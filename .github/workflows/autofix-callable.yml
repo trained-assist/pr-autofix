@@ -1,0 +1,142 @@
+name: PR Autofix (callable)
+
+# Reusable workflow — call from your CI when a PR fails.
+#
+# Usage in your ci.yml:
+#
+#   autofix:
+#     needs: [ci]                   # jobs that must run first
+#     if: |
+#       always() &&
+#       github.event_name == 'pull_request' &&
+#       !github.event.pull_request.draft &&
+#       needs.ci.result == 'failure' &&
+#       !startsWith(github.head_ref, 'fix/ci-')
+#     permissions:
+#       contents: write
+#       pull-requests: write
+#     uses: trained-assist/pr-autofix/.github/workflows/autofix-callable.yml@v1
+#     with:
+#       pr_number: ${{ github.event.pull_request.number }}
+#       original_branch: ${{ github.head_ref }}
+#       run_id: ${{ github.run_id }}
+#     secrets:
+#       openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+#       gh_token: ${{ secrets.AUTOFIX_PAT || github.token }}
+#
+# Required secrets in your repo:
+#   OPENROUTER_API_KEY — get a free key at https://openrouter.ai
+#   AUTOFIX_PAT        — Fine-Grained PAT with contents+pull_requests write on this repo
+#                        (GITHUB_TOKEN can't create PRs when org restricts workflow write)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'PR number that failed CI'
+        required: true
+        type: number
+      original_branch:
+        description: 'Branch name of the failing PR'
+        required: true
+        type: string
+      run_id:
+        description: 'GitHub Actions run ID of the failed CI run (pass 0 for batch/merge mode)'
+        required: false
+        type: string
+        default: '0'
+    secrets:
+      openrouter_api_key:
+        description: 'OpenRouter API key (free tier is sufficient)'
+        required: true
+      gh_token:
+        description: 'GitHub token with contents+pull_requests write (defaults to GITHUB_TOKEN)'
+        required: false
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Guard against duplicate fix PRs
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.gh_token || github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ inputs.original_branch }}
+        run: |
+          SAFE_BRANCH=$(echo "$BRANCH" | tr '/' '-' | sed 's/[^a-zA-Z0-9-]/-/g' | cut -c1-40)
+          EXISTING=$(gh pr list -R "$REPO" \
+            --json number,headRefName --state open \
+            | jq -r ".[] | select(.headRefName | startswith(\"fix/ci-${SAFE_BRANCH}-\")) | .number" \
+            | head -1)
+          if [ -n "$EXISTING" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already have open fix PR #$EXISTING for branch $BRANCH — skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          ref: ${{ inputs.original_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.gh_token || github.token }}
+
+      - name: Download autofix script
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/trained-assist/pr-autofix/main/scripts/autofix.mjs \
+            -o /tmp/autofix.mjs
+          node --check /tmp/autofix.mjs && echo "script syntax OK"
+
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.guard.outputs.skip == 'false'
+        run: npm ci --ignore-scripts
+
+      - name: Run autofix pipeline
+        id: autofix
+        if: steps.guard.outputs.skip == 'false'
+        continue-on-error: true
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+          GH_TOKEN: ${{ secrets.gh_token || github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          ORIGINAL_BRANCH: ${{ inputs.original_branch }}
+        run: node /tmp/autofix.mjs
+
+      - name: Report unfixed failure
+        if: steps.guard.outputs.skip == 'false' && steps.autofix.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.gh_token || github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          REASON=$(node -e "
+            try {
+              const s = JSON.parse(require('fs').readFileSync('ci-fixer-stats.json','utf8'));
+              process.stdout.write(s.reason || s.category || 'unknown');
+            } catch { process.stdout.write('unknown'); }
+          " 2>/dev/null || echo "unknown")
+          gh pr comment ${{ inputs.pr_number }} -R "$REPO" --body \
+            "🤖 Auto-fix pipeline could not resolve this CI failure. Reason: \`${REASON}\`. Needs a human look."
+
+      - name: Upload stats artifact
+        if: steps.guard.outputs.skip == 'false' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-fixer-stats-pr${{ inputs.pr_number }}-run${{ github.run_id }}
+          path: ci-fixer-stats.json
+          if-no-files-found: ignore
+          retention-days: 90
