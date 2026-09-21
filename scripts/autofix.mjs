@@ -574,7 +574,26 @@ if (BATCH_MODE) {
   log('batch', `batch mode (RUN_ID=${RUN_ID || 'unset'}) — skipping CI log fetch, will always attempt merge`);
 } else {
   try {
-    failedLog = sh(`gh run view ${RUN_ID} --log-failed -R ${REPO}`).slice(-LOG_CHAR_LIMIT);
+    // gh run view --log-failed fails when the overall run is still in progress
+    // (which it always is, since autofix runs as a job within the same run).
+    // Instead: fetch individual job logs for completed failed jobs via the API.
+    try {
+      const jobsRaw = sh(`gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" --jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")]'`);
+      const failedJobs = JSON.parse(jobsRaw);
+      if (failedJobs.length === 0) throw new Error('no failed jobs found in run');
+      const logParts = [];
+      for (const job of failedJobs) {
+        try {
+          const jobLog = sh(`gh api "repos/${REPO}/actions/jobs/${job.id}/logs"`).slice(-8000);
+          logParts.push(`=== job: ${job.name} ===\n${jobLog}`);
+        } catch { /* best effort per job */ }
+      }
+      failedLog = logParts.join('\n\n').slice(-LOG_CHAR_LIMIT);
+      if (!failedLog) throw new Error('all job log fetches failed');
+    } catch (apiErr) {
+      log('fetch-log', `job-level API fetch failed (${apiErr.message}), falling back to --log-failed`);
+      failedLog = sh(`gh run view ${RUN_ID} --log-failed -R ${REPO}`).slice(-LOG_CHAR_LIMIT);
+    }
   } catch (e) {
     failWithStats('fail:other', `could not fetch CI log: ${e.message}`);
   }
