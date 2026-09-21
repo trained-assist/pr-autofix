@@ -89,8 +89,18 @@ jobs:
       - name: Download autofix script
         if: steps.guard.outputs.skip == 'false'
         run: |
+          # Pin the script to the SAME ref the caller invoked us at (e.g. @v1.2), never
+          # to a moving `main` — otherwise every consumer breaks the instant main changes,
+          # with no way to roll back a single repo independently.
+          WORKFLOW_REF="${{ github.workflow_ref }}"
+          SCRIPT_REF="${WORKFLOW_REF##*@}"
+          if [ -z "$SCRIPT_REF" ] || [ "$SCRIPT_REF" = "$WORKFLOW_REF" ]; then
+            echo "Could not parse ref from github.workflow_ref='$WORKFLOW_REF' — refusing to fall back to main" >&2
+            exit 1
+          fi
+          echo "Fetching autofix.mjs @ $SCRIPT_REF"
           curl -fsSL \
-            https://raw.githubusercontent.com/trained-assist/pr-autofix/main/scripts/autofix.mjs \
+            "https://raw.githubusercontent.com/trained-assist/pr-autofix/${SCRIPT_REF}/scripts/autofix.mjs" \
             -o /tmp/autofix.mjs
           node --check /tmp/autofix.mjs && echo "script syntax OK"
 
