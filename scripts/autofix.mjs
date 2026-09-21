@@ -584,7 +584,10 @@ if (BATCH_MODE) {
       const logParts = [];
       for (const job of failedJobs) {
         try {
-          const jobLog = sh(`gh api "repos/${REPO}/actions/jobs/${job.id}/logs"`).slice(-8000);
+          // --allow-escape-sequences: job logs contain ANSI color codes; newer gh
+          // CLI versions refuse to print them to stdout without this flag, which
+          // made every automatic-mode run fail with fail:other "could not fetch CI log".
+          const jobLog = sh(`gh api --allow-escape-sequences "repos/${REPO}/actions/jobs/${job.id}/logs"`).slice(-8000);
           logParts.push(`=== job: ${job.name} ===\n${jobLog}`);
         } catch { /* best effort per job */ }
       }
