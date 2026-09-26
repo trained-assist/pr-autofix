@@ -641,6 +641,35 @@ function excerptFile(content, focusLines, budgetTokens = FILE_TOKEN_BUDGET) {
   return { text: out.join('\n'), excerpt: true };
 }
 
+// MISSING_CONTEXT retry: the model says WHAT it needs ("the stale
+// require('../playbooks/development.json')"). Re-sending the head of the file
+// misses it when it sits past the cap (seen live: agent#1469, line >141 of a
+// 48k test file). Pull concrete needles from the request + diagnosis and focus
+// the excerpt on the lines that contain them.
+function missingContextNeeds(text) {
+  const out = new Map();
+  for (const m of String(text || '').matchAll(/MISSING_CONTEXT:\s*`?([\w./@-]+\.[\w]+)`?\s*[—:-]*\s*(.*)/g)) out.set(m[1], m[2] || '');
+  return out;
+}
+function contextNeedles(...texts) {
+  const needles = new Set();
+  for (const t of texts) {
+    const s = String(t || '');
+    for (const m of s.matchAll(/[`'"]([^`'"\n]{4,80})[`'"]/g)) needles.add(m[1].trim());
+    for (const m of s.matchAll(/[\w@./-]*[\w-]\.(?:json|js|mjs|cjs|ts|tsx|yml|yaml|md|py|go|sh)\b/g)) needles.add(m[0].split('/').pop());
+    for (const m of s.matchAll(/\b([A-Za-z_$][\w$]{4,})\s*\(/g)) needles.add(m[1]);
+  }
+  return [...needles].filter(n => n.length >= 4).slice(0, 20);
+}
+function needleLines(content, needles, max = 40) {
+  const hits = [];
+  const lines = content.split('\n');
+  for (let i = 0; i < lines.length && hits.length < max; i++) {
+    if (needles.some(n => lines[i].includes(n))) hits.push(i + 1);
+  }
+  return hits;
+}
+
 // Stage 2 contract: the model names files it could not see enough of.
 function parseMissingContext(text) {
   return [...String(text || '').matchAll(/MISSING_CONTEXT:\s*`?([\w./@-]+\.[\w]+)`?/g)].map(m => m[1]);
@@ -996,6 +1025,15 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('parseJSON nested braces', parseJSON('{"a":{"b":[{"c":2}]}}').a.b[0].c === 2);
   let threw = false; try { parseJSON('just some prose, no json'); } catch { threw = true; }
   check('parseJSON rejects plain prose', threw);
+
+  // MISSING_CONTEXT retry targets what was asked for, not the file head (agent#1469).
+  const mcNeeds = missingContextNeeds("MISSING_CONTEXT: test/a.test.cjs — the stale require('../playbooks/development.json')");
+  check('missing-context need parsed', /development\.json/.test(mcNeeds.get('test/a.test.cjs') || ''));
+  const bigFile = Array.from({ length: 900 }, (_, i) => i === 700 ? "const pb = require('../playbooks/development.json');" : `line ${i} filler text here`).join('\n');
+  const hitLines = needleLines(bigFile, contextNeedles(mcNeeds.get('test/a.test.cjs')));
+  check('needle finds line past the head', hitLines.includes(701));
+  const mcEx = excerptFile(bigFile, new Set(hitLines), FILE_TOKEN_BUDGET * 4).text;
+  check('retry excerpt contains the needed line', mcEx.includes('development.json'));
 
   // Conflict-resolution guards (hh-skill#6 regression: base-side CI jobs dropped).
   check('protected path: workflows', PROTECTED_CONFLICT_RE.test('.github/workflows/ci.yml'));
@@ -1529,11 +1567,18 @@ Rules:
 
   // Line-numbered excerpts around PR-changed and log-cited lines (small files
   // whole). full=true is the MISSING_CONTEXT retry: the plain capped file.
-  const loadFile = (filePath, full = false) => {
-    const content = readFileSafe(path.join(process.cwd(), filePath), full ? FILE_CHAR_LIMIT : 1_000_000);
+  // full = the MISSING_CONTEXT retry: a 4x budget, focused on lines matching
+  // what the model asked for (+ diagnosis), not the head of the file.
+  const loadFile = (filePath, full = false, need = '') => {
+    const content = readFileSafe(path.join(process.cwd(), filePath), 1_000_000);
     if (content === null) { log('stage2', `skipped ${filePath} (not found)`); return null; }
     const focus = new Set([...(changedLines.get(filePath) || []), ...logCitedLines(filePath, failedLog)]);
-    const { text, excerpt } = full ? excerptFile(content, new Set(), Infinity) : excerptFile(content, focus);
+    if (full) {
+      const hits = needleLines(content, contextNeedles(need, diagnosis.problem, diagnosis.fix_approach));
+      hits.forEach(l => focus.add(l));
+      log('stage2', `${filePath}: retry focus +${hits.length} line(s) matching the requested context`);
+    }
+    const { text, excerpt } = excerptFile(content, focus, full ? FILE_TOKEN_BUDGET * 4 : FILE_TOKEN_BUDGET);
     log('stage2', `loaded ${filePath} (${content.length} chars → ~${estTokens(text)} tokens${excerpt ? ', excerpt' : ''})`);
     return `=== ${filePath}${excerpt ? ' (EXCERPT — gaps marked)' : ''} ===\n${text}`;
   };
@@ -1573,11 +1618,12 @@ Inputs are COMPRESSED: files may be line-numbered EXCERPTS with "... omitted" ga
       const missing = [...new Set(parseMissingContext(stage2Content))].slice(0, MAX_FILES);
       if (missing.length) {
         log('stage2', `model reported MISSING_CONTEXT for: ${missing.join(', ')} — retrying with full files`);
-        const full = missing.map(f => loadFile(f, true)).filter(Boolean);
+        const needs = missingContextNeeds(stage2Content);
+        const full = missing.map(f => loadFile(f, true, needs.get(f) || '')).filter(Boolean);
         const others = fileContents.filter(b => !missing.some(f => b.startsWith(`=== ${f} `) || b.startsWith(`=== ${f}\n`)));
         if (full.length) {
           changeSpec = await callModel(STAGE2_MODEL, [
-            { role: 'system', content: 'You are a code reviewer helping plan a minimal CI fix. Describe exactly what lines/functions need to change (file, function, what to add/remove/change). Plain English, no code. The files you asked for are now complete (up to a size cap). If something is still missing, say so explicitly instead of guessing.' },
+            { role: 'system', content: 'You are a code reviewer helping plan a minimal CI fix. Describe exactly what lines/functions need to change (file, function, what to add/remove/change). Plain English, no code. The files you asked for are re-sent, focused on the lines matching what you asked for (line-numbered; gaps marked). If something is still missing, say so explicitly instead of guessing.' },
             { role: 'user', content: `Root cause: ${diagnosis.problem}\n\nProposed fix approach: ${diagnosis.fix_approach}\n\nSource files:\n\n${[...full, ...others].join('\n\n')}\n\nPR diff:\n\`\`\`diff\n${prDiff}\n\`\`\`\n\nDescribe the exact changes needed.` },
           ]);
         }
