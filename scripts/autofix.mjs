@@ -23,7 +23,7 @@
 // Stage 0 (reasoning)   — understand WHY the PR exists before touching anything.
 //                          If unclear → comment + label + stop. Never patch blindly.
 // Pre-stage A/B/C       — deterministic fixes (no AI needed).
-// Stage 1/2/3 (AI)      — OpenRouter free models.
+// Stage 1/2/3 (AI)      — cheap paid primary (deepseek-v4-flash) → free ladder; stage 3 = search/replace edits.
 //
 // ── Stats (category taxonomy) ──────────────────────────────────────────────────
 // Every run writes ci-fixer-stats.json + appends to $GITHUB_STEP_SUMMARY.
@@ -55,7 +55,7 @@
 // multiple PRs at once.
 
 import { execSync, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 const LOG_CHAR_LIMIT = 120000; // raw log cap BEFORE compressLog (which fits LOG_TOKEN_BUDGET)
@@ -646,6 +646,38 @@ function parseMissingContext(text) {
   return [...String(text || '').matchAll(/MISSING_CONTEXT:\s*`?([\w./@-]+\.[\w]+)`?/g)].map(m => m[1]);
 }
 
+// Apply Stage 3 search/replace edits atomically: validate every edit against
+// the current file text first (exact, unique match; a copied "NNNNN| " prefix
+// is tolerated), write nothing unless all edits are valid.
+function applyEdits(edits, cwd) {
+  const errors = [], pending = new Map(), files = [];
+  const stripNum = t => String(t ?? '').replace(/^ *\d+\| ?/gm, '');
+  const root = path.resolve(cwd);
+  edits.forEach((e, i) => {
+    const file = String(e?.file || '').replace(/^\.?\//, '');
+    const abs = path.resolve(root, file);
+    if (!file || !abs.startsWith(root + path.sep) || /(^|\/)\.git\//.test(file)) { errors.push(`edit ${i + 1}: bad file path "${file}"`); return; }
+    const exists = existsSync(abs);
+    let text = pending.has(abs) ? pending.get(abs) : (exists ? readFileSync(abs, 'utf8') : null);
+    let oldStr = String(e?.old_str ?? ''), newStr = String(e?.new_str ?? '');
+    if (oldStr === '') {
+      if (text !== null && text !== '') { errors.push(`edit ${i + 1}: ${file} exists — old_str must not be empty`); return; }
+      pending.set(abs, newStr); files.push(file); return;
+    }
+    if (text === null) { errors.push(`edit ${i + 1}: ${file} does not exist`); return; }
+    const count = (hay, needle) => hay.split(needle).length - 1;
+    if (count(text, oldStr) !== 1 && count(text, stripNum(oldStr)) === 1) { oldStr = stripNum(oldStr); newStr = stripNum(newStr); }
+    const n = count(text, oldStr);
+    if (n === 0) { errors.push(`edit ${i + 1}: old_str not found in ${file}: ${JSON.stringify(oldStr.slice(0, 120))}`); return; }
+    if (n > 1) { errors.push(`edit ${i + 1}: old_str occurs ${n} times in ${file} — add surrounding lines to make it unique`); return; }
+    pending.set(abs, text.replace(oldStr, () => newStr)); files.push(file);
+  });
+  if (!edits.length) errors.push('edits array is empty');
+  if (errors.length) return { ok: false, errors };
+  for (const [abs, text] of pending) { mkdirSync(path.dirname(abs), { recursive: true }); writeFileSync(abs, text); }
+  return { ok: true, count: edits.length, files, errors: [] };
+}
+
 // ── Conflict resolution with AI ──────────────────────────────────────────────
 // Called by tryFixOutOfDate when git merge has conflicts.
 // Uses the PR's purpose (from Stage 0) to guide resolution — the "why" makes
@@ -1131,6 +1163,24 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('parseMissingContext', parseMissingContext('ok\nMISSING_CONTEXT: src/lib/a.ts — need foo()\nMISSING_CONTEXT: `b.js`').join(',') === 'src/lib/a.ts,b.js');
   rmSync(tmp, { recursive: true, force: true });
 
+  // ── Stage 3 search/replace edits (smoke run 2: git apply rejected a correct fix) ──
+  const et = mkdtempSync(path.join(os.tmpdir(), 'autofix-ed-'));
+  writeFileSync(path.join(et, 'cart.js'), 'export function ship(t) {\n  return t > 50 ? 0 : 5;\n}\nconst a = 1;\nconst a2 = 1;\n');
+  let r = applyEdits([{ file: 'cart.js', old_str: '  return t > 50 ? 0 : 5;', new_str: '  return t >= 50 ? 0 : 5;' }], et);
+  check('edits: exact unique replace applied', r.ok && readFileSync(path.join(et, 'cart.js'), 'utf8').includes('t >= 50'));
+  r = applyEdits([{ file: 'cart.js', old_str: '    2|   return t >= 50 ? 0 : 5;', new_str: '    2|   return t >= 49 ? 0 : 5;' }], et);
+  check('edits: copied line-number prefix tolerated', r.ok && readFileSync(path.join(et, 'cart.js'), 'utf8').includes('t >= 49 ? 0'));
+  const before = readFileSync(path.join(et, 'cart.js'), 'utf8');
+  r = applyEdits([{ file: 'cart.js', old_str: 'const a', new_str: 'let a' }, { file: 'cart.js', old_str: 'return t >= 49', new_str: 'return t >= 1' }], et);
+  check('edits: ambiguous match rejected atomically', !r.ok && /occurs 2 times/.test(r.errors[0]) && readFileSync(path.join(et, 'cart.js'), 'utf8') === before);
+  r = applyEdits([{ file: 'cart.js', old_str: 'nope', new_str: 'x' }], et);
+  check('edits: missing old_str reported', !r.ok && /not found/.test(r.errors[0]));
+  r = applyEdits([{ file: '../escape.js', old_str: '', new_str: 'x' }], et);
+  check('edits: path escape refused', !r.ok && /bad file path/.test(r.errors[0]));
+  r = applyEdits([{ file: 'test/new.test.js', old_str: '', new_str: 'ok\n' }], et);
+  check('edits: new file in new dir created', r.ok && readFileSync(path.join(et, 'test/new.test.js'), 'utf8') === 'ok\n');
+  rmSync(et, { recursive: true, force: true });
+
   // ── CI log compression + fast paid routing (live smoke findings) ──
   const ts = '2026-09-26T20:14:11.9392263Z ';
   const rawLog = '﻿' + ts + "Current runner version: '2.337.0'\n" + ts + '##[group]Run actions/checkout@v4\n' + ts + 'with: token: ***\n' + ts + '##[endgroup]\n'
@@ -1500,49 +1550,62 @@ Inputs are COMPRESSED: files may be line-numbered EXCERPTS with "... omitted" ga
   log('stage3', `calling ${STAGE3_MODEL} to write patch...`);
   await prComment('🔧 Stage 3/3: generating patch…');
 
-  let stage3Content;
-  try {
-    stage3Content = await callModel(STAGE3_MODEL, [
-      {
-        role: 'system',
-        content: `You are a CI auto-fix bot. Write a unified diff (git format, "diff --git a/... b/..." prefix) that fixes a CI failure.
+  // Stage 3 returns exact search/replace edits, not a unified diff: models
+  // can't count @@ line numbers — the live smoke's correct fix died in
+  // `git apply` (fail:ai_corrupt_patch). Exact-substring edits have no hunk
+  // arithmetic (bench-cicd/fix-loop.mjs). One retry with the apply errors fed
+  // back; a model that still answers with a diff goes down the diff path below.
+  const stage3System = `You are a CI auto-fix bot. Fix the CI failure with the smallest possible change — no refactors, no unrelated edits.
+
+Reply with JSON only:
+{"edits":[{"file":"path/to/file","old_str":"exact text currently in the file","new_str":"replacement text"}]}
 
 Rules:
-- Smallest possible change — no refactors, no unrelated edits
-- Valid git diff format, applicable via "git apply"
-- Wrap in a single \`\`\`diff code block
-- The PR diff you see is compressed (trimmed context). If you lack the exact surrounding lines needed for an applicable patch, reply CANNOT_FIX: missing context <file/what> — do not invent context lines
-- Source files are shown with a "NNNNN| " line-number prefix that is NOT part of the file — copy context lines without it, and use the numbers for @@ headers
-- If you cannot produce a correct patch, reply exactly: CANNOT_FIX`,
-      },
-      {
-        role: 'user',
-        content: `Root cause:\n${diagnosis.problem}\n\nWhat to change:\n${changeSpec}\n\n${fileContents.length ? `Source files (current PR state):\n\n${fileContents.join('\n\n')}\n\n` : ''}Current PR diff (for context on what already changed):\n\`\`\`diff\n${prDiff}\n\`\`\`\n\nWrite the fix patch.`,
-      },
-    ], false, { reasoning: true });
-  } catch (e) {
-    failWithStats('fail:ai_model_error', `Stage 3 model error: ${e.message.slice(0, 200)}`, { problem: diagnosis.problem });
-  }
+- old_str must be copied VERBATIM from the current file (same whitespace/indentation) and must occur exactly once in it; include 1-3 surrounding lines if needed to make it unique
+- Source files are shown with a "NNNNN| " line-number prefix that is NOT part of the file — never copy the prefix into old_str/new_str
+- To create a new file: old_str "" and new_str = whole file content
+- If the excerpts don't show the exact text you need to replace, or you cannot fix it safely, reply {"cannot_fix":"<reason, e.g. missing context: file/what>"}`;
+  const stage3User = `Root cause:\n${diagnosis.problem}\n\nWhat to change:\n${changeSpec}\n\n${fileContents.length ? `Source files (current PR state):\n\n${fileContents.join('\n\n')}\n\n` : ''}Current PR diff (for context on what already changed):\n\`\`\`diff\n${prDiff}\n\`\`\`\n\nReturn the edits.`;
 
-  if (!stage3Content || stage3Content.includes('CANNOT_FIX')) {
-    const why = (stage3Content || '').match(/CANNOT_FIX:?\s*(.{0,300})/)?.[1]?.trim() || '';
-    await prComment(`❌ Stage 3: model declined to generate a patch\n\n**Cause:** ${diagnosis.problem}${why ? `\n**Model says:** ${why}` : ''}\n\nThis likely requires a code change that needs human judgement.`);
-    failWithStats('fail:ai_cannot_fix', `Stage 3 declined to produce a patch${why ? `: ${why}` : ''}`, {
-      problem: diagnosis.problem,
-      fix_approach: diagnosis.fix_approach,
-    });
+  let stage3Content, applied = null;
+  const messages3 = [{ role: 'system', content: stage3System }, { role: 'user', content: stage3User }];
+  for (let attempt = 1; attempt <= 2 && !applied; attempt++) {
+    try {
+      stage3Content = await callModel(STAGE3_MODEL, messages3, false, { reasoning: true });
+    } catch (e) {
+      failWithStats('fail:ai_model_error', `Stage 3 model error: ${e.message.slice(0, 200)}`, { problem: diagnosis.problem });
+    }
+    let parsed = null;
+    try { parsed = parseJSON(stage3Content); } catch { /* not JSON — maybe a diff */ }
+    const why = parsed?.cannot_fix || ((stage3Content || '').match(/CANNOT_FIX:?\s*(.{0,300})/)?.[1]?.trim()) || (/CANNOT_FIX/.test(stage3Content || '') ? 'no reason given' : '');
+    if (!stage3Content || why) {
+      await prComment(`❌ Stage 3: model declined to generate a patch\n\n**Cause:** ${diagnosis.problem}\n**Model says:** ${String(why || 'empty answer').slice(0, 300)}\n\nThis likely requires a code change that needs human judgement.`);
+      failWithStats('fail:ai_cannot_fix', `Stage 3 declined to produce a patch: ${String(why || 'empty answer').slice(0, 200)}`, {
+        problem: diagnosis.problem,
+        fix_approach: diagnosis.fix_approach,
+      });
+    }
+    if (Array.isArray(parsed?.edits)) {
+      const res = applyEdits(parsed.edits, process.cwd());
+      if (res.ok) { applied = res; break; }
+      log('stage3', `edits rejected (attempt ${attempt}): ${res.errors.join('; ').slice(0, 300)}`);
+      if (attempt === 2) {
+        await prComment(`❌ Stage 3: edits did not match the files\n\n**Cause:** ${diagnosis.problem}\n\n\`\`\`\n${res.errors.join('\n').slice(0, 500)}\n\`\`\``);
+        failWithStats('fail:ai_corrupt_patch', 'Stage 3 edits did not match the files', { problem: diagnosis.problem, edit_errors: res.errors.slice(0, 5) });
+      }
+      messages3.push({ role: 'assistant', content: stage3Content }, { role: 'user', content: `These edits could not be applied — nothing was changed:\n${res.errors.join('\n')}\n\nReturn corrected edits for the whole fix (old_str must be verbatim, unique, without line-number prefixes).` });
+      continue;
+    }
+    // Legacy path: the model answered with a unified diff anyway.
+    const patch = extractPatch(stage3Content);
+    if (patch.startsWith('diff --git') || patch.startsWith('---')) { patchToApply = patch; break; }
+    if (attempt === 2) {
+      await prComment(`❌ Stage 3: generated neither edits nor a diff — cannot apply\n\n**Cause:** ${diagnosis.problem}`);
+      failWithStats('fail:ai_corrupt_patch', 'Stage 3 produced malformed output', { problem: diagnosis.problem, patch_head: String(stage3Content).slice(0, 100) });
+    }
+    messages3.push({ role: 'assistant', content: stage3Content }, { role: 'user', content: 'That was not valid JSON with an "edits" array. Reply with the JSON only.' });
   }
-
-  const patch = extractPatch(stage3Content);
-  if (!patch.startsWith('diff --git') && !patch.startsWith('---')) {
-    await prComment(`❌ Stage 3: generated a malformed diff — cannot apply\n\n**Cause:** ${diagnosis.problem}`);
-    failWithStats('fail:ai_corrupt_patch', 'Stage 3 produced malformed diff', {
-      problem: diagnosis.problem,
-      patch_head: patch.slice(0, 100),
-    });
-  }
-
-  patchToApply = patch;
+  if (applied) log('stage3', `applied ${applied.count} edit(s) to ${[...new Set(applied.files)].join(', ')}`);
   diagnosis.fix_approach = changeSpec; // use refined spec from stage 2
 }
 
@@ -1552,8 +1615,19 @@ if (patchToApply) {
   const patchFile = 'autofix-openrouter.patch';
   writeFileSync(patchFile, patchToApply + '\n');
 
+  // Models miscount @@ headers: fall back to --recount, then GNU patch fuzz.
+  const tryApply = [
+    ['git', ['apply', '--whitespace=fix', patchFile]],
+    ['git', ['apply', '--recount', '--whitespace=fix', patchFile]],
+    ['patch', ['-p1', '--fuzz=3', '--no-backup-if-mismatch', '-i', patchFile]],
+  ];
   try {
-    execFileSync('git', ['apply', '--whitespace=fix', patchFile], { stdio: 'inherit' });
+    let lastErr;
+    for (const [cmd, args] of tryApply) {
+      try { execFileSync(cmd, args, { stdio: 'pipe' }); lastErr = null; log('apply', `applied with ${cmd} ${args.slice(0, 2).join(' ')}`); break; }
+      catch (err) { lastErr = err; sh('git checkout -- . 2>/dev/null || true'); }
+    }
+    if (lastErr) throw lastErr;
   } catch (e) {
     unlinkSync(patchFile);
     await prComment(`❌ Patch did not apply cleanly\n\n**Cause:** ${diagnosis.problem}\n\n\`\`\`\n${e.message.slice(0, 300)}\n\`\`\``);
