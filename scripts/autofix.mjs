@@ -63,15 +63,27 @@ const DIFF_CHAR_LIMIT = 10000;
 const FILE_CHAR_LIMIT = 8000;
 const MAX_FILES = 8;
 
-// Free-tier model chain — tried first on 404/429/503 (first success wins).
-// After this chain is exhausted, callModel auto-discovers remaining free models
-// from OpenRouter's /models API, then falls back to cheap paid models.
-const STAGE0_MODEL_CHAIN = [
-  'deepseek/deepseek-v3-0324:free',
-  'google/gemma-3-12b-it:free',
-  'meta-llama/llama-3.1-8b-instruct:free',
-  'mistralai/mistral-7b-instruct:free',
+// Free-tier model ladder — bench-validated 2026-09-26 (500 rows, 10 diffs × 5
+// runs × 10 models, see bench-cicd/bench-ext-summary.json). Ordered by
+// availability × recall. The old chain (deepseek-v3-0324 / gemma-3-12b /
+// llama-3.1-8b / mistral-7b) and old STAGE1 (deepseek-v4-flash-0731) are gone
+// from the live OpenRouter catalog — replaced by the survivors below.
+const FREE_MODEL_LADDER = [
+  'nvidia/nemotron-3-super-120b-a12b:free',        // 84% avail, recall 0.79, 4.6s
+  'inclusionai/ling-3.0-flash-fin:free',           // 72% avail, recall 0.92, 0 FP, 2.5s
+  'inclusionai/ling-3.0-flash-sante:free',         // 58% avail, recall 0.72, 3.2s
+  'nvidia/nemotron-3-ultra-550b-a55b:free',        // 52% avail, recall 1.0, 0 FP, 13s
+  'cohere/north-mini-code:free',                   // 50% avail, recall 0.88, 0 FP
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', // 46% avail, recall 0.74
+  'poolside/laguna-xs-2.1:free',                   // 46% avail, recall 1.0 (rate-limited)
+  'dots-studio/dots-3-note-preview:free',          // 18% avail, recall 1.0
 ];
+// Stage assignment (bench per role): diagnose = best recall/FP (ling-fin),
+// contextualize = most reliable (super), patch = perfect recall (ultra).
+const STAGE1_MODEL = 'inclusionai/ling-3.0-flash-fin:free';
+const STAGE2_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free';
+const STAGE3_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
+const STAGE0_MODEL_CHAIN = FREE_MODEL_LADDER; // first success wins (conflict resolution)
 // Cheap paid models — last resort after all free options exhausted.
 // Costs ~$0.04–0.15 per 1M input tokens (negligible for small conflict resolution prompts).
 const CHEAP_PAID_FALLBACK = [
@@ -82,9 +94,6 @@ const CHEAP_PAID_FALLBACK = [
 
 const STAGE0_MODEL = STAGE0_MODEL_CHAIN[0];
 const STAGE0_FALLBACK_MODEL = STAGE0_MODEL_CHAIN[1]; // kept for compat, chain handles the rest
-const STAGE1_MODEL = 'deepseek/deepseek-v4-flash-0731:free';
-const STAGE2_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free';
-const STAGE3_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
 
 const PR_FIXER_PREFIX = 'pr-fixer:';
 
@@ -181,7 +190,7 @@ async function prComment(body) {
 }
 
 async function callModel(model, messages, json = false) {
-  const tryModel = async (m) => {
+  const tryModel = async (m, wantJson) => {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -192,21 +201,29 @@ async function callModel(model, messages, json = false) {
         model: m,
         messages,
         temperature: 0,
-        ...(json ? { response_format: { type: 'json_object' } } : {}),
+        ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
       }),
       signal: AbortSignal.timeout(CHEAP_PAID_FALLBACK.includes(m) ? 60_000 : 20_000),
     });
     if (!res.ok) {
       const body = await res.text();
+      // Some free models reject response_format (400) even though they answer
+      // JSON fine from the prompt alone — retry without the constraint.
+      if (json && res.status === 400 && wantJson && /response_format|json_object/i.test(body)) {
+        return tryModel(m, false);
+      }
       throw Object.assign(new Error(`OpenRouter HTTP ${res.status}: ${body}`), { status: res.status });
     }
     const data = await res.json();
     return data?.choices?.[0]?.message?.content?.trim() || '';
   };
 
-  // For STAGE0 calls: try full chain (hardcoded free → discovered free → cheap paid)
-  const chain = model === STAGE0_MODEL
-    ? [...STAGE0_MODEL_CHAIN, ...(await discoverFreeModels()), ...CHEAP_PAID_FALLBACK]
+  // Every stage call fails over: primary model → rest of the ladder → any
+  // remaining free models OpenRouter still lists → cheap paid last resort.
+  // (Previously only STAGE0 had a chain; STAGE1/2/3 died on a single 429.)
+  const ladderStart = FREE_MODEL_LADDER.indexOf(model);
+  const chain = ladderStart >= 0
+    ? [...FREE_MODEL_LADDER.slice(ladderStart), ...(await discoverFreeModels()), ...CHEAP_PAID_FALLBACK]
     : [model];
 
   let lastErr;
@@ -221,7 +238,7 @@ async function callModel(model, messages, json = false) {
         }
         log('model', `trying ${m}${isPaid ? ' (paid)' : ''}`);
       }
-      const result = await tryModel(m);
+      const result = await tryModel(m, json);
       if (result) return result; // non-empty → success
       lastErr = new Error(`${m} returned empty response`);
       log('model', `${m} empty — trying next`);
@@ -247,7 +264,7 @@ async function discoverFreeModels() {
     });
     if (!res.ok) { _discoveredFreeModels = []; return []; }
     const { data = [] } = await res.json();
-    const known = new Set(STAGE0_MODEL_CHAIN);
+    const known = new Set(FREE_MODEL_LADDER);
     _discoveredFreeModels = data
       .filter(m => m.id.endsWith(':free') && !known.has(m.id))
       .sort((a, b) => (b.context_length || 0) - (a.context_length || 0))
@@ -263,6 +280,15 @@ async function discoverFreeModels() {
 function extractPatch(raw) {
   const fenced = raw.match(/```(?:diff|patch)?\n([\s\S]*?)```/);
   return (fenced ? fenced[1] : raw).trim();
+}
+
+// Tolerant JSON extraction — free models frequently wrap JSON in fences or
+// lead with prose. Slices the first '{' to the last '}' and parses that.
+function parseJSON(text) {
+  const t = String(text || '').replace(/```(?:json)?/gi, '').trim();
+  const s = t.indexOf('{'), e = t.lastIndexOf('}');
+  if (s < 0 || e < 0) throw new Error('no JSON object found');
+  return JSON.parse(t.slice(s, e + 1));
 }
 
 function readFileSafe(filePath) {
@@ -770,8 +796,7 @@ Rules:
   }
 
   try {
-    const raw = stage1Content.replace(/^```json\n?/, '').replace(/```$/, '');
-    diagnosis = JSON.parse(raw);
+    diagnosis = parseJSON(stage1Content);
   } catch (e) {
     await prComment(`❌ Stage 1 returned unparseable response — cannot proceed`);
     failWithStats('fail:ai_no_diagnose', `Stage 1 returned invalid JSON: ${e.message}`, { raw: stage1Content.slice(0, 300) });
