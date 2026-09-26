@@ -682,7 +682,36 @@ function applyEdits(edits, cwd) {
 // Called by tryFixOutOfDate when git merge has conflicts.
 // Uses the PR's purpose (from Stage 0) to guide resolution — the "why" makes
 // per-block decisions more accurate than resolving with no context.
+// CI/workflow config: an AI "resolution" here can silently delete merge gates
+// (seen live: hh-skill#6 → fix PR dropped main's contract/behavior/guards/
+// staging-gate jobs). Conflicts in these paths always go to a human.
+const PROTECTED_CONFLICT_RE = /^\.github\/workflows\//;
+
+// Guard one AI-resolved block. We merge origin/<base> INTO the PR branch, so
+// `ours` (HEAD) = PR side and `theirs` = code already on the base branch.
+// Dropping most of the base side means the fix PR would revert other people's
+// merged work — reject instead of shipping it. Also reject runaway output.
+function checkResolvedBlock(block, result) {
+  const norm = t => t.split('\n').map(l => l.trim()).filter(Boolean);
+  const baseLines = norm(block.theirs);
+  const out = new Set(norm(result));
+  if (baseLines.length >= 3) {
+    const kept = baseLines.filter(l => out.has(l)).length;
+    if (kept / baseLines.length < 0.5) {
+      return `resolution dropped ${baseLines.length - kept}/${baseLines.length} lines already on ${BASE_BRANCH}`;
+    }
+  }
+  if (result.length > (block.ours.length + block.theirs.length) * 1.2 + 200) {
+    return `resolution is larger than both sides combined (${result.length} chars) — runaway output`;
+  }
+  return null;
+}
+
 async function resolveConflictsWithAI(conflictedFiles, prPurposeArg) {
+  const protectedFiles = conflictedFiles.filter(f => PROTECTED_CONFLICT_RE.test(f));
+  if (protectedFiles.length) {
+    return { ok: false, reason: `conflict in protected CI config (${protectedFiles.join(', ')}) — needs a human` };
+  }
   // <<< ... === ... >>> regex — one conflict block at a time
   const CONFLICT_RE = /<<<<<<< [^\n]+\n([\s\S]*?)\n?=======\n([\s\S]*?)\n?>>>>>>> [^\n]+/g;
 
@@ -718,6 +747,8 @@ async function resolveConflictsWithAI(conflictedFiles, prPurposeArg) {
             {
               role: 'system',
               content: `Resolve this single git merge conflict. PR purpose: "${prPurposeArg}".
+The side between <<<<<<< and ======= is the PR branch; the side between ======= and >>>>>>> is code ALREADY MERGED on ${BASE_BRANCH} by other changes.
+Keep the intent of BOTH sides: never drop code from ${BASE_BRANCH} unless the PR purpose explicitly requires removing it.
 Return ONLY the resolved code — no conflict markers, no explanations, no markdown fences.`,
             },
             {
@@ -736,6 +767,11 @@ Return ONLY the resolved code — no conflict markers, no explanations, no markd
         resolvedCode.push(blocks[bi].full); // leave original conflict marker
         failedBlocks++;
       } else {
+        const guard = checkResolvedBlock(blocks[bi], blockResult.trim());
+        if (guard) {
+          log('conflict-resolve', `${filePath}: block ${blockNum} rejected — ${guard}`);
+          return { ok: false, reason: `${filePath} block ${blockNum}: ${guard}` };
+        }
         log('conflict-resolve', `${filePath}: block ${blockNum} OK`);
         resolvedCode.push(blockResult.trim());
       }
@@ -960,6 +996,14 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('parseJSON nested braces', parseJSON('{"a":{"b":[{"c":2}]}}').a.b[0].c === 2);
   let threw = false; try { parseJSON('just some prose, no json'); } catch { threw = true; }
   check('parseJSON rejects plain prose', threw);
+
+  // Conflict-resolution guards (hh-skill#6 regression: base-side CI jobs dropped).
+  check('protected path: workflows', PROTECTED_CONFLICT_RE.test('.github/workflows/ci.yml'));
+  check('protected path: src not', !PROTECTED_CONFLICT_RE.test('src/ci.yml'));
+  const blk = { ours: 'a: 1\nb: 2', theirs: 'x: 1\ny: 2\nz: 3\nw: 4' };
+  check('guard rejects dropping base side', /dropped/.test(checkResolvedBlock(blk, 'a: 1\nb: 2') || ''));
+  check('guard accepts union', checkResolvedBlock(blk, 'a: 1\nb: 2\nx: 1\ny: 2\nz: 3\nw: 4') === null);
+  check('guard rejects runaway', /runaway/.test(checkResolvedBlock(blk, blk.theirs + '\n' + 'q'.repeat(1000)) || ''));
 
   // Ladder integrity: every rung is a :free model, stages are on the ladder.
   check('ladder non-empty', FREE_MODEL_LADDER.length >= 5);
