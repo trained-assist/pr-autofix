@@ -15,6 +15,8 @@ No code ever leaves GitHub Actions — your tokens stay in your repo secrets.
 
 **OPENROUTER_API_KEY** — [openrouter.ai](https://openrouter.ai), free account, free models are used by default.
 
+**OPENCODE_GO_API_KEY** (optional, recommended) — OpenCode Go subscription key. When set, every stage tries the Go gateway ladder first (no free-tier 429s); OpenRouter free → cheap paid stays as fallback. A rejected Go key only disables the Go rungs. Either key alone is enough.
+
 **AUTOFIX_PAT** — GitHub Fine-Grained Personal Access Token:
 - Go to: Settings → Developer settings → Personal access tokens → Fine-grained tokens
 - Repository access: select your repo
@@ -45,6 +47,7 @@ autofix:
     run_id: ${{ github.run_id }}
   secrets:
     openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+    opencode_go_api_key: ${{ secrets.OPENCODE_GO_API_KEY }}
     gh_token: ${{ secrets.AUTOFIX_PAT || github.token }}
 ```
 
