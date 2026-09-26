@@ -88,19 +88,25 @@ jobs:
 
       - name: Download autofix script
         if: steps.guard.outputs.skip == 'false'
+        env:
+          # Pin the script to THIS reusable workflow's own version, never to a moving
+          # `main`. The `job` context (not `github`) describes the workflow file that
+          # defines this job: inside a reusable workflow `github.workflow_ref` is the
+          # CALLER's workflow (e.g. .../ci.yml@refs/pull/1435/merge), so fetching
+          # `scripts/autofix.mjs` from this repo at that ref 404s and autofix never runs.
+          # job.workflow_repository + job.workflow_sha identify the exact
+          # autofix-callable.yml commit the consumer invoked (e.g. @v1.2).
+          WORKFLOW_REPO: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
-          # Pin the script to the SAME ref the caller invoked us at (e.g. @v1.2), never
-          # to a moving `main` — otherwise every consumer breaks the instant main changes,
-          # with no way to roll back a single repo independently.
-          WORKFLOW_REF="${{ github.workflow_ref }}"
-          SCRIPT_REF="${WORKFLOW_REF##*@}"
-          if [ -z "$SCRIPT_REF" ] || [ "$SCRIPT_REF" = "$WORKFLOW_REF" ]; then
-            echo "Could not parse ref from github.workflow_ref='$WORKFLOW_REF' — refusing to fall back to main" >&2
+          if [ -z "$WORKFLOW_REPO" ] || [ -z "$WORKFLOW_SHA" ]; then
+            echo "Could not resolve reusable-workflow identity (repo='$WORKFLOW_REPO' sha='$WORKFLOW_SHA') — refusing to fall back to main" >&2
             exit 1
           fi
-          echo "Fetching autofix.mjs @ $SCRIPT_REF"
+          echo "Fetching autofix.mjs from $WORKFLOW_REPO@$WORKFLOW_SHA ($WORKFLOW_REF)"
           curl -fsSL \
-            "https://raw.githubusercontent.com/trained-assist/pr-autofix/${SCRIPT_REF}/scripts/autofix.mjs" \
+            "https://raw.githubusercontent.com/${WORKFLOW_REPO}/${WORKFLOW_SHA}/scripts/autofix.mjs" \
             -o /tmp/autofix.mjs
           node --check /tmp/autofix.mjs && echo "script syntax OK"
 
