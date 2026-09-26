@@ -15,3 +15,5 @@ jobs:
           node-version: '22'
       - name: Contract self-test
         run: AUTOFIX_SELFTEST=1 node scripts/autofix.mjs
+      - name: Contract self-test (free-first mode)
+        run: AUTOFIX_SELFTEST=1 AUTOFIX_PRIMARY_MODEL=free node scripts/autofix.mjs

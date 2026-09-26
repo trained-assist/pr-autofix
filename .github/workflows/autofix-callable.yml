@@ -139,6 +139,8 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
           ORIGINAL_BRANCH: ${{ inputs.original_branch }}
+          # Optional repo variable: another OpenRouter id, or `free` for free-first.
+          AUTOFIX_PRIMARY_MODEL: ${{ vars.AUTOFIX_PRIMARY_MODEL }}
         run: node /tmp/autofix.mjs
 
       - name: Report unfixed failure

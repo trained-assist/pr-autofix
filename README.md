@@ -3,7 +3,7 @@
 Automated CI failure fixer for GitHub PRs. When CI fails on a pull request, this pipeline:
 
 1. **Diagnoses** the root cause using the CI log
-2. **Patches** the code with OpenRouter free-tier AI models
+2. **Patches** the code with a cheap LLM (`deepseek/deepseek-v4-flash-0731` via OpenRouter, free models as fallback) fed a structurally compressed diff
 3. **Creates** a new `fix/ci-*` branch + PR that auto-merges when CI passes
 4. **Closes** the original broken PR once the fix is merged
 
@@ -13,7 +13,7 @@ No code ever leaves GitHub Actions — your tokens stay in your repo secrets.
 
 ### 1. Get secrets
 
-**OPENROUTER_API_KEY** — [openrouter.ai](https://openrouter.ai), free account, free models are used by default.
+**OPENROUTER_API_KEY** — [openrouter.ai](https://openrouter.ai). The primary model is paid but tiny-priced (`deepseek/deepseek-v4-flash-0731`, $0.021/M input) — with compressed inputs a run costs a fraction of a cent; the account needs a small credit balance. On a free-only account the primary fails and the free ladder takes over automatically. Set repo variable `AUTOFIX_PRIMARY_MODEL=free` to go free-first, or another OpenRouter id to override.
 
 **OPENCODE_GO_API_KEY** (optional, recommended) — OpenCode Go subscription key. When set, every stage tries the Go gateway ladder first (no free-tier 429s); OpenRouter free → cheap paid stays as fallback. A rejected Go key only disables the Go rungs. Either key alone is enough.
 
@@ -64,10 +64,12 @@ The fixer runs in three layers:
 - B: Missing workflow permissions → patch the YAML automatically
 - C: Cloudflare DO migration conflict → diagnose and report (can't auto-fix)
 
-**AI stages (OpenRouter free models):**
+**AI stages** (primary `deepseek/deepseek-v4-flash-0731` → OpenRouter free ladder → cheap paid fallback; OpenCode Go first if its key is set):
 - Stage 1: Diagnose root cause + identify files to examine
-- Stage 2: Read the actual files, understand the changes
+- Stage 2: Read line-numbered excerpts of those files (around PR-changed and log-cited lines; small files whole). If the model says `MISSING_CONTEXT: <file>`, it gets the full file and retries once
 - Stage 3: Write a unified diff to fix the issue
+
+**Input compression** (every stage): the PR diff is parsed into hunks and shrunk PR-Agent style — asymmetric context (3 lines before / 1 after), deletion-only hunks and lock/generated/binary files dropped (listed by name), then zero context + collapsed removals, additions cut last, all within a ~4k-token budget. Files cited in the CI log go first. Models are told the input is compressed and must say what's missing instead of guessing. Token usage and cost per model land in `ci-fixer-stats.json` and the step summary.
 
 On success, a `fix/ci-*` branch is created with the patch applied. A PR is opened targeting the same base as the original. When CI passes, it auto-merges, and `ci-fix-cleanup.yml` closes the original.
 

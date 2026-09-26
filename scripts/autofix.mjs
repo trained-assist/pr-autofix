@@ -59,9 +59,17 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, appen
 import path from 'node:path';
 
 const LOG_CHAR_LIMIT = 12000;
-const DIFF_CHAR_LIMIT = 10000;
 const FILE_CHAR_LIMIT = 8000;
 const MAX_FILES = 8;
+// Structured input compression (PR-Agent style, issue #7). Budgets are in
+// tokens, estimated as chars/4 — no tokenizer dependency in the runner.
+const DIFF_TOKEN_BUDGET = 4000;      // compressed PR diff fed to every stage
+const FILE_TOKEN_BUDGET = 2000;      // per-file excerpt in Stage 2
+const HUNK_CTX_BEFORE = 3;           // asymmetric hunk context: 3 lines before,
+const HUNK_CTX_AFTER = 1;            // 1 after each changed line
+const FILE_WINDOW = 15;              // Stage 2: lines around each changed/log-cited line
+const WHOLE_FILE_CHARS = 4000;       // Stage 2: small files are sent whole, not excerpted
+const estTokens = s => Math.ceil(String(s).length / 4);
 
 // Free-tier model ladder — bench-validated 2026-09-26 (500 rows, 10 diffs × 5
 // runs × 10 models, see bench-cicd/bench-ext-summary.json). Ordered by
@@ -78,19 +86,30 @@ const FREE_MODEL_LADDER = [
   'poolside/laguna-xs-2.1:free',                   // 46% avail, recall 1.0 (rate-limited)
   'dots-studio/dots-3-note-preview:free',          // 18% avail, recall 1.0
 ];
-// Stage assignment (bench per role): diagnose = best recall/FP (ling-fin),
-// contextualize = most reliable (super), patch = perfect recall (ultra).
-const STAGE1_MODEL = 'inclusionai/ling-3.0-flash-fin:free';
-const STAGE2_MODEL = 'nvidia/nemotron-3-super-120b-a12b:free';
-const STAGE3_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free';
+// Primary model (issue #7): a cheap PAID model is tried first on every stage.
+// Inputs are compressed (see compressDiff), so a whole run costs well under a
+// cent, and a paid model has none of the free-tier 429/availability roulette.
+// deepseek-v4-flash-0731: $0.021/M in, $0.32/M out, 1.3M ctx, JSON mode, p50 ~1.5s.
+// The free ladder stays right behind it as fallback. AUTOFIX_PRIMARY_MODEL=free
+// switches back to free-first (stage models below), any other id overrides;
+// unset/empty (e.g. an undefined repo var) keeps the default.
+const PRIMARY_MODEL = (m => !m ? 'deepseek/deepseek-v4-flash-0731' : m === 'free' ? '' : m)(process.env.AUTOFIX_PRIMARY_MODEL);
+// Free stage assignment (bench per role), used when PRIMARY_MODEL is empty:
+// diagnose = best recall/FP (ling-fin), contextualize = most reliable (super),
+// patch = perfect recall (ultra).
+const STAGE1_MODEL = PRIMARY_MODEL || 'inclusionai/ling-3.0-flash-fin:free';
+const STAGE2_MODEL = PRIMARY_MODEL || 'nvidia/nemotron-3-super-120b-a12b:free';
+const STAGE3_MODEL = PRIMARY_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b:free';
 const STAGE0_MODEL_CHAIN = FREE_MODEL_LADDER; // first success wins (conflict resolution)
 // Cheap paid models — last resort after all free options exhausted.
-// Costs ~$0.04–0.15 per 1M input tokens (negligible for small conflict resolution prompts).
+// (google/gemini-flash-1.5-8b is gone from the OpenRouter catalog, 2026-09-26.)
 const CHEAP_PAID_FALLBACK = [
-  'deepseek/deepseek-chat',        // ~$0.07/1M — DeepSeek V3 paid, very capable
-  'google/gemini-flash-1.5-8b',   // ~$0.04/1M — cheapest capable model
-  'openai/gpt-4o-mini',           // ~$0.15/1M — reliable fallback
+  'deepseek/deepseek-v4.1-flash',  // $0.035/M in — same family as primary, different endpoint
+  'deepseek/deepseek-chat',        // DeepSeek V3 paid, very capable
+  'openai/gpt-4o-mini',            // $0.15/M — reliable, different vendor
 ];
+// Paid ids get the long timeout and are counted in the per-run cost summary.
+const isPaidModel = m => m === PRIMARY_MODEL || CHEAP_PAID_FALLBACK.includes(m);
 
 // OpenCode Go gateway — primary provider when OPENCODE_GO_API_KEY is set.
 // Subscription-backed, so no free-tier 429 roulette: tried FIRST on every
@@ -109,7 +128,7 @@ const GO_MODEL_LADDER = [
   'go:glm-5.3-flash',            // 47% avail, recall 1.00, 0 FP
 ];
 
-const STAGE0_MODEL = STAGE0_MODEL_CHAIN[0];
+const STAGE0_MODEL = PRIMARY_MODEL || STAGE0_MODEL_CHAIN[0];
 const STAGE0_FALLBACK_MODEL = STAGE0_MODEL_CHAIN[1]; // kept for compat, chain handles the rest
 
 const PR_FIXER_PREFIX = 'pr-fixer:';
@@ -148,6 +167,7 @@ function writeStats(category, extra = {}) {
     run_id: RUN_ID || '',
     category,
     ...extra,
+    llm_usage: { ..._usage, cost_usd: Number(_usage.cost_usd.toFixed(6)) },
   };
 
   // Machine-readable JSON artifact — aggregatable later via GitHub Actions API
@@ -164,6 +184,7 @@ function writeStats(category, extra = {}) {
       extra.reason  ? ['Reason',     extra.reason.slice(0, 200)]  : null,
       extra.fix     ? ['Fix',        extra.fix.slice(0, 200)]     : null,
       extra.hint    ? ['Hint',       extra.hint.slice(0, 300)]    : null,
+      _usage.calls  ? ['LLM', `${_usage.calls} calls, ${_usage.prompt_tokens} in / ${_usage.completion_tokens} out tokens, $${_usage.cost_usd.toFixed(5)} — ${Object.keys(_usage.by_model).join(', ')}`] : null,
     ].filter(Boolean);
 
     const tableRows = rows.map(([k, v]) => `| ${k} | ${v} |`).join('\n');
@@ -226,7 +247,7 @@ async function callModel(model, messages, json = false) {
       }),
       // Go p90 latency is 3–26s (bench) — the 20s free-tier cut would drop
       // healthy answers from qwen/glm, so Go rungs get the paid-tier budget.
-      signal: AbortSignal.timeout(isGo || CHEAP_PAID_FALLBACK.includes(m) ? 60_000 : 20_000),
+      signal: AbortSignal.timeout(isGo || isPaidModel(m) ? 60_000 : 20_000),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -244,16 +265,19 @@ async function callModel(model, messages, json = false) {
       throw Object.assign(new Error(`${isGo ? 'OpenCode Go' : 'OpenRouter'} HTTP ${res.status}: ${body}`), { status: res.status, isGo });
     }
     const data = await res.json();
+    recordUsage(m, data?.usage);
     return data?.choices?.[0]?.message?.content?.trim() || '';
   };
 
   // Every stage call fails over: primary model → rest of the ladder → any
   // remaining free models OpenRouter still lists → cheap paid last resort.
   // (Previously only STAGE0 had a chain; STAGE1/2/3 died on a single 429.)
-  const ladderStart = FREE_MODEL_LADDER.indexOf(model);
+  // The cheap paid PRIMARY_MODEL leads; the free ladder is its fallback.
+  const isPrimary = !!PRIMARY_MODEL && model === PRIMARY_MODEL;
+  const ladderStart = isPrimary ? 0 : FREE_MODEL_LADDER.indexOf(model);
   const orChain = !OR_KEY && GO_KEY ? []
     : ladderStart >= 0
-      ? [...FREE_MODEL_LADDER.slice(ladderStart), ...(await discoverFreeModels()), ...CHEAP_PAID_FALLBACK]
+      ? [...(isPrimary ? [PRIMARY_MODEL] : []), ...FREE_MODEL_LADDER.slice(ladderStart), ...(await discoverFreeModels()), ...CHEAP_PAID_FALLBACK]
       : [model];
   // Go rungs go first whenever the Go key is present — for every stage.
   const chain = [...new Set([...(goAvailable() ? GO_MODEL_LADDER : []), ...orChain])];
@@ -320,6 +344,16 @@ async function callModel(model, messages, json = false) {
   throw lastErr;
 }
 
+// Per-run model usage — which model actually answered and what it cost.
+// OpenRouter returns usage.cost (USD) in every response; Go is subscription.
+const _usage = { calls: 0, prompt_tokens: 0, completion_tokens: 0, cost_usd: 0, by_model: {} };
+function recordUsage(m, u) {
+  const e = (_usage.by_model[m] ||= { calls: 0, prompt_tokens: 0, completion_tokens: 0, cost_usd: 0 });
+  const pt = u?.prompt_tokens || 0, ct = u?.completion_tokens || 0, c = Number(u?.cost) || 0;
+  for (const t of [_usage, e]) { t.calls++; t.prompt_tokens += pt; t.completion_tokens += ct; t.cost_usd += c; }
+  log('model', `${m} answered: ${pt} in / ${ct} out tokens${c ? `, $${c.toFixed(6)}` : ''}`);
+}
+
 // Mutable copies so the self-test can toggle providers without env juggling.
 let OR_KEY = OPENROUTER_API_KEY || '';
 let GO_KEY = OPENCODE_GO_API_KEY || '';
@@ -365,13 +399,193 @@ function parseJSON(text) {
   return JSON.parse(t.slice(s, e + 1));
 }
 
-function readFileSafe(filePath) {
+function readFileSafe(filePath, limit = FILE_CHAR_LIMIT) {
   try {
     if (!existsSync(filePath)) return null;
-    return readFileSync(filePath, 'utf8').slice(0, FILE_CHAR_LIMIT);
+    return readFileSync(filePath, 'utf8').slice(0, limit);
   } catch {
     return null;
   }
+}
+
+// ── Input compression (issue #7) ─────────────────────────────────────────────
+// PR-Agent-style: instead of slicing the raw diff/file at N chars (which cuts
+// mid-hunk and drops whatever came last), parse the diff into hunks and shrink
+// it structurally, least-useful parts first. Output is still a valid unified
+// diff (sub-hunk headers are recomputed), so models read it as usual.
+
+// Files whose diff is noise for a CI fix — listed by name, never inlined.
+const NOISE_FILE_RE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|go\.sum|poetry\.lock|composer\.lock|Gemfile\.lock)$|\.(min\.js|min\.css|map|snap|svg|png|jpe?g|gif|ico|pdf|woff2?)$|(^|\/)(dist|build|vendor|node_modules)\//;
+
+function parseDiff(diff) {
+  const files = [];
+  let f = null, h = null;
+  for (const line of String(diff || '').split('\n')) {
+    const g = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (g) { f = { path: g[2], header: [line], hunks: [], binary: false, deleted: false }; files.push(f); h = null; continue; }
+    if (!f) continue;
+    const hh = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/);
+    if (hh) { h = { oldStart: +hh[1], newStart: +hh[3], tail: hh[5] || '', lines: [] }; f.hunks.push(h); continue; }
+    if (!h) {
+      if (/^Binary files /.test(line)) f.binary = true;
+      if (/^deleted file mode/.test(line)) f.deleted = true;
+      f.header.push(line);
+      continue;
+    }
+    if (line === '' || line[0] === ' ' || line[0] === '+' || line[0] === '-' || line[0] === '\\') h.lines.push(line);
+  }
+  return files;
+}
+
+// Keep ctxBefore/ctxAfter context lines around each change; split the hunk
+// where context runs longer and recompute each piece's @@ header. With
+// collapseDeletes, runs of '-' lines become one marker comment (level 1).
+function trimHunk(h, ctxBefore, ctxAfter, collapseDeletes = false) {
+  const L = h.lines.filter(l => l[0] !== '\\');
+  const isChg = l => l[0] === '+' || l[0] === '-';
+  const keep = new Array(L.length).fill(false);
+  L.forEach((l, i) => {
+    if (!isChg(l)) return;
+    for (let k = Math.max(0, i - ctxBefore); k <= Math.min(L.length - 1, i + ctxAfter); k++) keep[k] = true;
+  });
+  const out = [];
+  let oldLn = h.oldStart, newLn = h.newStart, cur = null;
+  L.forEach((l, i) => {
+    const t = l[0] === '+' ? '+' : l[0] === '-' ? '-' : ' ';
+    if (keep[i]) {
+      if (!cur) { cur = { oldStart: oldLn, newStart: newLn, oldN: 0, newN: 0, body: [], dels: 0 }; out.push(cur); }
+      if (t === '-' && collapseDeletes) { cur.dels++; cur.oldN++; }
+      else {
+        if (cur.dels) { cur.body.push(`-… (${cur.dels} removed line(s) omitted)`); cur.dels = 0; }
+        cur.body.push(l);
+        if (t !== '+') cur.oldN++;
+        if (t !== '-') cur.newN++;
+      }
+    } else cur = null;
+    if (t !== '+') oldLn++;
+    if (t !== '-') newLn++;
+  });
+  return out.map(c => {
+    if (c.dels) c.body.push(`-… (${c.dels} removed line(s) omitted)`);
+    return `@@ -${c.oldStart},${c.oldN} +${c.newStart},${c.newN} @@${h.tail}\n${c.body.join('\n')}`;
+  });
+}
+
+// Compress a unified diff into <= budgetTokens. Degradation order:
+//   always: drop noise/binary/deleted files and deletion-only hunks (listed)
+//   level 0: asymmetric context 3/1 for every file
+//   level 1 (if level 0 is over budget): zero context + collapse removed lines
+//   then, in priority order: a file that doesn't fit is cut mid-additions (if
+//   enough budget is left to be useful) or listed by name as "over budget".
+// Files cited in the failing CI log are placed first so they survive longest.
+function compressDiff(diff, budgetTokens = DIFF_TOKEN_BUDGET, failedLogText = '') {
+  const files = parseDiff(diff);
+  if (!files.length) return String(diff || '').slice(0, budgetTokens * 4);
+  const omitted = [];
+  const cited = f => failedLogText && (failedLogText.includes(f.path) || failedLogText.includes(path.basename(f.path)));
+  const useful = [];
+  for (const f of files) {
+    if (NOISE_FILE_RE.test(f.path) || f.binary) { omitted.push(`${f.path} (lock/generated/binary)`); continue; }
+    if (f.deleted) { omitted.push(`${f.path} (deleted)`); continue; }
+    const hunks = f.hunks.filter(h => h.lines.some(l => l[0] === '+'));
+    const dropped = f.hunks.length - hunks.length;
+    if (!hunks.length) { if (f.hunks.length) omitted.push(`${f.path} (deletion-only)`); continue; }
+    useful.push({ ...f, hunks, dropped });
+  }
+  useful.sort((a, b) => (cited(b) ? 1 : 0) - (cited(a) ? 1 : 0));
+  const render = (f, level) => {
+    const hdr = f.header.filter(l => /^(diff --git|--- |\+\+\+ |new file mode|rename )/.test(l));
+    const body = f.hunks.flatMap(h => level === 0 ? trimHunk(h, HUNK_CTX_BEFORE, HUNK_CTX_AFTER) : trimHunk(h, 0, 0, true));
+    const note = f.dropped ? [`# (${f.dropped} deletion-only hunk(s) omitted)`] : [];
+    return [...hdr, ...note, ...body].join('\n');
+  };
+  // Reserve room for the trailing "not shown" note (every path may end up there).
+  const reserve = estTokens(omitted.concat(useful.map(f => `${f.path} (over budget)`)).join(', ')) + 40;
+  const avail = budgetTokens - reserve;
+  let rendered = useful.map(f => render(f, 0));
+  if (estTokens(rendered.join('\n')) > avail) rendered = useful.map(f => render(f, 1));
+  let used = 0;
+  const parts = [], rest = [];
+  rendered.forEach((r, i) => {
+    const t = estTokens(r) + 1;
+    if (used + t <= avail) { parts.push(r); used += t; return; }
+    const left = avail - used;
+    if (left >= 200) {
+      const cut = r.slice(0, left * 4 - 80);
+      const kept = cut.slice(0, cut.lastIndexOf('\n'));
+      const more = r.slice(kept.length).split('\n').filter(l => l.startsWith('+')).length;
+      parts.push(`${kept}\n# … ${more} more added line(s) in ${useful[i].path} truncated (budget)`);
+      used = avail;
+      return;
+    }
+    rest.push(useful[i].path);
+  });
+  if (rest.length) omitted.push(...rest.map(p => `${p} (over budget)`));
+  if (omitted.length) parts.push(`# Compressed diff — not shown: ${omitted.join(', ')}.\n# Ask for a file via files_to_examine if you need it.`);
+  return parts.join('\n');
+}
+
+// New-side line numbers touched by the PR, per file (for Stage 2 excerpts).
+function changedLinesByFile(diff) {
+  const map = new Map();
+  for (const f of parseDiff(diff)) {
+    const set = new Set();
+    for (const h of f.hunks) {
+      let n = h.newStart;
+      for (const l of h.lines) {
+        if (l[0] === '+') { set.add(n); n++; }
+        else if (l[0] === '-' || l[0] === '\\') { /* old side only */ }
+        else n++;
+      }
+    }
+    map.set(f.path, set);
+  }
+  return map;
+}
+
+// Line numbers the CI log cites for this file ("src/a.js:42", "a.js(42,7)").
+function logCitedLines(filePath, logText) {
+  const out = new Set();
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const name of new Set([filePath, path.basename(filePath)])) {
+    const re = new RegExp(`${esc(name)}(?::|\\()(\\d+)`, 'g');
+    for (const m of String(logText || '').matchAll(re)) out.add(+m[1]);
+  }
+  return out;
+}
+
+// Stage 2 file context. Small files go whole; bigger ones become line-numbered
+// windows around PR-changed and log-cited lines, plus the first lines
+// (imports). Gaps are marked so the model knows it sees an excerpt and can say
+// MISSING_CONTEXT instead of guessing. Returns { text, excerpt }.
+function excerptFile(content, focusLines, budgetTokens = FILE_TOKEN_BUDGET) {
+  const lines = content.split('\n');
+  const num = (i) => `${String(i + 1).padStart(5)}| ${lines[i]}`;
+  if (content.length <= WHOLE_FILE_CHARS || (!focusLines.size && estTokens(content) <= budgetTokens)) {
+    return { text: lines.map((_, i) => num(i)).join('\n'), excerpt: false };
+  }
+  const keep = new Array(lines.length).fill(false);
+  for (let i = 0; i < Math.min(20, lines.length); i++) keep[i] = true;
+  // Nearest-first so the budget is spent on what the PR/log points at.
+  for (const ln of [...focusLines].sort((a, b) => a - b)) {
+    for (let k = Math.max(0, ln - 1 - FILE_WINDOW); k <= Math.min(lines.length - 1, ln - 1 + FILE_WINDOW); k++) keep[k] = true;
+  }
+  const out = [];
+  let used = 0, gapFrom = -1, cut = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (!keep[i]) { if (gapFrom < 0) gapFrom = i; continue; }
+    if (gapFrom >= 0) { out.push(`  ... (lines ${gapFrom + 1}-${i} omitted)`); gapFrom = -1; }
+    const row = num(i);
+    if (used + estTokens(row) > budgetTokens) { cut = true; out.push(`  ... (excerpt truncated at line ${i}, file has ${lines.length} lines)`); break; }
+    out.push(row); used += estTokens(row);
+  }
+  if (!cut && gapFrom >= 0) out.push(`  ... (lines ${gapFrom + 1}-${lines.length} omitted)`);
+  return { text: out.join('\n'), excerpt: true };
+}
+
+// Stage 2 contract: the model names files it could not see enough of.
+function parseMissingContext(text) {
+  return [...String(text || '').matchAll(/MISSING_CONTEXT:\s*`?([\w./@-]+\.[\w]+)`?/g)].map(m => m[1]);
 }
 
 // ── Conflict resolution with AI ──────────────────────────────────────────────
@@ -661,9 +875,6 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('ladder non-empty', FREE_MODEL_LADDER.length >= 5);
   check('ladder all :free', FREE_MODEL_LADDER.every(m => m.endsWith(':free')));
   check('ladder unique', new Set(FREE_MODEL_LADDER).size === FREE_MODEL_LADDER.length);
-  check('STAGE1 on ladder', FREE_MODEL_LADDER.includes(STAGE1_MODEL));
-  check('STAGE2 on ladder', FREE_MODEL_LADDER.includes(STAGE2_MODEL));
-  check('STAGE3 on ladder', FREE_MODEL_LADDER.includes(STAGE3_MODEL));
   check('paid fallback non-empty', CHEAP_PAID_FALLBACK.length >= 1);
 
   // callModel failover against a scripted mock of the OpenRouter API.
@@ -782,6 +993,86 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
     check('go-only config works', goSeq.length === 1 && goSeq[0].startsWith(GO_PREFIX));
   } catch (e) { check('go-only config works', false, e.message); }
 
+  // ── Primary cheap paid model (issue #7) ──
+  // Primary leads, the free ladder is its fallback, paid last-resort behind that.
+  globalThis.fetch = async (url, opts) => {
+    const b = JSON.parse(opts.body);
+    goSeq.push(b.model);
+    if (b.model === PRIMARY_MODEL && GO_MODE === 'primary500') return { ok: false, status: 500, text: async () => 'upstream' };
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"ok":true}' } }], usage: { prompt_tokens: 100, completion_tokens: 10, cost: 0.0000052 } }) };
+  };
+  OR_KEY = 'or-test'; GO_KEY = ''; _goDisabled = false;
+  if (!PRIMARY_MODEL) {
+    check('free-first mode: stages on free ladder', [STAGE1_MODEL, STAGE2_MODEL, STAGE3_MODEL].every(m => FREE_MODEL_LADDER.includes(m)));
+  } else {
+    check('primary is a paid, non-free model', !!PRIMARY_MODEL && !PRIMARY_MODEL.endsWith(':free') && isPaidModel(PRIMARY_MODEL));
+    check('stages 0-3 use primary', [STAGE0_MODEL, STAGE1_MODEL, STAGE2_MODEL, STAGE3_MODEL].every(m => m === PRIMARY_MODEL));
+    check('paid fallback has no retired ids', !CHEAP_PAID_FALLBACK.includes('google/gemini-flash-1.5-8b'));
+    goSeq.length = 0; GO_MODE = 'ok';
+    try {
+      await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
+      check('primary tried first', goSeq.length === 1 && goSeq[0] === PRIMARY_MODEL, goSeq.join(','));
+      check('usage recorded with cost', _usage.by_model[PRIMARY_MODEL]?.cost_usd > 0 && _usage.prompt_tokens >= 100);
+    } catch (e) { check('primary tried first', false, e.message); }
+    goSeq.length = 0; GO_MODE = 'primary500';
+    try {
+      await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
+      check('primary failure falls back to free ladder', goSeq[0] === PRIMARY_MODEL && goSeq[1] === FREE_MODEL_LADDER[0], goSeq.join(','));
+    } catch (e) { check('primary failure falls back to free ladder', false, e.message); }
+  }
+
+  // ── Input compression (issue #7) ──
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const os = await import('node:os');
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'autofix-st-'));
+  const orig = Array.from({ length: 120 }, (_, i) => `line ${i + 1}`);
+  const mod = orig.slice();
+  mod[9] = 'line 10 CHANGED';                 // hunk A
+  mod.splice(60, 0, 'added after 60');        // hunk B (pure addition)
+  mod.splice(101, 3);                          // hunk C (deletion-only: lines 101-103)
+  writeFileSync(path.join(tmp, 'a.txt'), orig.join('\n') + '\n');
+  writeFileSync(path.join(tmp, 'b.txt'), mod.join('\n') + '\n');
+  let raw = '';
+  try { execFileSync('git', ['diff', '--no-index', 'a.txt', 'b.txt'], { cwd: tmp, encoding: 'utf8' }); }
+  catch (e) { raw = e.stdout; } // exit 1 = files differ
+  raw = raw.replace(/a\/a\.txt/g, 'a/src/f.txt').replace(/b\/b\.txt/g, 'b/src/f.txt');
+  const lock = 'diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,1 +1,1 @@\n-{"a":1}\n+{"a":2}\n';
+  const cd = compressDiff(raw + lock, 4000, '');
+  check('compress: lock file listed, not inlined', cd.includes('package-lock.json (lock/generated/binary)') && !cd.includes('{"a":2}'));
+  check('compress: deletion-only hunk dropped', !cd.includes('-line 101') && cd.includes('deletion-only hunk'));
+  check('compress: additions kept', cd.includes('+line 10 CHANGED') && cd.includes('+added after 60'));
+  const body = cd.split('\n').filter(l => !l.startsWith('@@'));
+  check('compress: asymmetric context 3/1', body.includes(' line 7') && !body.includes(' line 6') && body.includes(' line 11') && !body.includes(' line 12'));
+  // Recomputed sub-hunk headers must still apply cleanly (minus the dropped deletion hunk).
+  const applicable = compressDiff(raw, 4000, '').split('\n').filter(l => !l.startsWith('#')).join('\n').replace(/src\/f\.txt/g, 'a.txt') + '\n';
+  writeFileSync(path.join(tmp, 'p.diff'), applicable);
+  let applies = true;
+  try { execFileSync('git', ['apply', '--check', 'p.diff'], { cwd: tmp, stdio: 'pipe' }); } catch { applies = false; }
+  check('compress: level-0 output is a valid applicable diff', applies);
+  // Budget: many big files → stays under budget, extra files listed by name, cited file first.
+  const big = n => `diff --git a/f${n}.js b/f${n}.js\n--- a/f${n}.js\n+++ b/f${n}.js\n@@ -1,1 +1,200 @@\n` + Array.from({ length: 200 }, (_, i) => `+const v${i} = ${i}; // padding padding padding`).join('\n');
+  const many = [1, 2, 3, 4, 5, 6].map(big).join('\n');
+  const cb = compressDiff(many, 1500, 'Error at f5.js:3');
+  check('compress: respects token budget', estTokens(cb) <= 1500, `~${estTokens(cb)}`);
+  check('compress: over-budget files listed', /f\d\.js \(over budget\)/.test(cb));
+  check('compress: log-cited file kept first', cb.indexOf('diff --git a/f5.js') === 0, cb.slice(0, 80));
+  check('compress: oversized file cut mid-additions, not dropped', /more added line\(s\) in f5\.js truncated/.test(cb));
+  const del = 'diff --git a/x.js b/x.js\n--- a/x.js\n+++ b/x.js\n@@ -1,40 +1,2 @@\n' + Array.from({ length: 38 }, (_, i) => `-old ${i}`).join('\n') + '\n+new 1\n+new 2';
+  const cl = compressDiff(del + '\n' + big(9), 1200, '');
+  check('compress: level-1 collapses removals, keeps additions', cl.includes('removed line(s) omitted') && cl.includes('+new 1') && !cl.includes('-old 5'), cl.slice(0, 200));
+
+  // Stage 2 excerpts.
+  check('changedLinesByFile maps new-side lines', changedLinesByFile(raw).get('src/f.txt')?.has(10) && changedLinesByFile(raw).get('src/f.txt')?.has(61));
+  check('logCitedLines finds path:line', logCitedLines('src/f.txt', 'at src/f.txt:77:3\n f.txt(5,2)').has(77) && logCitedLines('src/f.txt', 'f.txt(5,2)').has(5));
+  const small = excerptFile('a\nb\nc', new Set([2]));
+  check('excerpt: small file sent whole', !small.excerpt && small.text.includes('    3| c'));
+  const long = Array.from({ length: 2000 }, (_, i) => `const row${i} = ${i}; // some code here`).join('\n');
+  const ex = excerptFile(long, new Set([1000]));
+  check('excerpt: big file windows focus line with numbers', ex.excerpt && ex.text.includes(' 1000| const row999') && ex.text.includes('omitted') && !ex.text.includes('row500 '));
+  check('excerpt: within budget', estTokens(ex.text) <= FILE_TOKEN_BUDGET + 50, `~${estTokens(ex.text)}`);
+  check('parseMissingContext', parseMissingContext('ok\nMISSING_CONTEXT: src/lib/a.ts — need foo()\nMISSING_CONTEXT: `b.js`').join(',') === 'src/lib/a.ts,b.js');
+  rmSync(tmp, { recursive: true, force: true });
+
   globalThis.fetch = originalFetch;
   if (failed > 0) { console.error(`SELFTEST FAILED: ${failed} check(s)`); process.exit(1); }
   console.log('SELFTEST PASS');
@@ -855,10 +1146,15 @@ if (BATCH_MODE) {
   }
 }
 
+// prDiffRaw drives Stage 2 excerpts; prDiff is the structurally compressed
+// version every prompt sees (issue #7 — no more blind 10k-char slice).
+let prDiffRaw = '';
 let prDiff = '';
 try {
   sh(`git fetch origin ${BASE_BRANCH} --quiet`);
-  prDiff = sh(`git diff origin/${BASE_BRANCH}...HEAD`).slice(0, DIFF_CHAR_LIMIT);
+  prDiffRaw = sh(`git diff origin/${BASE_BRANCH}...HEAD`);
+  prDiff = compressDiff(prDiffRaw, DIFF_TOKEN_BUDGET, failedLog);
+  log('input', `diff compressed: ~${estTokens(prDiffRaw)} → ~${estTokens(prDiff)} tokens`);
 } catch { /* best effort */ }
 
 // ── Stage 0: Reasoning — understand WHY this PR exists ───────────────────────
@@ -990,7 +1286,7 @@ if (preStageDiagnosis) {
 } else {
   // ── Stage 1: Diagnose ──────────────────────────────────────────────────────
   log('stage1', `calling ${STAGE1_MODEL} for diagnosis...`);
-  await prComment('🔎 Stage 1/3: diagnosing CI failure with free LLM…');
+  await prComment('🔎 Stage 1/3: diagnosing CI failure with a cheap LLM…');
 
   let stage1Content;
   try {
@@ -1010,6 +1306,7 @@ Reply with valid JSON only:
 Rules:
 - files_to_examine: list up to ${MAX_FILES} specific source files (not node_modules, not lock files)
 - If the fix is obvious from the log alone and needs no extra file context, set files_to_examine to []
+- The PR diff is COMPRESSED: trimmed context, removed lines may be collapsed, some files listed as "not shown". If the cause may live in a file or region you cannot see, put that file in files_to_examine — never guess its content
 - If you cannot determine the cause, set problem to "CANNOT_DIAGNOSE"
 - confidence: high = clear deterministic fix; medium = likely fix; low = uncertain`,
       },
@@ -1047,15 +1344,21 @@ Rules:
   // ── Stage 2: Gather context ────────────────────────────────────────────────
   const fileList = (diagnosis.files_to_examine || []).slice(0, MAX_FILES);
   const fileContents = [];
+  const changedLines = changedLinesByFile(prDiffRaw);
 
+  // Line-numbered excerpts around PR-changed and log-cited lines (small files
+  // whole). full=true is the MISSING_CONTEXT retry: the plain capped file.
+  const loadFile = (filePath, full = false) => {
+    const content = readFileSafe(path.join(process.cwd(), filePath), full ? FILE_CHAR_LIMIT : 1_000_000);
+    if (content === null) { log('stage2', `skipped ${filePath} (not found)`); return null; }
+    const focus = new Set([...(changedLines.get(filePath) || []), ...logCitedLines(filePath, failedLog)]);
+    const { text, excerpt } = full ? excerptFile(content, new Set(), Infinity) : excerptFile(content, focus);
+    log('stage2', `loaded ${filePath} (${content.length} chars → ~${estTokens(text)} tokens${excerpt ? ', excerpt' : ''})`);
+    return `=== ${filePath}${excerpt ? ' (EXCERPT — gaps marked)' : ''} ===\n${text}`;
+  };
   for (const filePath of fileList) {
-    const content = readFileSafe(path.join(process.cwd(), filePath));
-    if (content !== null) {
-      fileContents.push(`=== ${filePath} ===\n${content}`);
-      log('stage2', `loaded ${filePath} (${content.length} chars)`);
-    } else {
-      log('stage2', `skipped ${filePath} (not found)`);
-    }
+    const block = loadFile(filePath);
+    if (block) fileContents.push(block);
   }
 
   let changeSpec = diagnosis.fix_approach;
@@ -1074,7 +1377,9 @@ Rules:
 
 Your job: describe exactly what lines/functions need to change to fix the CI failure. Be specific (file, function name, what to add/remove/change). Do NOT write code — only describe the change in plain English.
 
-If the diagnosis is wrong given what you see in the files, correct it.`,
+If the diagnosis is wrong given what you see in the files, correct it.
+
+Inputs are COMPRESSED: files may be line-numbered EXCERPTS with "... omitted" gaps, and the diff is trimmed. If the part you need is not visible, do NOT guess — output one line per file: MISSING_CONTEXT: <path> — <what you need>. You will then get the full file.`,
         },
         {
           role: 'user',
@@ -1083,6 +1388,19 @@ If the diagnosis is wrong given what you see in the files, correct it.`,
       ]);
 
       changeSpec = stage2Content;
+      // One retry with full files when the model says the excerpt was not enough.
+      const missing = [...new Set(parseMissingContext(stage2Content))].slice(0, MAX_FILES);
+      if (missing.length) {
+        log('stage2', `model reported MISSING_CONTEXT for: ${missing.join(', ')} — retrying with full files`);
+        const full = missing.map(f => loadFile(f, true)).filter(Boolean);
+        const others = fileContents.filter(b => !missing.some(f => b.startsWith(`=== ${f} `) || b.startsWith(`=== ${f}\n`)));
+        if (full.length) {
+          changeSpec = await callModel(STAGE2_MODEL, [
+            { role: 'system', content: 'You are a code reviewer helping plan a minimal CI fix. Describe exactly what lines/functions need to change (file, function, what to add/remove/change). Plain English, no code. The files you asked for are now complete (up to a size cap). If something is still missing, say so explicitly instead of guessing.' },
+            { role: 'user', content: `Root cause: ${diagnosis.problem}\n\nProposed fix approach: ${diagnosis.fix_approach}\n\nSource files:\n\n${[...full, ...others].join('\n\n')}\n\nPR diff:\n\`\`\`diff\n${prDiff}\n\`\`\`\n\nDescribe the exact changes needed.` },
+          ]);
+        }
+      }
       log('stage2', `change spec (first 200): ${changeSpec.slice(0, 200)}`);
     } catch (e) {
       log('stage2', `model error (${e.message.slice(0, 80)}) — falling back to stage 1 diagnosis`);
@@ -1106,6 +1424,7 @@ Rules:
 - Smallest possible change — no refactors, no unrelated edits
 - Valid git diff format, applicable via "git apply"
 - Wrap in a single \`\`\`diff code block
+- The PR diff you see is compressed (trimmed context). If you lack the exact surrounding lines needed for an applicable patch, reply CANNOT_FIX: missing context <file/what> — do not invent context lines
 - If you cannot produce a correct patch, reply exactly: CANNOT_FIX`,
       },
       {
@@ -1118,8 +1437,9 @@ Rules:
   }
 
   if (!stage3Content || stage3Content.includes('CANNOT_FIX')) {
-    await prComment(`❌ Stage 3: model declined to generate a patch\n\n**Cause:** ${diagnosis.problem}\n\nThis likely requires a code change that needs human judgement.`);
-    failWithStats('fail:ai_cannot_fix', 'Stage 3 declined to produce a patch', {
+    const why = (stage3Content || '').match(/CANNOT_FIX:?\s*(.{0,300})/)?.[1]?.trim() || '';
+    await prComment(`❌ Stage 3: model declined to generate a patch\n\n**Cause:** ${diagnosis.problem}${why ? `\n**Model says:** ${why}` : ''}\n\nThis likely requires a code change that needs human judgement.`);
+    failWithStats('fail:ai_cannot_fix', `Stage 3 declined to produce a patch${why ? `: ${why}` : ''}`, {
       problem: diagnosis.problem,
       fix_approach: diagnosis.fix_approach,
     });
@@ -1183,7 +1503,7 @@ const safeBranch = (ORIGINAL_BRANCH || 'unknown').replace(/[^a-zA-Z0-9-]/g, '-')
 const fixBranch = `fix/ci-${safeBranch}-${ts}`;
 const fixStrategy = preStageDiagnosis
   ? preStageDiagnosis.category
-  : `ai:free (${STAGE1_MODEL} → ${STAGE2_MODEL} → ${STAGE3_MODEL})`;
+  : `ai (${Object.keys(_usage.by_model).join(', ') || STAGE1_MODEL}, $${_usage.cost_usd.toFixed(5)})`;
 
 sh('git config user.name "trained-assist-autofix"');
 sh('git config user.email "autofix@trained-assist.bot"');
