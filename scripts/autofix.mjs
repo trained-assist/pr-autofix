@@ -736,7 +736,13 @@ function checkResolvedBlock(block, result) {
   return null;
 }
 
-async function resolveConflictsWithAI(conflictedFiles, prPurposeArg) {
+// Strip a markdown fence the model wraps the code in despite instructions.
+function stripCodeFence(t) {
+  const m = String(t || '').match(/^\s*```[\w-]*\n([\s\S]*?)\n```\s*$/);
+  return m ? m[1] : String(t || '');
+}
+
+async function resolveConflictsWithAI(conflictedFiles, prPurposeArg, retryHints = {}) {
   const protectedFiles = conflictedFiles.filter(f => PROTECTED_CONFLICT_RE.test(f));
   if (protectedFiles.length) {
     return { ok: false, reason: `conflict in protected CI config (${protectedFiles.join(', ')}) — needs a human` };
@@ -782,7 +788,15 @@ Return ONLY the resolved code — no conflict markers, no explanations, no markd
             },
             {
               role: 'user',
-              content: `File: ${filePath}\n\n${blocks[bi].full}`,
+              content: (() => {
+                // Surrounding code: a block resolved blind breaks syntax at its edges
+                // (hh-skill#5/#7 live: node --check failed after per-block resolution).
+                const at = content.indexOf(blocks[bi].full);
+                const before = content.slice(0, at).split('\n').slice(-20).join('\n');
+                const after = content.slice(at + blocks[bi].full.length).split('\n').slice(0, 20).join('\n');
+                const hint = retryHints[filePath] ? `\n\nA previous resolution of this file failed: ${retryHints[filePath]}\nMake the result syntactically valid in its surroundings.` : '';
+                return `File: ${filePath}\n\nCode BEFORE the conflict (context, do not repeat):\n${before}\n\nCONFLICT:\n${blocks[bi].full}\n\nCode AFTER the conflict (context, do not repeat):\n${after}${hint}\n\nReturn only the code that replaces the CONFLICT region.`;
+              })(),
             },
           ]);
         } catch (e) {
@@ -796,6 +810,7 @@ Return ONLY the resolved code — no conflict markers, no explanations, no markd
         resolvedCode.push(blocks[bi].full); // leave original conflict marker
         failedBlocks++;
       } else {
+        blockResult = stripCodeFence(blockResult);
         const guard = checkResolvedBlock(blocks[bi], blockResult.trim());
         if (guard) {
           log('conflict-resolve', `${filePath}: block ${blockNum} rejected — ${guard}`);
@@ -830,7 +845,8 @@ Return ONLY the resolved code — no conflict markers, no explanations, no markd
         log('conflict-resolve', `${filePath}: resolved OK (syntax valid)`);
       } catch (syntaxErr) {
         writeFileSync(fullPath, content); // restore original conflicted content
-        return { ok: false, reason: `AI resolution of ${filePath} introduced syntax error: ${syntaxErr.message.slice(0, 120)}` };
+        const msg = String(syntaxErr.stderr || syntaxErr.message).split('\n').filter(l => /Error|^\s*\^|:\d+$/.test(l)).slice(0, 4).join(' | ').slice(0, 300);
+        return { ok: false, syntax: true, file: filePath, reason: `AI resolution of ${filePath} introduced syntax error: ${msg}` };
       }
     } else {
       log('conflict-resolve', `${filePath}: resolved OK`);
@@ -879,7 +895,11 @@ async function tryFixOutOfDate(failedLog, prPurposeArg) {
     log('pre-A', `${conflictedFiles.length} conflict(s): ${conflictedFiles.join(', ')} — asking AI to resolve...`);
     await prComment(`🔀 Merge conflicts in ${conflictedFiles.length} file(s): \`${conflictedFiles.join('`, `')}\`\n\nAsking AI to resolve using context: _"${effectivePurpose.slice(0, 100)}"_…`);
 
-    const resolveResult = await resolveConflictsWithAI(conflictedFiles, effectivePurpose);
+    let resolveResult = await resolveConflictsWithAI(conflictedFiles, effectivePurpose);
+    if (!resolveResult.ok && resolveResult.syntax) {
+      log('pre-A', `syntax error after resolution — one retry with the error: ${resolveResult.reason.slice(0, 160)}`);
+      resolveResult = await resolveConflictsWithAI(conflictedFiles, effectivePurpose, { [resolveResult.file]: resolveResult.reason });
+    }
     if (!resolveResult.ok) {
       try { sh('git merge --abort'); } catch {}
       return {
@@ -1041,6 +1061,8 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   const blk = { ours: 'a: 1\nb: 2', theirs: 'x: 1\ny: 2\nz: 3\nw: 4' };
   check('guard rejects dropping base side', /dropped/.test(checkResolvedBlock(blk, 'a: 1\nb: 2') || ''));
   check('guard accepts union', checkResolvedBlock(blk, 'a: 1\nb: 2\nx: 1\ny: 2\nz: 3\nw: 4') === null);
+  check('fence stripped', stripCodeFence('```js\nconst a = 1;\n```') === 'const a = 1;');
+  check('unfenced kept', stripCodeFence('const a = 1;') === 'const a = 1;');
   check('guard rejects runaway', /runaway/.test(checkResolvedBlock(blk, blk.theirs + '\n' + 'q'.repeat(1000)) || ''));
 
   // Ladder integrity: every rung is a :free model, stages are on the ladder.
@@ -1573,11 +1595,12 @@ Rules:
     const content = readFileSafe(path.join(process.cwd(), filePath), 1_000_000);
     if (content === null) { log('stage2', `skipped ${filePath} (not found)`); return null; }
     const focus = new Set([...(changedLines.get(filePath) || []), ...logCitedLines(filePath, failedLog)]);
-    if (full) {
-      const hits = needleLines(content, contextNeedles(need, diagnosis.problem, diagnosis.fix_approach));
-      hits.forEach(l => focus.add(l));
-      log('stage2', `${filePath}: retry focus +${hits.length} line(s) matching the requested context`);
-    }
+    // First pass also focuses on what the DIAGNOSIS names (agent#1469: the stale
+    // require() sat on line ~400 of a 48k test file, neither PR-changed nor
+    // log-cited → a 343-token excerpt without it → Stage 3 declined).
+    const hits = needleLines(content, contextNeedles(full ? need : '', diagnosis.problem, diagnosis.fix_approach), full ? 40 : 15);
+    hits.forEach(l => focus.add(l));
+    if (hits.length) log('stage2', `${filePath}: focus +${hits.length} line(s) matching ${full ? 'the requested context' : 'the diagnosis'}`);
     const { text, excerpt } = excerptFile(content, focus, full ? FILE_TOKEN_BUDGET * 4 : FILE_TOKEN_BUDGET);
     log('stage2', `loaded ${filePath} (${content.length} chars → ~${estTokens(text)} tokens${excerpt ? ', excerpt' : ''})`);
     return `=== ${filePath}${excerpt ? ' (EXCERPT — gaps marked)' : ''} ===\n${text}`;
