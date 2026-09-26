@@ -67,7 +67,7 @@ The fixer runs in three layers:
 **AI stages** (primary `deepseek/deepseek-v4-flash-0731` → OpenRouter free ladder → cheap paid fallback; OpenCode Go first if its key is set):
 - Stage 1: Diagnose root cause + identify files to examine
 - Stage 2: Read line-numbered excerpts of those files (around PR-changed and log-cited lines; small files whole). If the model says `MISSING_CONTEXT: <file>`, it gets the full file and retries once
-- Stage 3: Write a unified diff to fix the issue
+- Stage 3: Return exact search/replace edits (`{file, old_str, new_str}`), validated and applied atomically — no hunk arithmetic for the model to get wrong; one retry with the mismatch errors. A unified diff answer still works (git apply → `--recount` → `patch --fuzz=3`)
 
 **Input compression** (every stage): the PR diff is parsed into hunks and shrunk PR-Agent style — asymmetric context (3 lines before / 1 after), deletion-only hunks and lock/generated/binary files dropped (listed by name), then zero context + collapsed removals, additions cut last, all within a ~4k-token budget. Files cited in the CI log go first. The CI log itself is compressed too (timestamps/ANSI/`##[group]` bodies/runner preamble/post-job cleanup stripped, error lines ±3 kept first, ~2.5k-token budget); deterministic pre-stage checks still see the raw log. Paid calls use OpenRouter `provider.sort=throughput` with reasoning off (stage 3 opts into low reasoning): ~1.5s/call, <$0.001/call. Stage 3 sees the same line-numbered file excerpts as stage 2. Models are told the input is compressed and must say what's missing instead of guessing. Token usage and cost per model land in `ci-fixer-stats.json` and the step summary.
 
