@@ -22,10 +22,14 @@ name: PR Autofix (callable)
 #       run_id: ${{ github.run_id }}
 #     secrets:
 #       openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+#       opencode_go_api_key: ${{ secrets.OPENCODE_GO_API_KEY }}   # optional, tried first
 #       gh_token: ${{ secrets.AUTOFIX_PAT || github.token }}
 #
 # Required secrets in your repo:
-#   OPENROUTER_API_KEY — get a free key at https://openrouter.ai
+#   OPENROUTER_API_KEY  — get a free key at https://openrouter.ai
+#   OPENCODE_GO_API_KEY — optional; OpenCode Go subscription key. When set, the
+#                         Go gateway is the primary provider and OpenRouter is
+#                         the fallback. At least one of the two is required.
 #   AUTOFIX_PAT        — Fine-Grained PAT with contents+pull_requests write on this repo
 #                        (GITHUB_TOKEN can't create PRs when org restricts workflow write)
 
@@ -47,8 +51,11 @@ on:
         default: '0'
     secrets:
       openrouter_api_key:
-        description: 'OpenRouter API key (free tier is sufficient)'
-        required: true
+        description: 'OpenRouter API key (free tier is sufficient). Fallback when opencode_go_api_key is set.'
+        required: false
+      opencode_go_api_key:
+        description: 'OpenCode Go gateway key — primary provider when set'
+        required: false
       gh_token:
         description: 'GitHub token with contents+pull_requests write (defaults to GITHUB_TOKEN)'
         required: false
@@ -126,6 +133,7 @@ jobs:
         continue-on-error: true
         env:
           OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+          OPENCODE_GO_API_KEY: ${{ secrets.opencode_go_api_key }}
           GH_TOKEN: ${{ secrets.gh_token || github.token }}
           RUN_ID: ${{ inputs.run_id }}
           REPO: ${{ github.repository }}

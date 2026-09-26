@@ -92,6 +92,23 @@ const CHEAP_PAID_FALLBACK = [
   'openai/gpt-4o-mini',           // ~$0.15/1M — reliable fallback
 ];
 
+// OpenCode Go gateway — primary provider when OPENCODE_GO_API_KEY is set.
+// Subscription-backed, so no free-tier 429 roulette: tried FIRST on every
+// stage call; the OpenRouter free ladder + paid fallback stay behind it.
+// Rungs are tagged `go:<model>` so callModel knows which endpoint to hit.
+// Order: bench 2026-09-26 (bench-cicd, BENCH_PROVIDER=go, 10 diffs × 3 runs).
+const GO_BASE = 'https://opencode.ai/zen/go/v1/chat/completions';
+const GO_PREFIX = 'go:';
+const GO_SESSION = `pr-autofix-${process.env.GITHUB_RUN_ID || 'local'}-${Date.now()}`;
+const GO_MODEL_LADDER = [
+  'go:deepseek-v4-flash',        // 97% avail, recall 0.83, 1 FP, p50 1.6s
+  'go:longcat-2.5-preview-free', // 100% avail, recall 0.90, 0 FP, p50 7.0s
+  'go:qwen3.8-flash',            // 97% avail, recall 0.86, 1 FP, p50 9.0s
+  'go:mimo-v2.6-flash',          // 87% avail, recall 0.88, 3 FP
+  'go:deepseek-flash',           // 77% avail, recall 0.87, 2 FP, p50 2.8s
+  'go:glm-5.3-flash',            // 47% avail, recall 1.00, 0 FP
+];
+
 const STAGE0_MODEL = STAGE0_MODEL_CHAIN[0];
 const STAGE0_FALLBACK_MODEL = STAGE0_MODEL_CHAIN[1]; // kept for compat, chain handles the rest
 
@@ -99,6 +116,7 @@ const PR_FIXER_PREFIX = 'pr-fixer:';
 
 const {
   OPENROUTER_API_KEY,
+  OPENCODE_GO_API_KEY,
   GH_TOKEN,
   RUN_ID,
   REPO,
@@ -191,19 +209,24 @@ async function prComment(body) {
 
 async function callModel(model, messages, json = false) {
   const tryModel = async (m, wantJson) => {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const isGo = m.startsWith(GO_PREFIX);
+    const res = await fetch(isGo ? GO_BASE : 'https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${isGo ? GO_KEY : OR_KEY}`,
         'Content-Type': 'application/json',
+        // The Go gateway 400s (MissingSessionID) without a session header.
+        ...(isGo ? { 'x-opencode-session': GO_SESSION } : {}),
       },
       body: JSON.stringify({
-        model: m,
+        model: isGo ? m.slice(GO_PREFIX.length) : m,
         messages,
         temperature: 0,
         ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
       }),
-      signal: AbortSignal.timeout(CHEAP_PAID_FALLBACK.includes(m) ? 60_000 : 20_000),
+      // Go p90 latency is 3–26s (bench) — the 20s free-tier cut would drop
+      // healthy answers from qwen/glm, so Go rungs get the paid-tier budget.
+      signal: AbortSignal.timeout(isGo || CHEAP_PAID_FALLBACK.includes(m) ? 60_000 : 20_000),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -218,7 +241,7 @@ async function callModel(model, messages, json = false) {
         log('model', `${m} rejected response_format (400) — retrying prompt-only`);
         return tryModel(m, false);
       }
-      throw Object.assign(new Error(`OpenRouter HTTP ${res.status}: ${body}`), { status: res.status });
+      throw Object.assign(new Error(`${isGo ? 'OpenCode Go' : 'OpenRouter'} HTTP ${res.status}: ${body}`), { status: res.status, isGo });
     }
     const data = await res.json();
     return data?.choices?.[0]?.message?.content?.trim() || '';
@@ -228,13 +251,18 @@ async function callModel(model, messages, json = false) {
   // remaining free models OpenRouter still lists → cheap paid last resort.
   // (Previously only STAGE0 had a chain; STAGE1/2/3 died on a single 429.)
   const ladderStart = FREE_MODEL_LADDER.indexOf(model);
-  const chain = ladderStart >= 0
-    ? [...FREE_MODEL_LADDER.slice(ladderStart), ...(await discoverFreeModels()), ...CHEAP_PAID_FALLBACK]
-    : [model];
+  const orChain = !OR_KEY && GO_KEY ? []
+    : ladderStart >= 0
+      ? [...FREE_MODEL_LADDER.slice(ladderStart), ...(await discoverFreeModels()), ...CHEAP_PAID_FALLBACK]
+      : [model];
+  // Go rungs go first whenever the Go key is present — for every stage.
+  const chain = [...new Set([...(goAvailable() ? GO_MODEL_LADDER : []), ...orChain])];
+  if (!chain.length) throw new Error('no LLM provider configured (OPENCODE_GO_API_KEY / OPENROUTER_API_KEY)');
 
   let lastErr;
   let reachedPaid = false;
   for (const m of chain) {
+    if (m.startsWith(GO_PREFIX) && !goAvailable()) continue; // Go key rejected earlier this run
     const isPaid = CHEAP_PAID_FALLBACK.includes(m);
     try {
       if (m !== model) {
@@ -273,6 +301,13 @@ async function callModel(model, messages, json = false) {
       // whole stage on one model, which is exactly what the ladder exists to
       // prevent. Only auth/billing are fatal: retrying them across models
       // cannot help and just burns the chain.
+      // A rejected Go key/subscription only disables the Go rungs — the
+      // OpenRouter ladder behind them is an independent provider.
+      if (e.isGo && [401, 402, 403].includes(e.status)) {
+        _goDisabled = true;
+        log('model', `OpenCode Go auth/billing failed (${e.status}) — skipping Go rungs, falling back to OpenRouter`);
+        continue;
+      }
       const fatal = [401, 402].includes(e.status);
       if (fatal) throw e;
       if (e.name === 'AbortError' || e.name === 'TimeoutError') {
@@ -285,13 +320,20 @@ async function callModel(model, messages, json = false) {
   throw lastErr;
 }
 
+// Mutable copies so the self-test can toggle providers without env juggling.
+let OR_KEY = OPENROUTER_API_KEY || '';
+let GO_KEY = OPENCODE_GO_API_KEY || '';
+let _goDisabled = false;
+function goAvailable() { return !!GO_KEY && !_goDisabled; }
+
 // Cached list of free models discovered from OpenRouter /models (fetched once per run)
 let _discoveredFreeModels = null;
 async function discoverFreeModels() {
   if (_discoveredFreeModels !== null) return _discoveredFreeModels;
+  if (!OR_KEY) return (_discoveredFreeModels = []);
   try {
     const res = await fetch('https://openrouter.ai/api/v1/models', {
-      headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` },
+      headers: { Authorization: `Bearer ${OR_KEY}` },
       signal: AbortSignal.timeout(8_000),
     });
     if (!res.ok) { _discoveredFreeModels = []; return []; }
@@ -650,6 +692,8 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
     return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
   };
   _discoveredFreeModels = [];
+  // OpenRouter-only for tests 1–4, independent of whatever keys the host has.
+  OR_KEY = 'or-test'; GO_KEY = '';
 
   // 1. response_format 400 → retries the SAME model prompt-only and succeeds.
   //    Regression: the old regex `/response_format|json_object/` never matched
@@ -689,6 +733,55 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
     check('auth401 is fatal', String(e.status) === '401' && !seq.includes('R1'));
   }
 
+  // ── OpenCode Go provider ──
+  check('go ladder non-empty', GO_MODEL_LADDER.length >= 3);
+  check('go ladder all tagged', GO_MODEL_LADDER.every(m => m.startsWith(GO_PREFIX)));
+  const goSeq = [];
+  let GO_MODE = 'ok';
+  globalThis.fetch = async (url, opts) => {
+    const b = JSON.parse(opts.body);
+    const auth = opts.headers.Authorization;
+    if (url === GO_BASE) {
+      if (!opts.headers['x-opencode-session']) return { ok: false, status: 400, text: async () => '{"error":{"type":"MissingSessionID"}}' };
+      goSeq.push(`go:${b.model}|${auth}`);
+      if (GO_MODE === 'auth401') return { ok: false, status: 401, text: async () => 'invalid key' };
+      if (GO_MODE === 'first429' && b.model === GO_MODEL_LADDER[0].slice(GO_PREFIX.length)) return { ok: false, status: 429, text: async () => 'rate' };
+      return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
+    }
+    goSeq.push(`or:${b.model}|${auth}`);
+    return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
+  };
+  OR_KEY = 'or-test'; GO_KEY = 'go-test';
+
+  // 5. Go key set → Go rung is hit FIRST, with the Go key, model id untagged.
+  goSeq.length = 0; GO_MODE = 'ok'; _goDisabled = false;
+  try {
+    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
+    check('go tried first with go key', goSeq[0] === `${GO_MODEL_LADDER[0]}|Bearer go-test` && goSeq.length === 1, goSeq.join(','));
+  } catch (e) { check('go tried first with go key', false, e.message); }
+
+  // 6. Go 429 on first rung → next Go rung (not straight to OpenRouter).
+  goSeq.length = 0; GO_MODE = 'first429'; _goDisabled = false;
+  try {
+    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
+    check('go 429 advances within go', goSeq[1]?.startsWith(GO_MODEL_LADDER[1] + '|'), goSeq.join(','));
+  } catch (e) { check('go 429 advances within go', false, e.message); }
+
+  // 7. Go 401 → NOT fatal: Go rungs skipped, OpenRouter ladder answers with the OR key.
+  goSeq.length = 0; GO_MODE = 'auth401'; _goDisabled = false;
+  try {
+    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
+    const goHits = goSeq.filter(x => x.startsWith('go:')).length;
+    check('go 401 falls back to openrouter', goHits === 1 && goSeq[1] === `or:${STAGE1_MODEL}|Bearer or-test`, goSeq.join(','));
+  } catch (e) { check('go 401 falls back to openrouter', false, e.message); }
+
+  // 8. Go-only config (no OpenRouter key) still works.
+  goSeq.length = 0; GO_MODE = 'ok'; _goDisabled = false; OR_KEY = '';
+  try {
+    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
+    check('go-only config works', goSeq.length === 1 && goSeq[0].startsWith(GO_PREFIX));
+  } catch (e) { check('go-only config works', false, e.message); }
+
   globalThis.fetch = originalFetch;
   if (failed > 0) { console.error(`SELFTEST FAILED: ${failed} check(s)`); process.exit(1); }
   console.log('SELFTEST PASS');
@@ -697,7 +790,8 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
 
 // ── Preflight ────────────────────────────────────────────────────────────────
 
-if (!OPENROUTER_API_KEY) failWithStats('fail:other', 'OPENROUTER_API_KEY not set');
+if (!OPENROUTER_API_KEY && !OPENCODE_GO_API_KEY) failWithStats('fail:other', 'neither OPENCODE_GO_API_KEY nor OPENROUTER_API_KEY set');
+log('model', `providers: ${OPENCODE_GO_API_KEY ? `OpenCode Go (${GO_MODEL_LADDER.length} rungs) → ` : ''}${OPENROUTER_API_KEY ? 'OpenRouter free ladder → paid' : '(no OpenRouter)'}`);
 if (!REPO || !PR_NUMBER) failWithStats('fail:other', 'missing REPO/PR_NUMBER env');
 if (!BATCH_MODE && !RUN_ID) failWithStats('fail:other', 'missing RUN_ID env (set RUN_ID=0 for batch/manual mode)');
 
