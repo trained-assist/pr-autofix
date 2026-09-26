@@ -207,9 +207,15 @@ async function callModel(model, messages, json = false) {
     });
     if (!res.ok) {
       const body = await res.text();
-      // Some free models reject response_format (400) even though they answer
-      // JSON fine from the prompt alone — retry without the constraint.
-      if (json && res.status === 400 && wantJson && /response_format|json_object/i.test(body)) {
+      // Free models reject response_format with a 400 whose body says things
+      // like `does not support feature: structured-outputs` — it never mentions
+      // "response_format", so this used to be gated on a regex that never
+      // matched and the model was skipped instead of retried prompt-only.
+      // Any 400 while wantJson → retry the SAME model once without the
+      // constraint. Recursion is bounded: the retry passes wantJson=false, so a
+      // second 400 falls through to the throw below.
+      if (json && res.status === 400 && wantJson) {
+        log('model', `${m} rejected response_format (400) — retrying prompt-only`);
         return tryModel(m, false);
       }
       throw Object.assign(new Error(`OpenRouter HTTP ${res.status}: ${body}`), { status: res.status });
@@ -239,15 +245,41 @@ async function callModel(model, messages, json = false) {
         log('model', `trying ${m}${isPaid ? ' (paid)' : ''}`);
       }
       const result = await tryModel(m, json);
-      if (result) return result; // non-empty → success
-      lastErr = new Error(`${m} returned empty response`);
-      log('model', `${m} empty — trying next`);
+      if (!result) {
+        lastErr = new Error(`${m} returned empty response`);
+        log('model', `${m} empty — trying next`);
+        continue;
+      }
+      // When JSON was requested, "non-empty" is NOT success: the bench showed
+      // no_json was the dominant failure (227/500 rows), and a prose answer
+      // used to pass this check only to blow up in the caller's parseJSON with
+      // no failover — the stage died on a model that had simply answered
+      // talkatively. Validate here so the ladder advances instead.
+      if (json) {
+        try {
+          parseJSON(result);
+        } catch (e) {
+          lastErr = new Error(`${m} returned unparseable JSON: ${e.message}`);
+          log('model', `${m} returned non-JSON — trying next`);
+          continue;
+        }
+      }
+      return result;
     } catch (e) {
       lastErr = e;
-      const isRetryable = [400, 403, 404, 429, 503].includes(e.status)
-        || e.name === 'AbortError' || e.name === 'TimeoutError';
-      if (!isRetryable) throw e;
-      if (e.name === 'AbortError' || e.name === 'TimeoutError') log('model', `${m} timed out — trying next`);
+      // Default is "advance the ladder". The old list only tolerated
+      // 400/403/404/429/503 — a 500/502/504 from an upstream provider (never
+      // seen in the bench, common in prod) escaped the loop and killed the
+      // whole stage on one model, which is exactly what the ladder exists to
+      // prevent. Only auth/billing are fatal: retrying them across models
+      // cannot help and just burns the chain.
+      const fatal = [401, 402].includes(e.status);
+      if (fatal) throw e;
+      if (e.name === 'AbortError' || e.name === 'TimeoutError') {
+        log('model', `${m} timed out — trying next`);
+      } else {
+        log('model', `${m} failed (${e.status || e.name}) — trying next`);
+      }
     }
   }
   throw lastErr;
@@ -562,6 +594,107 @@ function checkCloudflareConflict(failedLog) {
   return patterns.some(p => p.test(failedLog));
 }
 
+// ── Self-test (AUTOFIX_SELFTEST=1) ─────────────────────────────────────────────
+// Pure-function contract test, runnable without GitHub/OpenRouter:
+//   AUTOFIX_SELFTEST=1 node scripts/autofix.mjs && echo PASS
+// Exercises parseJSON tolerance and the callModel failover ladder against a
+// mocked fetch, so the regression that free models only fail over on transport
+// errors (not on 400-rejected response_format or prose answers) stays locked.
+if (process.env.AUTOFIX_SELFTEST === '1') {
+  let failed = 0;
+  const check = (name, cond, detail = '') => {
+    if (cond) { console.log(`ok   ${name}`); }
+    else { failed++; console.log(`FAIL ${name} ${detail}`); }
+  };
+
+  // parseJSON tolerance: fences, prose prefix, nested braces, no-JSON.
+  check('parseJSON plain', parseJSON('{"a":1}').a === 1);
+  check('parseJSON fenced', parseJSON('```json\n{"a":1}\n```').a === 1);
+  check('parseJSON prose-prefixed', parseJSON('Sure! Here is the result:\n{"a":1}').a === 1);
+  check('parseJSON nested braces', parseJSON('{"a":{"b":[{"c":2}]}}').a.b[0].c === 2);
+  let threw = false; try { parseJSON('just some prose, no json'); } catch { threw = true; }
+  check('parseJSON rejects plain prose', threw);
+
+  // Ladder integrity: every rung is a :free model, stages are on the ladder.
+  check('ladder non-empty', FREE_MODEL_LADDER.length >= 5);
+  check('ladder all :free', FREE_MODEL_LADDER.every(m => m.endsWith(':free')));
+  check('ladder unique', new Set(FREE_MODEL_LADDER).size === FREE_MODEL_LADDER.length);
+  check('STAGE1 on ladder', FREE_MODEL_LADDER.includes(STAGE1_MODEL));
+  check('STAGE2 on ladder', FREE_MODEL_LADDER.includes(STAGE2_MODEL));
+  check('STAGE3 on ladder', FREE_MODEL_LADDER.includes(STAGE3_MODEL));
+  check('paid fallback non-empty', CHEAP_PAID_FALLBACK.length >= 1);
+
+  // callModel failover against a scripted mock of the OpenRouter API.
+  // The mock keys off the ACTUAL ladder entries (callModel builds the chain from
+  // the ladder when the model is on it), so the failover path is the real one.
+  const [R0, R1] = [FREE_MODEL_LADDER[0], FREE_MODEL_LADDER[1]];
+  const originalFetch = globalThis.fetch;
+  const seq = [];
+  const rfRejectedBody = JSON.stringify({ error: { message: 'Provider returned error', code: 400, metadata: { raw: '{"code":400,"reason":"INVALID_REQUEST_BODY","message":"model: inclusionai/ling-3.0-flash-fin does not support feature: structured-outputs"}' } } });
+  const proseBody = JSON.stringify({ choices: [{ message: { content: 'I cannot do that, but here is a thought: the bug is obvious.' } }] });
+  const jsonBody = JSON.stringify({ choices: [{ message: { content: '{"problem":"x","files_to_examine":[],"fix_approach":"y","confidence":"high"}' } }] });
+  let MODE = 'rf-reject';
+  globalThis.fetch = async (url, opts) => {
+    const m = JSON.parse(opts.body).model;
+    const rf = !!JSON.parse(opts.body).response_format;
+    if (m === R0) {
+      seq.push('R0');
+      if (MODE === 'rf-reject' && rf) return { ok: false, status: 400, text: async () => rfRejectedBody };
+      if (MODE === 'prose') return { ok: true, status: 200, json: async () => JSON.parse(proseBody) };
+      if (MODE === 'http500') return { ok: false, status: 500, text: async () => 'upstream error' };
+      if (MODE === 'auth401') return { ok: false, status: 401, text: async () => 'bad key' };
+      // default / rf-reject prompt-only retry: R0 answers JSON fine.
+      return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
+    }
+    seq.push('R1');
+    return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
+  };
+  _discoveredFreeModels = [];
+
+  // 1. response_format 400 → retries the SAME model prompt-only and succeeds.
+  //    Regression: the old regex `/response_format|json_object/` never matched
+  //    the real body ("does not support feature: structured-outputs"), so R0 was
+  //    skipped to the next rung instead of retried — STAGE1's best model was
+  //    silently dropped on every run. Now the retry must land on R0, not R1.
+  seq.length = 0;
+  MODE = 'rf-reject';
+  try {
+    const out = await callModel(R0, [{ role: 'user', content: 'hi' }], true);
+    check('rf-400 retried prompt-only and succeeded', out.includes('"problem"') && !seq.includes('R1'));
+  } catch (e) { check('rf-400 retried prompt-only and succeeded', false, e.message); }
+
+  // 2. json=true + prose answer → advances to the next rung instead of returning prose.
+  seq.length = 0;
+  MODE = 'prose';
+  try {
+    const out = await callModel(R0, [{ role: 'user', content: 'hi' }], true);
+    check('prose advanced to next rung', seq.includes('R1') && out.includes('"problem"'));
+  } catch (e) { check('prose advanced to next rung', false, e.message); }
+
+  // 3. HTTP 500 (was NOT in the old retryable list → killed the whole stage) → advances.
+  seq.length = 0;
+  MODE = 'http500';
+  try {
+    const out = await callModel(R0, [{ role: 'user', content: 'hi' }], true);
+    check('http500 advanced to next rung', seq.includes('R1') && out.includes('"problem"'));
+  } catch (e) { check('http500 advanced to next rung', false, e.message); }
+
+  // 4. HTTP 401 is fatal — retrying across models can't help.
+  seq.length = 0;
+  MODE = 'auth401';
+  try {
+    await callModel(R0, [{ role: 'user', content: 'hi' }], true);
+    check('auth401 is fatal', false, 'should have thrown');
+  } catch (e) {
+    check('auth401 is fatal', String(e.status) === '401' && !seq.includes('R1'));
+  }
+
+  globalThis.fetch = originalFetch;
+  if (failed > 0) { console.error(`SELFTEST FAILED: ${failed} check(s)`); process.exit(1); }
+  console.log('SELFTEST PASS');
+  process.exit(0);
+}
+
 // ── Preflight ────────────────────────────────────────────────────────────────
 
 if (!OPENROUTER_API_KEY) failWithStats('fail:other', 'OPENROUTER_API_KEY not set');
@@ -685,8 +818,9 @@ Set is_clear=true for ordinary feature PRs, bug fixes, refactors, dependency upd
       },
       { role: 'user', content: prContext },
     ], true);
-    const cleaned = raw.replace(/^```json\n?/, '').replace(/```$/, '');
-    reasoning = JSON.parse(cleaned);
+    // callModel already validated this parses when json=true; parseJSON also
+    // tolerates fences/prose wrappers that JSON.parse(cleaned) used to choke on.
+    reasoning = parseJSON(raw);
   } catch (e) {
     log('stage0', `reasoning model error (${e.message.slice(0, 80)}) — assuming clear and proceeding`);
     reasoning = { purpose: 'unknown (model error)', is_clear: true, ambiguity_reason: '' };
