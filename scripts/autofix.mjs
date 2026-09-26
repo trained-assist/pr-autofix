@@ -58,7 +58,7 @@ import { execSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
 
-const LOG_CHAR_LIMIT = 12000;
+const LOG_CHAR_LIMIT = 120000; // raw log cap BEFORE compressLog (which fits LOG_TOKEN_BUDGET)
 const FILE_CHAR_LIMIT = 8000;
 const MAX_FILES = 8;
 // Structured input compression (PR-Agent style, issue #7). Budgets are in
@@ -228,7 +228,12 @@ async function prComment(body) {
   try { unlinkSync('__comment.txt'); } catch {}
 }
 
-async function callModel(model, messages, json = false) {
+// opts.reasoning: paid models run with reasoning OFF by default — measured on a
+// real 5k-token CI log: 1.3–1.6s vs 15–60s with reasoning on, same diagnosis.
+// Stage 3 (patch writing) opts back in. Paid calls are routed to the fastest
+// provider (sort: throughput): ~$0.0007/call instead of ~$0.00015, but the slow
+// cheap providers timed out the primary in the first live smoke.
+async function callModel(model, messages, json = false, opts = {}) {
   const tryModel = async (m, wantJson) => {
     const isGo = m.startsWith(GO_PREFIX);
     const res = await fetch(isGo ? GO_BASE : 'https://openrouter.ai/api/v1/chat/completions', {
@@ -244,6 +249,10 @@ async function callModel(model, messages, json = false) {
         messages,
         temperature: 0,
         ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
+        ...(!isGo && isPaidModel(m) ? {
+          provider: { sort: 'throughput' },
+          reasoning: opts.reasoning ? { effort: 'low' } : { enabled: false },
+        } : {}),
       }),
       // Go p90 latency is 3–26s (bench) — the 20s free-tier cut would drop
       // healthy answers from qwen/glm, so Go rungs get the paid-tier budget.
@@ -523,6 +532,55 @@ function compressDiff(diff, budgetTokens = DIFF_TOKEN_BUDGET, failedLogText = ''
   if (rest.length) omitted.push(...rest.map(p => `${p} (over budget)`));
   if (omitted.length) parts.push(`# Compressed diff — not shown: ${omitted.join(', ')}.\n# Ask for a file via files_to_examine if you need it.`);
   return parts.join('\n');
+}
+
+// CI log compression. Raw Actions job logs are mostly runner noise: ISO
+// timestamps on every line, ANSI colours, ##[group] blocks with env dumps and
+// setup chatter, post-job cleanup. Strip that, keep step headers ("Run npm
+// test") and step output, then fit the budget keeping error-looking lines and
+// their neighbourhood first, the tail next. Order is preserved.
+const LOG_TOKEN_BUDGET = 2500;
+const LOG_ERROR_RE = /(error|fail|not ok|assert|expected|received|actual|exception|traceback|panic|cannot|undefined|denied|missing|exit code [1-9]|✗|✖|×)/i;
+function compressLog(raw, budgetTokens = LOG_TOKEN_BUDGET) {
+  const lines = [];
+  let inGroup = false, seen = new Set(), sawStep = false;
+  for (let l of String(raw || '').split('\n')) {
+    l = l.replace(/^\uFEFF/, '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z ?/, '').trimEnd();
+    if (/^##\[group\]/.test(l)) {
+      inGroup = true;
+      const step = l.replace(/^##\[group\]/, '');
+      if (/^Run /.test(step)) { lines.push(`▶ ${step.slice(0, 160)}`); sawStep = true; }
+      continue;
+    }
+    if (/^##\[endgroup\]/.test(l)) { inGroup = false; continue; }
+    if (inGroup || !l.trim()) continue;
+    if (/^Post job cleanup|^Cleaning up orphan processes/.test(l)) break;
+    if (/^(=== job: )/.test(l)) { lines.push(l); sawStep = false; continue; }
+    // Runner preamble before the first step (versions, action downloads).
+    if (!sawStep && !LOG_ERROR_RE.test(l)) continue;
+    // Collapse exact repeats (retry spam, progress bars).
+    if (seen.has(l) && !LOG_ERROR_RE.test(l)) continue;
+    seen.add(l);
+    lines.push(l.replace(/^##\[error\]/, 'ERROR: ').slice(0, 400));
+  }
+  const text = lines.join('\n');
+  if (estTokens(text) <= budgetTokens) return text;
+  // Over budget: error lines ±3 first, then fill from the tail backwards.
+  const keep = new Array(lines.length).fill(false);
+  let used = 0;
+  const take = i => { if (keep[i]) return true; const t = estTokens(lines[i]) + 1; if (used + t > budgetTokens) return false; keep[i] = true; used += t; return true; };
+  lines.forEach((l, i) => { if (/^(▶ |=== job: )/.test(l)) take(i); });
+  outer: for (let i = lines.length - 1; i >= 0; i--) {
+    if (!LOG_ERROR_RE.test(lines[i])) continue;
+    for (let k = Math.max(0, i - 3); k <= Math.min(lines.length - 1, i + 3); k++) if (!take(k)) break outer;
+  }
+  for (let i = lines.length - 1; i >= 0; i--) if (!take(i)) break;
+  const out = [];
+  lines.forEach((l, i) => {
+    if (keep[i]) out.push(l);
+    else if (out[out.length - 1] !== '  …') out.push('  …');
+  });
+  return out.join('\n');
 }
 
 // New-side line numbers touched by the PR, per file (for Stage 2 excerpts).
@@ -1073,6 +1131,28 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('parseMissingContext', parseMissingContext('ok\nMISSING_CONTEXT: src/lib/a.ts — need foo()\nMISSING_CONTEXT: `b.js`').join(',') === 'src/lib/a.ts,b.js');
   rmSync(tmp, { recursive: true, force: true });
 
+  // ── CI log compression + fast paid routing (live smoke findings) ──
+  const ts = '2026-09-26T20:14:11.9392263Z ';
+  const rawLog = '﻿' + ts + "Current runner version: '2.337.0'\n" + ts + '##[group]Run actions/checkout@v4\n' + ts + 'with: token: ***\n' + ts + '##[endgroup]\n'
+    + Array.from({ length: 400 }, (_, i) => `${ts}\x1b[32mprogress ${i} ok\x1b[0m`).join('\n') + '\n'
+    + ts + '##[group]Run npm test\n' + ts + 'npm test\n' + ts + '##[endgroup]\n'
+    + ts + "# Error: Cannot find module '/w/test'\n" + ts + 'not ok 1 - test\n' + ts + '##[error]Process completed with exit code 1.\n'
+    + ts + 'Post job cleanup.\n' + ts + 'git version 2.4\n';
+  const lc = compressLog(rawLog, 300);
+  check('log: timestamps/ANSI/BOM/preamble stripped', !/2026-09-26T|\x1b|﻿|runner version/.test(lc), lc.slice(0, 120));
+  check('log: group bodies dropped, step headers kept', lc.includes('▶ Run npm test') && !lc.includes('token: ***'));
+  check('log: error lines survive the budget', lc.includes("Cannot find module '/w/test'") && lc.includes('not ok 1') && lc.includes('ERROR: Process completed with exit code 1'));
+  check('log: within budget, post-job cleanup cut', estTokens(lc) <= 300 && !lc.includes('git version'), `~${estTokens(lc)}`);
+  const bodies = [];
+  globalThis.fetch = async (url, opts) => { bodies.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"ok":1}' } }] }) }; };
+  OR_KEY = 'or-test'; GO_KEY = '';
+  await callModel(PRIMARY_MODEL || CHEAP_PAID_FALLBACK[0], [{ role: 'user', content: 'x' }], true);
+  await callModel(PRIMARY_MODEL || CHEAP_PAID_FALLBACK[0], [{ role: 'user', content: 'x' }], false, { reasoning: true });
+  await callModel(FREE_MODEL_LADDER[0], [{ role: 'user', content: 'x' }], true);
+  check('paid: throughput routing + reasoning off by default', bodies[0].provider?.sort === 'throughput' && bodies[0].reasoning?.enabled === false);
+  check('paid: reasoning opt-in (stage 3)', bodies[1].reasoning?.effort === 'low');
+  check('free: no provider/reasoning params', !bodies[2].provider && !bodies[2].reasoning);
+
   globalThis.fetch = originalFetch;
   if (failed > 0) { console.error(`SELFTEST FAILED: ${failed} check(s)`); process.exit(1); }
   console.log('SELFTEST PASS');
@@ -1131,7 +1211,7 @@ if (BATCH_MODE) {
           // --allow-escape-sequences: job logs contain ANSI color codes; newer gh
           // CLI versions refuse to print them to stdout without this flag, which
           // made every automatic-mode run fail with fail:other "could not fetch CI log".
-          const jobLog = sh(`gh api --allow-escape-sequences "repos/${REPO}/actions/jobs/${job.id}/logs"`).slice(-8000);
+          const jobLog = sh(`gh api --allow-escape-sequences "repos/${REPO}/actions/jobs/${job.id}/logs"`).slice(-60000);
           logParts.push(`=== job: ${job.name} ===\n${jobLog}`);
         } catch { /* best effort per job */ }
       }
@@ -1145,6 +1225,13 @@ if (BATCH_MODE) {
     failWithStats('fail:other', `could not fetch CI log: ${e.message}`);
   }
 }
+
+// Deterministic pre-stage checks regex the RAW log; only LLM prompts get the
+// compressed one.
+const failedLogRaw = failedLog;
+const rawLogTokens = estTokens(failedLog);
+failedLog = compressLog(failedLog);
+if (failedLog) log('input', `CI log compressed: ~${rawLogTokens} → ~${estTokens(failedLog)} tokens`);
 
 // prDiffRaw drives Stage 2 excerpts; prDiff is the structurally compressed
 // version every prompt sees (issue #7 — no more blind 10k-char slice).
@@ -1241,7 +1328,7 @@ Set is_clear=true for ordinary feature PRs, bug fixes, refactors, dependency upd
 // ── Run pre-stage strategies (deterministic, no AI) ──────────────────────────
 
 // Pre-stage C: Cloudflare conflicts — bail with a precise message, never patch blindly
-if (checkCloudflareConflict(failedLog)) {
+if (checkCloudflareConflict(failedLogRaw)) {
   await prComment('❌ Cannot auto-fix: Cloudflare Durable Objects migration conflict (code 10074)\n\nThe migration tag in `wrangler.toml` is out of sync with what Cloudflare has deployed. Patching this blindly would corrupt live DO state. Needs human review of the migration history.');
   failWithStats(
     'fail:cloudflare_do',
@@ -1253,7 +1340,7 @@ if (checkCloudflareConflict(failedLog)) {
 // Pre-stage A + B: deterministic fixes
 let preStageDiagnosis = null;
 
-const outOfDateResult = await tryFixOutOfDate(failedLog, prPurpose);
+const outOfDateResult = await tryFixOutOfDate(failedLogRaw, prPurpose);
 if (outOfDateResult) {
   if (!outOfDateResult.ok) {
     const icon = outOfDateResult.category === 'fail:ai_conflict_resolution' ? '🤖' : '❌';
@@ -1264,7 +1351,7 @@ if (outOfDateResult) {
 }
 
 if (!preStageDiagnosis) {
-  const permResult = tryFixMissingPermissions(failedLog);
+  const permResult = tryFixMissingPermissions(failedLogRaw);
   if (permResult) {
     if (!permResult.ok) {
       await prComment(`❌ Could not fix: GitHub Actions permissions issue but no patchable workflow found\n\nReason: ${permResult.reason}`);
@@ -1425,13 +1512,14 @@ Rules:
 - Valid git diff format, applicable via "git apply"
 - Wrap in a single \`\`\`diff code block
 - The PR diff you see is compressed (trimmed context). If you lack the exact surrounding lines needed for an applicable patch, reply CANNOT_FIX: missing context <file/what> — do not invent context lines
+- Source files are shown with a "NNNNN| " line-number prefix that is NOT part of the file — copy context lines without it, and use the numbers for @@ headers
 - If you cannot produce a correct patch, reply exactly: CANNOT_FIX`,
       },
       {
         role: 'user',
-        content: `Root cause:\n${diagnosis.problem}\n\nWhat to change:\n${changeSpec}\n\nCurrent PR diff (for context on what already changed):\n\`\`\`diff\n${prDiff}\n\`\`\`\n\nWrite the fix patch.`,
+        content: `Root cause:\n${diagnosis.problem}\n\nWhat to change:\n${changeSpec}\n\n${fileContents.length ? `Source files (current PR state):\n\n${fileContents.join('\n\n')}\n\n` : ''}Current PR diff (for context on what already changed):\n\`\`\`diff\n${prDiff}\n\`\`\`\n\nWrite the fix patch.`,
       },
-    ]);
+    ], false, { reasoning: true });
   } catch (e) {
     failWithStats('fail:ai_model_error', `Stage 3 model error: ${e.message.slice(0, 200)}`, { problem: diagnosis.problem });
   }
