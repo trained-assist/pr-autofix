@@ -6,7 +6,7 @@
 //     B. Missing permissions → patch workflow YAML
 //     C. Cloudflare DO conflict → bail with precise diagnosis
 //
-//   AI stages (OpenRouter free models, only if pre-stage didn't apply):
+//   AI stages (llm-ladder worker, model free-ladder; only if pre-stage didn't apply):
 //     Stage 1 (deepseek-v4-flash:free)    — diagnose: root cause + files to examine
 //     Stage 2 (nemotron-3-super-120b:free) — contextualize: read real files, describe changes
 //     Stage 3 (nemotron-3-ultra-550b:free) — patch: write the unified diff
@@ -45,7 +45,7 @@
 //   fail:ai_cannot_fix          Stage 3 returned CANNOT_FIX        ← paid-tier candidate
 //   fail:ai_corrupt_patch       Stage 3 produced malformed diff     ← paid-tier candidate
 //   fail:ai_tests_fail          patch applied but tests still fail  ← paid-tier candidate
-//   fail:ai_model_error         OpenRouter API error (network/quota/model gone)
+//   fail:ai_model_error         llm-ladder error (worker unreachable / every rung failed)
 //   fail:other                  unexpected error
 //
 // ── Batch mode ──────────────────────────────────────────────────────────────────
@@ -71,71 +71,23 @@ const FILE_WINDOW = 15;              // Stage 2: lines around each changed/log-c
 const WHOLE_FILE_CHARS = 4000;       // Stage 2: small files are sent whole, not excerpted
 const estTokens = s => Math.ceil(String(s).length / 4);
 
-// Free-tier model ladder — bench-validated 2026-09-26 (500 rows, 10 diffs × 5
-// runs × 10 models, see bench-cicd/bench-ext-summary.json). Ordered by
-// availability × recall. The old chain (deepseek-v3-0324 / gemma-3-12b /
-// llama-3.1-8b / mistral-7b) and old STAGE1 (deepseek-v4-flash-0731) are gone
-// from the live OpenRouter catalog — replaced by the survivors below.
-const FREE_MODEL_LADDER = [
-  'nvidia/nemotron-3-super-120b-a12b:free',        // 84% avail, recall 0.79, 4.6s
-  'inclusionai/ling-3.0-flash-fin:free',           // 72% avail, recall 0.92, 0 FP, 2.5s
-  'inclusionai/ling-3.0-flash-sante:free',         // 58% avail, recall 0.72, 3.2s
-  'nvidia/nemotron-3-ultra-550b-a55b:free',        // 52% avail, recall 1.0, 0 FP, 13s
-  'cohere/north-mini-code:free',                   // 50% avail, recall 0.88, 0 FP
-  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', // 46% avail, recall 0.74
-  'poolside/laguna-xs-2.1:free',                   // 46% avail, recall 1.0 (rate-limited)
-  'dots-studio/dots-3-note-preview:free',          // 18% avail, recall 1.0
-];
-// Primary model (issue #7): a cheap PAID model is tried first on every stage.
-// Inputs are compressed (see compressDiff), so a whole run costs well under a
-// cent, and a paid model has none of the free-tier 429/availability roulette.
-// deepseek-v4-flash-0731: $0.021/M in, $0.32/M out, 1.3M ctx, JSON mode, p50 ~1.5s.
-// The free ladder stays right behind it as fallback. AUTOFIX_PRIMARY_MODEL=free
-// switches back to free-first (stage models below), any other id overrides;
-// unset/empty (e.g. an undefined repo var) keeps the default.
-const PRIMARY_MODEL = (m => !m ? 'deepseek/deepseek-v4-flash-0731' : m === 'free' ? '' : m)(process.env.AUTOFIX_PRIMARY_MODEL);
-// Free stage assignment (bench per role), used when PRIMARY_MODEL is empty:
-// diagnose = best recall/FP (ling-fin), contextualize = most reliable (super),
-// patch = perfect recall (ultra).
-const STAGE1_MODEL = PRIMARY_MODEL || 'inclusionai/ling-3.0-flash-fin:free';
-const STAGE2_MODEL = PRIMARY_MODEL || 'nvidia/nemotron-3-super-120b-a12b:free';
-const STAGE3_MODEL = PRIMARY_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b:free';
-const STAGE0_MODEL_CHAIN = FREE_MODEL_LADDER; // first success wins (conflict resolution)
-// Cheap paid models — last resort after all free options exhausted.
-// (google/gemini-flash-1.5-8b is gone from the OpenRouter catalog, 2026-09-26.)
-const CHEAP_PAID_FALLBACK = [
-  'deepseek/deepseek-v4.1-flash',  // $0.035/M in — same family as primary, different endpoint
-  'deepseek/deepseek-chat',        // DeepSeek V3 paid, very capable
-  'openai/gpt-4o-mini',            // $0.15/M — reliable, different vendor
-];
-// Paid ids get the long timeout and are counted in the per-run cost summary.
-const isPaidModel = m => m === PRIMARY_MODEL || CHEAP_PAID_FALLBACK.includes(m);
-
-// OpenCode Go gateway — primary provider when OPENCODE_GO_API_KEY is set.
-// Subscription-backed, so no free-tier 429 roulette: tried FIRST on every
-// stage call; the OpenRouter free ladder + paid fallback stay behind it.
-// Rungs are tagged `go:<model>` so callModel knows which endpoint to hit.
-// Order: bench 2026-09-26 (bench-cicd, BENCH_PROVIDER=go, 10 diffs × 3 runs).
-const GO_BASE = 'https://opencode.ai/zen/go/v1/chat/completions';
-const GO_PREFIX = 'go:';
-const GO_SESSION = `pr-autofix-${process.env.GITHUB_RUN_ID || 'local'}-${Date.now()}`;
-const GO_MODEL_LADDER = [
-  'go:deepseek-v4-flash',        // 97% avail, recall 0.83, 1 FP, p50 1.6s
-  'go:longcat-2.5-preview-free', // 100% avail, recall 0.90, 0 FP, p50 7.0s
-  'go:qwen3.8-flash',            // 97% avail, recall 0.86, 1 FP, p50 9.0s
-  'go:mimo-v2.6-flash',          // 87% avail, recall 0.88, 3 FP
-  'go:deepseek-flash',           // 77% avail, recall 0.87, 2 FP, p50 2.8s
-  'go:glm-5.3-flash',            // 47% avail, recall 1.00, 0 FP
-];
-
-const STAGE0_MODEL = PRIMARY_MODEL || STAGE0_MODEL_CHAIN[0];
-const STAGE0_FALLBACK_MODEL = STAGE0_MODEL_CHAIN[1]; // kept for compat, chain handles the rest
+// Models: every stage calls ONE place — the trained-assist-llm-ladder worker
+// (https://llm-ladder.trainedassist.store, repo trained-assist/trained-assist-llm-ladder), model
+// `free-ladder`: OpenCode Go cheap rungs → OpenRouter :free, with per-model health, Go key
+// rotation, JSON guard and response_format-400 retry done server-side. The bench-validated rung
+// order that used to live here (FREE_MODEL_LADDER / GO_MODEL_LADDER / paid fallback) moved into
+// the worker's config — one ladder for every trained-assist consumer (owner 2026-09-27).
+const LADDER_URL = (process.env.LLM_LADDER_URL || 'https://llm-ladder.trainedassist.store').replace(/\/+$/, '');
+const LADDER_MODEL = process.env.AUTOFIX_LADDER || 'free-ladder';
+const STAGE0_MODEL = LADDER_MODEL;
+const STAGE1_MODEL = LADDER_MODEL;
+const STAGE2_MODEL = LADDER_MODEL;
+const STAGE3_MODEL = LADDER_MODEL;
 
 const PR_FIXER_PREFIX = 'pr-fixer:';
 
 const {
-  OPENROUTER_API_KEY,
-  OPENCODE_GO_API_KEY,
+  LLM_LADDER_TOKEN,
   GH_TOKEN,
   RUN_ID,
   REPO,
@@ -228,133 +180,43 @@ async function prComment(body) {
   try { unlinkSync('__comment.txt'); } catch {}
 }
 
-// opts.reasoning: paid models run with reasoning OFF by default — measured on a
-// real 5k-token CI log: 1.3–1.6s vs 15–60s with reasoning on, same diagnosis.
-// Stage 3 (patch writing) opts back in. Paid calls are routed to the fastest
-// provider (sort: throughput): ~$0.0007/call instead of ~$0.00015, but the slow
-// cheap providers timed out the primary in the first live smoke.
+// One stage call → the llm-ladder worker. `model` is the ladder name (all stages use
+// LADDER_MODEL); failover across rungs happens in the worker. Patch writing (stage 3) needs long
+// answers, so rungs get a 60s budget and the whole ladder up to 2 min.
 async function callModel(model, messages, json = false, opts = {}) {
-  const tryModel = async (m, wantJson) => {
-    const isGo = m.startsWith(GO_PREFIX);
-    const res = await fetch(isGo ? GO_BASE : 'https://openrouter.ai/api/v1/chat/completions', {
+  if (!LADDER_TOKEN) throw Object.assign(new Error('no LLM provider configured (LLM_LADDER_TOKEN)'), { status: 401 });
+  let res;
+  try {
+    res = await fetch(`${LADDER_URL}/v1/chat/completions`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${isGo ? GO_KEY : OR_KEY}`,
-        'Content-Type': 'application/json',
-        // The Go gateway 400s (MissingSessionID) without a session header.
-        ...(isGo ? { 'x-opencode-session': GO_SESSION } : {}),
-      },
+      headers: { Authorization: `Bearer ${LADDER_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: isGo ? m.slice(GO_PREFIX.length) : m,
+        model: model || LADDER_MODEL,
         messages,
         temperature: 0,
-        ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
-        ...(!isGo && isPaidModel(m) ? {
-          provider: { sort: 'throughput' },
-          reasoning: opts.reasoning ? { effort: 'low' } : { enabled: false },
-        } : {}),
+        ...(json ? { response_format: { type: 'json_object' } } : {}),
+        ladder_timeout_ms: 60_000,
+        ladder_total_timeout_ms: 120_000,
       }),
-      // Go p90 latency is 3–26s (bench) — the 20s free-tier cut would drop
-      // healthy answers from qwen/glm, so Go rungs get the paid-tier budget.
-      signal: AbortSignal.timeout(isGo || isPaidModel(m) ? 60_000 : 20_000),
+      signal: AbortSignal.timeout(130_000),
     });
-    if (!res.ok) {
-      const body = await res.text();
-      // Free models reject response_format with a 400 whose body says things
-      // like `does not support feature: structured-outputs` — it never mentions
-      // "response_format", so this used to be gated on a regex that never
-      // matched and the model was skipped instead of retried prompt-only.
-      // Any 400 while wantJson → retry the SAME model once without the
-      // constraint. Recursion is bounded: the retry passes wantJson=false, so a
-      // second 400 falls through to the throw below.
-      if (json && res.status === 400 && wantJson) {
-        log('model', `${m} rejected response_format (400) — retrying prompt-only`);
-        return tryModel(m, false);
-      }
-      throw Object.assign(new Error(`${isGo ? 'OpenCode Go' : 'OpenRouter'} HTTP ${res.status}: ${body}`), { status: res.status, isGo });
-    }
-    const data = await res.json();
-    recordUsage(m, data?.usage);
-    return data?.choices?.[0]?.message?.content?.trim() || '';
-  };
-
-  // Every stage call fails over: primary model → rest of the ladder → any
-  // remaining free models OpenRouter still lists → cheap paid last resort.
-  // (Previously only STAGE0 had a chain; STAGE1/2/3 died on a single 429.)
-  // The cheap paid PRIMARY_MODEL leads; the free ladder is its fallback.
-  const isPrimary = !!PRIMARY_MODEL && model === PRIMARY_MODEL;
-  const ladderStart = isPrimary ? 0 : FREE_MODEL_LADDER.indexOf(model);
-  const orChain = !OR_KEY && GO_KEY ? []
-    : ladderStart >= 0
-      ? [...(isPrimary ? [PRIMARY_MODEL] : []), ...FREE_MODEL_LADDER.slice(ladderStart), ...(await discoverFreeModels()), ...CHEAP_PAID_FALLBACK]
-      : [model];
-  // Go rungs go first whenever the Go key is present — for every stage.
-  const chain = [...new Set([...(goAvailable() ? GO_MODEL_LADDER : []), ...orChain])];
-  if (!chain.length) throw new Error('no LLM provider configured (OPENCODE_GO_API_KEY / OPENROUTER_API_KEY)');
-
-  let lastErr;
-  let reachedPaid = false;
-  for (const m of chain) {
-    if (m.startsWith(GO_PREFIX) && !goAvailable()) continue; // Go key rejected earlier this run
-    const isPaid = CHEAP_PAID_FALLBACK.includes(m);
-    try {
-      if (m !== model) {
-        if (isPaid && !reachedPaid) {
-          reachedPaid = true;
-          log('model', 'all free models exhausted — falling back to cheap paid models');
-        }
-        log('model', `trying ${m}${isPaid ? ' (paid)' : ''}`);
-      }
-      const result = await tryModel(m, json);
-      if (!result) {
-        lastErr = new Error(`${m} returned empty response`);
-        log('model', `${m} empty — trying next`);
-        continue;
-      }
-      // When JSON was requested, "non-empty" is NOT success: the bench showed
-      // no_json was the dominant failure (227/500 rows), and a prose answer
-      // used to pass this check only to blow up in the caller's parseJSON with
-      // no failover — the stage died on a model that had simply answered
-      // talkatively. Validate here so the ladder advances instead.
-      if (json) {
-        try {
-          parseJSON(result);
-        } catch (e) {
-          lastErr = new Error(`${m} returned unparseable JSON: ${e.message}`);
-          log('model', `${m} returned non-JSON — trying next`);
-          continue;
-        }
-      }
-      return result;
-    } catch (e) {
-      lastErr = e;
-      // Default is "advance the ladder". The old list only tolerated
-      // 400/403/404/429/503 — a 500/502/504 from an upstream provider (never
-      // seen in the bench, common in prod) escaped the loop and killed the
-      // whole stage on one model, which is exactly what the ladder exists to
-      // prevent. Only auth/billing are fatal: retrying them across models
-      // cannot help and just burns the chain.
-      // A rejected Go key/subscription only disables the Go rungs — the
-      // OpenRouter ladder behind them is an independent provider.
-      if (e.isGo && [401, 402, 403].includes(e.status)) {
-        _goDisabled = true;
-        log('model', `OpenCode Go auth/billing failed (${e.status}) — skipping Go rungs, falling back to OpenRouter`);
-        continue;
-      }
-      const fatal = [401, 402].includes(e.status);
-      if (fatal) throw e;
-      if (e.name === 'AbortError' || e.name === 'TimeoutError') {
-        log('model', `${m} timed out — trying next`);
-      } else {
-        log('model', `${m} failed (${e.status || e.name}) — trying next`);
-      }
-    }
+  } catch (e) {
+    throw Object.assign(new Error(`llm-ladder unreachable: ${e.message}`), { name: e.name });
   }
-  throw lastErr;
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const attempts = (data?.error?.attempts || []).map(a => `${a.model}=${a.outcome}`).join(', ');
+    throw Object.assign(new Error(`llm-ladder HTTP ${res.status}: ${data?.error?.message || ''}${attempts ? ` [${attempts}]` : ''}`), { status: res.status });
+  }
+  recordUsage(data?.model || model, data?.usage);
+  const result = data?.choices?.[0]?.message?.content?.trim() || '';
+  if (!result) throw new Error(`llm-ladder: ${data?.model || model} returned an empty answer`);
+  if (json) parseJSON(result); // worker guards JSON too; a caller-side parse failure must surface here
+  return result;
 }
 
-// Per-run model usage — which model actually answered and what it cost.
-// OpenRouter returns usage.cost (USD) in every response; Go is subscription.
+// Per-run model usage — which rung actually answered (the worker reports it in `model`).
+// OpenRouter returns usage.cost (USD); Go is subscription.
 const _usage = { calls: 0, prompt_tokens: 0, completion_tokens: 0, cost_usd: 0, by_model: {} };
 function recordUsage(m, u) {
   const e = (_usage.by_model[m] ||= { calls: 0, prompt_tokens: 0, completion_tokens: 0, cost_usd: 0 });
@@ -363,36 +225,8 @@ function recordUsage(m, u) {
   log('model', `${m} answered: ${pt} in / ${ct} out tokens${c ? `, $${c.toFixed(6)}` : ''}`);
 }
 
-// Mutable copies so the self-test can toggle providers without env juggling.
-let OR_KEY = OPENROUTER_API_KEY || '';
-let GO_KEY = OPENCODE_GO_API_KEY || '';
-let _goDisabled = false;
-function goAvailable() { return !!GO_KEY && !_goDisabled; }
-
-// Cached list of free models discovered from OpenRouter /models (fetched once per run)
-let _discoveredFreeModels = null;
-async function discoverFreeModels() {
-  if (_discoveredFreeModels !== null) return _discoveredFreeModels;
-  if (!OR_KEY) return (_discoveredFreeModels = []);
-  try {
-    const res = await fetch('https://openrouter.ai/api/v1/models', {
-      headers: { Authorization: `Bearer ${OR_KEY}` },
-      signal: AbortSignal.timeout(8_000),
-    });
-    if (!res.ok) { _discoveredFreeModels = []; return []; }
-    const { data = [] } = await res.json();
-    const known = new Set(FREE_MODEL_LADDER);
-    _discoveredFreeModels = data
-      .filter(m => m.id.endsWith(':free') && !known.has(m.id))
-      .sort((a, b) => (b.context_length || 0) - (a.context_length || 0))
-      .map(m => m.id);
-    log('model', `discovered ${_discoveredFreeModels.length} additional free models from OpenRouter`);
-  } catch (e) {
-    log('model', `free model discovery failed: ${e.message.slice(0, 60)} — skipping`);
-    _discoveredFreeModels = [];
-  }
-  return _discoveredFreeModels;
-}
+// Mutable so the self-test can toggle the token without env juggling.
+let LADDER_TOKEN = LLM_LADDER_TOKEN || '';
 
 function extractPatch(raw) {
   const fenced = raw.match(/```(?:diff|patch)?\n([\s\S]*?)```/);
@@ -1065,155 +899,52 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('unfenced kept', stripCodeFence('const a = 1;') === 'const a = 1;');
   check('guard rejects runaway', /runaway/.test(checkResolvedBlock(blk, blk.theirs + '\n' + 'q'.repeat(1000)) || ''));
 
-  // Ladder integrity: every rung is a :free model, stages are on the ladder.
-  check('ladder non-empty', FREE_MODEL_LADDER.length >= 5);
-  check('ladder all :free', FREE_MODEL_LADDER.every(m => m.endsWith(':free')));
-  check('ladder unique', new Set(FREE_MODEL_LADDER).size === FREE_MODEL_LADDER.length);
-  check('paid fallback non-empty', CHEAP_PAID_FALLBACK.length >= 1);
-
-  // callModel failover against a scripted mock of the OpenRouter API.
-  // The mock keys off the ACTUAL ladder entries (callModel builds the chain from
-  // the ladder when the model is on it), so the failover path is the real one.
-  const [R0, R1] = [FREE_MODEL_LADDER[0], FREE_MODEL_LADDER[1]];
+  // ── Model calls go to the llm-ladder worker (failover is server-side) ──
+  check('stages use the ladder', [STAGE0_MODEL, STAGE1_MODEL, STAGE2_MODEL, STAGE3_MODEL].every(m => m === LADDER_MODEL));
   const originalFetch = globalThis.fetch;
-  const seq = [];
-  const rfRejectedBody = JSON.stringify({ error: { message: 'Provider returned error', code: 400, metadata: { raw: '{"code":400,"reason":"INVALID_REQUEST_BODY","message":"model: inclusionai/ling-3.0-flash-fin does not support feature: structured-outputs"}' } } });
-  const proseBody = JSON.stringify({ choices: [{ message: { content: 'I cannot do that, but here is a thought: the bug is obvious.' } }] });
-  const jsonBody = JSON.stringify({ choices: [{ message: { content: '{"problem":"x","files_to_examine":[],"fix_approach":"y","confidence":"high"}' } }] });
-  let MODE = 'rf-reject';
+  const calls = [];
+  let MODE = 'ok';
+  const jsonBody = { model: 'opencode-go/deepseek-v4-flash', choices: [{ message: { content: '{"problem":"x","files_to_examine":[],"fix_approach":"y","confidence":"high"}' } }], usage: { prompt_tokens: 100, completion_tokens: 10, cost: 0.0000052 } };
   globalThis.fetch = async (url, opts) => {
-    const m = JSON.parse(opts.body).model;
-    const rf = !!JSON.parse(opts.body).response_format;
-    if (m === R0) {
-      seq.push('R0');
-      if (MODE === 'rf-reject' && rf) return { ok: false, status: 400, text: async () => rfRejectedBody };
-      if (MODE === 'prose') return { ok: true, status: 200, json: async () => JSON.parse(proseBody) };
-      if (MODE === 'http500') return { ok: false, status: 500, text: async () => 'upstream error' };
-      if (MODE === 'auth401') return { ok: false, status: 401, text: async () => 'bad key' };
-      // default / rf-reject prompt-only retry: R0 answers JSON fine.
-      return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
-    }
-    seq.push('R1');
-    return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
+    calls.push({ url, auth: opts.headers.Authorization, body: JSON.parse(opts.body) });
+    if (MODE === 'ladder502') return { ok: false, status: 502, json: async () => ({ error: { message: 'every rung failed', type: 'ladder_error', attempts: [{ model: 'opencode-go/a', outcome: 'error' }] } }) };
+    if (MODE === 'auth401') return { ok: false, status: 401, json: async () => ({ error: { message: 'unauthorized' } }) };
+    if (MODE === 'prose') return { ok: true, status: 200, json: async () => ({ model: 'm', choices: [{ message: { content: 'just prose' } }] }) };
+    return { ok: true, status: 200, json: async () => jsonBody };
   };
-  _discoveredFreeModels = [];
-  // OpenRouter-only for tests 1–4, independent of whatever keys the host has.
-  OR_KEY = 'or-test'; GO_KEY = '';
+  LADDER_TOKEN = 'ladder-test';
 
-  // 1. response_format 400 → retries the SAME model prompt-only and succeeds.
-  //    Regression: the old regex `/response_format|json_object/` never matched
-  //    the real body ("does not support feature: structured-outputs"), so R0 was
-  //    skipped to the next rung instead of retried — STAGE1's best model was
-  //    silently dropped on every run. Now the retry must land on R0, not R1.
-  seq.length = 0;
-  MODE = 'rf-reject';
+  // 1. JSON stage call → one request to the worker: ladder model, JSON mode, budgets, bearer.
+  calls.length = 0; MODE = 'ok';
   try {
-    const out = await callModel(R0, [{ role: 'user', content: 'hi' }], true);
-    check('rf-400 retried prompt-only and succeeded', out.includes('"problem"') && !seq.includes('R1'));
-  } catch (e) { check('rf-400 retried prompt-only and succeeded', false, e.message); }
+    const out = await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
+    const b = calls[0]?.body || {};
+    check('worker called once with ladder model + json mode', calls.length === 1 && /\/v1\/chat\/completions$/.test(calls[0].url) && b.model === LADDER_MODEL && b.response_format?.type === 'json_object' && out.includes('"problem"'));
+    check('worker bearer token', calls[0].auth === 'Bearer ladder-test');
+    check('rung budgets for long patches', b.ladder_timeout_ms === 60000 && b.ladder_total_timeout_ms === 120000);
+    check('usage recorded under the answering rung', _usage.by_model['opencode-go/deepseek-v4-flash']?.calls === 1);
+  } catch (e) { check('worker called once with ladder model + json mode', false, e.message); }
 
-  // 2. json=true + prose answer → advances to the next rung instead of returning prose.
-  seq.length = 0;
-  MODE = 'prose';
-  try {
-    const out = await callModel(R0, [{ role: 'user', content: 'hi' }], true);
-    check('prose advanced to next rung', seq.includes('R1') && out.includes('"problem"'));
-  } catch (e) { check('prose advanced to next rung', false, e.message); }
+  // 2. Every rung failed (502) → the stage fails with the attempts in the error.
+  MODE = 'ladder502';
+  try { await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true); check('ladder 502 throws', false, 'should have thrown'); }
+  catch (e) { check('ladder 502 throws with attempts', String(e.status) === '502' && /opencode-go\/a=error/.test(e.message)); }
 
-  // 3. HTTP 500 (was NOT in the old retryable list → killed the whole stage) → advances.
-  seq.length = 0;
-  MODE = 'http500';
-  try {
-    const out = await callModel(R0, [{ role: 'user', content: 'hi' }], true);
-    check('http500 advanced to next rung', seq.includes('R1') && out.includes('"problem"'));
-  } catch (e) { check('http500 advanced to next rung', false, e.message); }
-
-  // 4. HTTP 401 is fatal — retrying across models can't help.
-  seq.length = 0;
+  // 3. 401 (bad ladder token) surfaces as status 401.
   MODE = 'auth401';
-  try {
-    await callModel(R0, [{ role: 'user', content: 'hi' }], true);
-    check('auth401 is fatal', false, 'should have thrown');
-  } catch (e) {
-    check('auth401 is fatal', String(e.status) === '401' && !seq.includes('R1'));
-  }
+  try { await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true); check('auth401 throws', false, 'should have thrown'); }
+  catch (e) { check('auth401 throws', String(e.status) === '401'); }
 
-  // ── OpenCode Go provider ──
-  check('go ladder non-empty', GO_MODEL_LADDER.length >= 3);
-  check('go ladder all tagged', GO_MODEL_LADDER.every(m => m.startsWith(GO_PREFIX)));
-  const goSeq = [];
-  let GO_MODE = 'ok';
-  globalThis.fetch = async (url, opts) => {
-    const b = JSON.parse(opts.body);
-    const auth = opts.headers.Authorization;
-    if (url === GO_BASE) {
-      if (!opts.headers['x-opencode-session']) return { ok: false, status: 400, text: async () => '{"error":{"type":"MissingSessionID"}}' };
-      goSeq.push(`go:${b.model}|${auth}`);
-      if (GO_MODE === 'auth401') return { ok: false, status: 401, text: async () => 'invalid key' };
-      if (GO_MODE === 'first429' && b.model === GO_MODEL_LADDER[0].slice(GO_PREFIX.length)) return { ok: false, status: 429, text: async () => 'rate' };
-      return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
-    }
-    goSeq.push(`or:${b.model}|${auth}`);
-    return { ok: true, status: 200, json: async () => JSON.parse(jsonBody) };
-  };
-  OR_KEY = 'or-test'; GO_KEY = 'go-test';
+  // 4. json=true + prose answer → caller-side parse error, not silent prose.
+  MODE = 'prose';
+  try { await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true); check('prose in json mode throws', false, 'should have thrown'); }
+  catch (e) { check('prose in json mode throws', true); }
 
-  // 5. Go key set → Go rung is hit FIRST, with the Go key, model id untagged.
-  goSeq.length = 0; GO_MODE = 'ok'; _goDisabled = false;
-  try {
-    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
-    check('go tried first with go key', goSeq[0] === `${GO_MODEL_LADDER[0]}|Bearer go-test` && goSeq.length === 1, goSeq.join(','));
-  } catch (e) { check('go tried first with go key', false, e.message); }
-
-  // 6. Go 429 on first rung → next Go rung (not straight to OpenRouter).
-  goSeq.length = 0; GO_MODE = 'first429'; _goDisabled = false;
-  try {
-    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
-    check('go 429 advances within go', goSeq[1]?.startsWith(GO_MODEL_LADDER[1] + '|'), goSeq.join(','));
-  } catch (e) { check('go 429 advances within go', false, e.message); }
-
-  // 7. Go 401 → NOT fatal: Go rungs skipped, OpenRouter ladder answers with the OR key.
-  goSeq.length = 0; GO_MODE = 'auth401'; _goDisabled = false;
-  try {
-    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
-    const goHits = goSeq.filter(x => x.startsWith('go:')).length;
-    check('go 401 falls back to openrouter', goHits === 1 && goSeq[1] === `or:${STAGE1_MODEL}|Bearer or-test`, goSeq.join(','));
-  } catch (e) { check('go 401 falls back to openrouter', false, e.message); }
-
-  // 8. Go-only config (no OpenRouter key) still works.
-  goSeq.length = 0; GO_MODE = 'ok'; _goDisabled = false; OR_KEY = '';
-  try {
-    await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
-    check('go-only config works', goSeq.length === 1 && goSeq[0].startsWith(GO_PREFIX));
-  } catch (e) { check('go-only config works', false, e.message); }
-
-  // ── Primary cheap paid model (issue #7) ──
-  // Primary leads, the free ladder is its fallback, paid last-resort behind that.
-  globalThis.fetch = async (url, opts) => {
-    const b = JSON.parse(opts.body);
-    goSeq.push(b.model);
-    if (b.model === PRIMARY_MODEL && GO_MODE === 'primary500') return { ok: false, status: 500, text: async () => 'upstream' };
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"ok":true}' } }], usage: { prompt_tokens: 100, completion_tokens: 10, cost: 0.0000052 } }) };
-  };
-  OR_KEY = 'or-test'; GO_KEY = ''; _goDisabled = false;
-  if (!PRIMARY_MODEL) {
-    check('free-first mode: stages on free ladder', [STAGE1_MODEL, STAGE2_MODEL, STAGE3_MODEL].every(m => FREE_MODEL_LADDER.includes(m)));
-  } else {
-    check('primary is a paid, non-free model', !!PRIMARY_MODEL && !PRIMARY_MODEL.endsWith(':free') && isPaidModel(PRIMARY_MODEL));
-    check('stages 0-3 use primary', [STAGE0_MODEL, STAGE1_MODEL, STAGE2_MODEL, STAGE3_MODEL].every(m => m === PRIMARY_MODEL));
-    check('paid fallback has no retired ids', !CHEAP_PAID_FALLBACK.includes('google/gemini-flash-1.5-8b'));
-    goSeq.length = 0; GO_MODE = 'ok';
-    try {
-      await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
-      check('primary tried first', goSeq.length === 1 && goSeq[0] === PRIMARY_MODEL, goSeq.join(','));
-      check('usage recorded with cost', _usage.by_model[PRIMARY_MODEL]?.cost_usd > 0 && _usage.prompt_tokens >= 100);
-    } catch (e) { check('primary tried first', false, e.message); }
-    goSeq.length = 0; GO_MODE = 'primary500';
-    try {
-      await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], true);
-      check('primary failure falls back to free ladder', goSeq[0] === PRIMARY_MODEL && goSeq[1] === FREE_MODEL_LADDER[0], goSeq.join(','));
-    } catch (e) { check('primary failure falls back to free ladder', false, e.message); }
-  }
+  // 5. No token → configuration error without a request.
+  calls.length = 0; LADDER_TOKEN = '';
+  try { await callModel(STAGE1_MODEL, [{ role: 'user', content: 'hi' }], false); check('no token throws', false, 'should have thrown'); }
+  catch (e) { check('no token throws without a request', /LLM_LADDER_TOKEN/.test(e.message) && calls.length === 0); }
+  LADDER_TOKEN = 'ladder-test'; MODE = 'ok';
 
   // ── Input compression (issue #7) ──
   const { mkdtempSync, rmSync } = await import('node:fs');
@@ -1297,16 +1028,6 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('log: group bodies dropped, step headers kept', lc.includes('▶ Run npm test') && !lc.includes('token: ***'));
   check('log: error lines survive the budget', lc.includes("Cannot find module '/w/test'") && lc.includes('not ok 1') && lc.includes('ERROR: Process completed with exit code 1'));
   check('log: within budget, post-job cleanup cut', estTokens(lc) <= 300 && !lc.includes('git version'), `~${estTokens(lc)}`);
-  const bodies = [];
-  globalThis.fetch = async (url, opts) => { bodies.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"ok":1}' } }] }) }; };
-  OR_KEY = 'or-test'; GO_KEY = '';
-  await callModel(PRIMARY_MODEL || CHEAP_PAID_FALLBACK[0], [{ role: 'user', content: 'x' }], true);
-  await callModel(PRIMARY_MODEL || CHEAP_PAID_FALLBACK[0], [{ role: 'user', content: 'x' }], false, { reasoning: true });
-  await callModel(FREE_MODEL_LADDER[0], [{ role: 'user', content: 'x' }], true);
-  check('paid: throughput routing + reasoning off by default', bodies[0].provider?.sort === 'throughput' && bodies[0].reasoning?.enabled === false);
-  check('paid: reasoning opt-in (stage 3)', bodies[1].reasoning?.effort === 'low');
-  check('free: no provider/reasoning params', !bodies[2].provider && !bodies[2].reasoning);
-
   globalThis.fetch = originalFetch;
   if (failed > 0) { console.error(`SELFTEST FAILED: ${failed} check(s)`); process.exit(1); }
   console.log('SELFTEST PASS');
@@ -1315,8 +1036,8 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
 
 // ── Preflight ────────────────────────────────────────────────────────────────
 
-if (!OPENROUTER_API_KEY && !OPENCODE_GO_API_KEY) failWithStats('fail:other', 'neither OPENCODE_GO_API_KEY nor OPENROUTER_API_KEY set');
-log('model', `providers: ${OPENCODE_GO_API_KEY ? `OpenCode Go (${GO_MODEL_LADDER.length} rungs) → ` : ''}${OPENROUTER_API_KEY ? 'OpenRouter free ladder → paid' : '(no OpenRouter)'}`);
+if (!LLM_LADDER_TOKEN) failWithStats('fail:other', 'LLM_LADDER_TOKEN not set (trained-assist-llm-ladder worker)');
+log('model', `llm-ladder: ${LADDER_URL} model ${LADDER_MODEL}`);
 if (!REPO || !PR_NUMBER) failWithStats('fail:other', 'missing REPO/PR_NUMBER env');
 if (!BATCH_MODE && !RUN_ID) failWithStats('fail:other', 'missing RUN_ID env (set RUN_ID=0 for batch/manual mode)');
 

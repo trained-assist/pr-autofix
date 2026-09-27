@@ -96,8 +96,7 @@ jobs:
       - name: Run autofix (batch mode)
         continue-on-error: true
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
           GH_TOKEN: ${{ secrets.AUTOFIX_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           RUN_ID: '0'
           REPO: ${{ github.repository }}
