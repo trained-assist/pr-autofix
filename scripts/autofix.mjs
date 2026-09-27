@@ -33,6 +33,7 @@
 //   success:pre_a_conflict_resolved  merge had conflicts → AI resolved them using PR purpose
 //   success:pre_b_permissions        job lacked permissions → workflow YAML patched
 //   success:ai                       3-stage free-model pipeline fixed it
+//   success:agent                    AUTOFIX_AGENT=1: the coding agent produced a fix (fix PR CI decides)
 //
 //   fail:stage0_ambiguous       PR purpose unclear — skipping to avoid blind fix
 //   fail:cloudflare_do          Cloudflare DO migration conflict (needs human)
@@ -46,6 +47,8 @@
 //   fail:ai_corrupt_patch       Stage 3 produced malformed diff     ← paid-tier candidate
 //   fail:ai_tests_fail          patch applied but tests still fail  ← paid-tier candidate
 //   fail:ai_model_error         llm-ladder error (worker unreachable / every rung failed)
+//   fail:agent_no_change        AUTOFIX_AGENT=1: the agent finished without changing any file
+//   fail:agent_error            AUTOFIX_AGENT=1: the agent could not run / timed out with no change
 //   fail:other                  unexpected error
 //
 // ── Batch mode ──────────────────────────────────────────────────────────────────
@@ -54,9 +57,10 @@
 // (merge + AI conflict resolution). Use batch-fix-prs.yml workflow to trigger
 // multiple PRs at once.
 
-import { execSync, execFileSync } from 'node:child_process';
+import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 const LOG_CHAR_LIMIT = 120000; // raw log cap BEFORE compressLog (which fits LOG_TOKEN_BUDGET)
 const FILE_CHAR_LIMIT = 8000;
@@ -83,6 +87,95 @@ const STAGE0_MODEL = LADDER_MODEL;
 const STAGE1_MODEL = LADDER_MODEL;
 const STAGE2_MODEL = LADDER_MODEL;
 const STAGE3_MODEL = LADDER_MODEL;
+
+// AUTOFIX_AGENT=1 (repo variable): after the Stage 1 diagnosis, a coding agent (opencode)
+// replaces the single-shot Stages 2–3 — it reads files, edits, runs the failing tests and
+// iterates. Its model calls go to the SAME llm-ladder worker with the SAME token, as an
+// OpenAI-compatible provider (issue #21: the weak link is the fix step, not diagnosis).
+const AGENT_MODE = process.env.AUTOFIX_AGENT === '1';
+const AGENT_TIMEOUT_MS = (Number(process.env.AUTOFIX_AGENT_TIMEOUT_MIN) || 20) * 60_000;
+const AGENT_BIN = process.env.AUTOFIX_AGENT_BIN || 'opencode';
+
+// opencode config: one provider = the llm-ladder worker. The key is read from env at
+// runtime ({env:…}), never written to disk; the model id is the ladder name.
+function agentOpencodeConfig(ladderUrl = LADDER_URL, ladder = LADDER_MODEL) {
+  return {
+    $schema: 'https://opencode.ai/config.json',
+    provider: {
+      ladder: {
+        npm: '@ai-sdk/openai-compatible',
+        name: 'llm-ladder',
+        options: { baseURL: `${ladderUrl}/v1`, apiKey: '{env:LLM_LADDER_TOKEN}' },
+        models: { [ladder]: { name: `ladder ${ladder}`, tool_call: true, limit: { context: 128000, output: 16000 } } },
+      },
+    },
+    model: `ladder/${ladder}`,
+    small_model: `ladder/${ladder}`,
+  };
+}
+
+function agentPrompt({ diagnosis, purpose, log: ciLog, diff, base }) {
+  return `You are fixing a failed CI run on a pull request. The repository is checked out at the PR head in the current directory.
+
+PR purpose: ${purpose || '(unknown)'}
+
+Diagnosis from a first pass (may be incomplete — verify it):
+- Root cause: ${diagnosis.problem}
+- Suggested fix: ${diagnosis.fix_approach}
+- Files: ${(diagnosis.files_to_examine || []).join(', ') || '(none named)'}
+
+Failed CI log (compressed):
+\`\`\`
+${ciLog}
+\`\`\`
+
+PR diff vs ${base} (compressed):
+\`\`\`diff
+${diff}
+\`\`\`
+
+Do:
+1. Read the relevant files and reproduce the failure by running the failing test(s) or check named in the log (prefer the single failing file over the whole suite).
+2. Make the smallest change that fixes it, in line with the PR purpose. No refactors, no unrelated edits.
+3. Re-run the failing test(s)/check until they pass. Tests that also fail without this PR are not yours to fix.
+Do NOT: commit, push, create branches or PRs, edit .github/workflows/, delete or skip tests to make them pass, or change lock files unless the failure is about them.
+Finish with one short paragraph: what was wrong and what you changed.`;
+}
+
+// Runs the agent in the working tree. Returns { ok, summary, error }.
+function runAgentFix(prompt) {
+  const dir = path.join(os.tmpdir(), `autofix-agent-${process.pid}`); // outside the repo: never committed
+  mkdirSync(dir, { recursive: true });
+  const configPath = path.join(dir, 'opencode.json');
+  writeFileSync(configPath, JSON.stringify(agentOpencodeConfig(), null, 2));
+  // The agent gets the ladder token (its model access) but not the GitHub write token.
+  const { GH_TOKEN: _gh, GITHUB_TOKEN: _gt, ...env } = process.env;
+  const r = spawnSync(AGENT_BIN, ['run', '--auto', '-m', `ladder/${LADDER_MODEL}`, prompt], {
+    cwd: process.cwd(),
+    env: { ...env, OPENCODE_CONFIG: configPath, XDG_DATA_HOME: path.join(dir, 'data') },
+    encoding: 'utf8',
+    timeout: AGENT_TIMEOUT_MS,
+    maxBuffer: 50 * 1024 * 1024,
+  });
+  const out = `${r.stdout || ''}`.replace(/\x1b\[[0-9;]*m/g, '');
+  const summary = out.trim().split('\n').slice(-12).join('\n').slice(-1500);
+  if (r.error) return { ok: false, summary, error: r.error.code === 'ETIMEDOUT' ? `timed out after ${AGENT_TIMEOUT_MS / 60000} min` : r.error.message };
+  if (r.status !== 0) return { ok: false, summary, error: `exit ${r.status}: ${(r.stderr || '').slice(-300)}` };
+  return { ok: true, summary };
+}
+
+// Whatever the agent did to git history or workflows is undone; only working-tree
+// changes outside .github/workflows/ survive into the fix PR.
+function normalizeAgentChanges(headBefore) {
+  if (sh('git rev-parse HEAD').trim() !== headBefore) {
+    log('agent', 'agent created commits — folding them back into the working tree');
+    sh(`git reset --soft ${headBefore}`);
+    sh('git reset -q');
+  }
+  sh(`git checkout ${headBefore} -- .github/workflows 2>/dev/null || true`);
+  sh('git clean -fdq -- .github/workflows 2>/dev/null || true');
+  return sh('git status --porcelain').trim();
+}
 
 const PR_FIXER_PREFIX = 'pr-fixer:';
 
@@ -1025,6 +1118,13 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
     + ts + 'Post job cleanup.\n' + ts + 'git version 2.4\n';
   const lc = compressLog(rawLog, 300);
   check('log: timestamps/ANSI/BOM/preamble stripped', !/2026-09-26T|\x1b|﻿|runner version/.test(lc), lc.slice(0, 120));
+  // ── Agent stage config (issue #21) ──
+  const ac = agentOpencodeConfig('https://ladder.example', 'deepseek');
+  check('agent: provider points at the ladder /v1', ac.provider.ladder.options.baseURL === 'https://ladder.example/v1');
+  check('agent: key comes from env, never inline', ac.provider.ladder.options.apiKey === '{env:LLM_LADDER_TOKEN}');
+  check('agent: model = ladder name', ac.model === 'ladder/deepseek' && !!ac.provider.ladder.models.deepseek?.tool_call);
+  const ap = agentPrompt({ diagnosis: { problem: 'P', fix_approach: 'F', files_to_examine: ['a.js'] }, purpose: 'X', log: 'L', diff: 'D', base: 'main' });
+  check('agent: prompt carries diagnosis/log/diff and forbids commits + workflow edits', ap.includes('P') && ap.includes('a.js') && /Do NOT: commit/.test(ap) && ap.includes('.github/workflows/'));
   check('log: group bodies dropped, step headers kept', lc.includes('▶ Run npm test') && !lc.includes('token: ***'));
   check('log: error lines survive the budget', lc.includes("Cannot find module '/w/test'") && lc.includes('not ok 1') && lc.includes('ERROR: Process completed with exit code 1'));
   check('log: within budget, post-job cleanup cut', estTokens(lc) <= 300 && !lc.includes('git version'), `~${estTokens(lc)}`);
@@ -1303,6 +1403,21 @@ Rules:
   log('stage1', `files to examine: ${(diagnosis.files_to_examine || []).join(', ') || '(none)'}`);
   await prComment(`✅ Stage 1/3: root cause identified (confidence: ${diagnosis.confidence || '?'})\n\n**Cause:** ${diagnosis.problem}\n**Plan:** ${diagnosis.fix_approach}`);;
 
+  if (AGENT_MODE) {
+  // ── Agent stage (replaces Stages 2–3) ──────────────────────────────────────
+  await prComment(`🤖 Agent: fixing with opencode (ladder \`${LADDER_MODEL}\`) — reads files, runs the failing tests, iterates…`);
+  const headBefore = sh('git rev-parse HEAD').trim();
+  const res = runAgentFix(agentPrompt({ diagnosis, purpose: prPurpose, log: failedLog, diff: prDiff, base: BASE_BRANCH }));
+  const changed = normalizeAgentChanges(headBefore);
+  log('agent', `finished (ok=${res.ok}${res.error ? `, ${res.error}` : ''}); changed: ${changed.split('\n').filter(Boolean).length} path(s)`);
+  if (!changed) {
+    const cat = res.ok ? 'fail:agent_no_change' : 'fail:agent_error';
+    await prComment(`❌ Agent made no change\n\n**Cause:** ${diagnosis.problem}\n${res.error ? `**Error:** ${res.error}\n` : ''}\n\`\`\`\n${res.summary.slice(-800)}\n\`\`\``);
+    failWithStats(cat, res.error || 'agent finished without changing any file', { problem: diagnosis.problem, agent_summary: res.summary.slice(-500) });
+  }
+  diagnosis.fix_approach = res.summary.split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 600) || diagnosis.fix_approach;
+  diagnosis.agent = true;
+  } else {
   // ── Stage 2: Gather context ────────────────────────────────────────────────
   const fileList = (diagnosis.files_to_examine || []).slice(0, MAX_FILES);
   const fileContents = [];
@@ -1441,6 +1556,7 @@ Rules:
   }
   if (applied) log('stage3', `applied ${applied.count} edit(s) to ${[...new Set(applied.files)].join(', ')}`);
   diagnosis.fix_approach = changeSpec; // use refined spec from stage 2
+  } // end !AGENT_MODE
 }
 
 // ── Apply patch (AI path only) ────────────────────────────────────────────────
@@ -1477,7 +1593,11 @@ if (patchToApply) {
 // Skip for conflict resolution — push fix PR and let CI report failures.
 // The loop: conflict resolved → fix PR → CI fails → fixer picks up next iteration.
 
-if (!preStageDiagnosis?.category.startsWith('success:pre_a')) {
+// Agent mode: the agent already ran the failing tests; the full suite is judged by the
+// fix PR's own CI (a full local `npm test` mostly flagged unrelated failures — issue #21).
+if (diagnosis.agent) {
+  log('verify', 'agent mode — skipping local full test run; the fix PR CI verifies');
+} else if (!preStageDiagnosis?.category.startsWith('success:pre_a')) {
   await prComment('🧪 Patch applied — running tests…');
   try {
     sh('npm test');
@@ -1499,6 +1619,7 @@ const safeBranch = (ORIGINAL_BRANCH || 'unknown').replace(/[^a-zA-Z0-9-]/g, '-')
 const fixBranch = `fix/ci-${safeBranch}-${ts}`;
 const fixStrategy = preStageDiagnosis
   ? preStageDiagnosis.category
+  : diagnosis.agent ? `agent (opencode, ladder/${LADDER_MODEL})`
   : `ai (${Object.keys(_usage.by_model).join(', ') || STAGE1_MODEL}, $${_usage.cost_usd.toFixed(5)})`;
 
 sh('git config user.name "trained-assist-autofix"');
@@ -1589,7 +1710,7 @@ await prComment([
 ].join('\n'));
 
 // ── Write success stats ───────────────────────────────────────────────────────
-writeStats(preStageDiagnosis ? preStageDiagnosis.category : 'success:ai', {
+writeStats(preStageDiagnosis ? preStageDiagnosis.category : diagnosis.agent ? 'success:agent' : 'success:ai', {
   problem: diagnosis.problem,
   fix: diagnosis.fix_approach,
   fix_branch: fixBranch,

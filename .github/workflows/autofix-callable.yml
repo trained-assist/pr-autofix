@@ -129,6 +129,12 @@ jobs:
         if: steps.guard.outputs.skip == 'false'
         run: npm ci --ignore-scripts
 
+      # AUTOFIX_AGENT=1 (repo variable): Stages 2–3 are done by a coding agent (opencode)
+      # talking to the same llm-ladder worker with the same token — no extra secret.
+      - name: Install coding agent (opencode)
+        if: steps.guard.outputs.skip == 'false' && vars.AUTOFIX_AGENT == '1'
+        run: npm install -g opencode-ai@1.18.32 && opencode --version
+
       - name: Run autofix pipeline
         id: autofix
         if: steps.guard.outputs.skip == 'false'
@@ -142,6 +148,9 @@ jobs:
           ORIGINAL_BRANCH: ${{ inputs.original_branch }}
           # Optional repo variable: another llm-ladder ladder name (default free-ladder).
           AUTOFIX_LADDER: ${{ vars.AUTOFIX_LADDER }}
+          # Optional repo variables: coding-agent fix stage (issue #21).
+          AUTOFIX_AGENT: ${{ vars.AUTOFIX_AGENT }}
+          AUTOFIX_AGENT_TIMEOUT_MIN: ${{ vars.AUTOFIX_AGENT_TIMEOUT_MIN }}
         run: node /tmp/autofix.mjs
 
       - name: Report unfixed failure
