@@ -53,7 +53,8 @@
 //   fail:ai_tests_fail          patch applied but tests still fail  ← paid-tier candidate
 //   fail:ai_model_error         llm-ladder error (worker unreachable / every rung failed)
 //   fail:agent_no_change        AUTOFIX_AGENT=1: the agent finished without changing any file
-//   fail:agent_error            AUTOFIX_AGENT=1: the agent could not run / timed out with no change
+//   fail:agent_error            (retired: an agent error now falls back to Stages 2–3; the
+//                               result is then an ordinary success:ai / fail:ai_* category)
 //   fail:diff_rejected          the fix diff failed the deterministic gate (weakened tests, lock
 //                               files, too big) — never becomes a PR, whoever wrote it
 //   fail:other                  unexpected error
@@ -278,6 +279,7 @@ function writeStats(category, extra = {}) {
     run_id: RUN_ID || '',
     category,
     ...extra,
+    ...(typeof agentFellBack === 'string' ? { agent_fallback: agentFellBack } : {}),
     llm_usage: { ..._usage, cost_usd: Number(_usage.cost_usd.toFixed(6)) },
   };
 
@@ -1490,6 +1492,8 @@ if (!preStageDiagnosis) {
 // ── AI pipeline (only runs if pre-stages didn't apply) ───────────────────────
 
 let diagnosis;
+// Set when the AUTOFIX_AGENT run errored/timed out → Stages 2–3 ran instead (lands in stats).
+var agentFellBack = null;
 let patchToApply = null; // set by stage 3 if AI ran
 
 if (preStageDiagnosis) {
@@ -1568,14 +1572,21 @@ Rules:
   }
   const changed = normalizeAgentChanges(headBefore);
   log('agent', `finished (ok=${res.ok}${res.error ? `, ${res.error}` : ''}); changed: ${changed.split('\n').filter(Boolean).length} path(s)`);
-  if (!changed) {
-    const cat = res.ok ? 'fail:agent_no_change' : 'fail:agent_error';
-    await prComment(`❌ Agent made no change\n\n**Cause:** ${diagnosis.problem}\n${res.error ? `**Error:** ${res.error}\n` : ''}\n\`\`\`\n${res.summary.slice(-800)}\n\`\`\``);
-    failWithStats(cat, res.error || 'agent finished without changing any file', { problem: diagnosis.problem, agent_summary: res.summary.slice(-500) });
+  if (!changed && res.ok) {
+    await prComment(`❌ Agent made no change\n\n**Cause:** ${diagnosis.problem}\n\n\`\`\`\n${res.summary.slice(-800)}\n\`\`\``);
+    failWithStats('fail:agent_no_change', 'agent finished without changing any file', { problem: diagnosis.problem, agent_summary: res.summary.slice(-500) });
   }
-  diagnosis.fix_approach = res.summary.split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 600) || diagnosis.fix_approach;
-  diagnosis.agent = true;
+  if (changed) {
+    diagnosis.fix_approach = res.summary.split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 600) || diagnosis.fix_approach;
+    diagnosis.agent = true;
   } else {
+    // The agent could not run / went silent (timeout) → the single-shot Stages 2–3 below.
+    agentFellBack = res.error;
+    log('agent', `agent error (${res.error}) — falling back to Stages 2–3`);
+    await prComment(`⚠️ Agent failed (${res.error}) — falling back to single-shot Stages 2–3`);
+  }
+  }
+  if (!AGENT_MODE || agentFellBack) {
   // ── Stage 2: Gather context ────────────────────────────────────────────────
   const fileList = (diagnosis.files_to_examine || []).slice(0, MAX_FILES);
   const fileContents = [];
@@ -1714,7 +1725,7 @@ Rules:
   }
   if (applied) log('stage3', `applied ${applied.count} edit(s) to ${[...new Set(applied.files)].join(', ')}`);
   diagnosis.fix_approach = changeSpec; // use refined spec from stage 2
-  } // end !AGENT_MODE
+  } // end !AGENT_MODE || agentFellBack
 }
 
 // ── Apply patch (AI path only) ────────────────────────────────────────────────
