@@ -2,7 +2,7 @@
 // CI auto-fix pipeline — three layers:
 //
 //   Pre-stage (deterministic, no AI):
-//     A. Out-of-date branch  → git merge origin/main
+//     A. Out-of-date branch  → update PR branch in place (clean) / merge + AI conflict resolution
 //     B. Missing permissions → patch workflow YAML
 //     C. Cloudflare DO conflict → bail with precise diagnosis
 //
@@ -11,7 +11,9 @@
 //     Stage 2 (nemotron-3-super-120b:free) — contextualize: read real files, describe changes
 //     Stage 3 (nemotron-3-ultra-550b:free) — patch: write the unified diff
 //
-// On success: creates a new fix/ci-* branch + PR (never pushes to original branch).
+// On success: creates a new fix/ci-* branch + PR (never pushes code to the original branch).
+// Exception — no code of ours: a branch that is merely behind and merges cleanly is updated
+// in place (GitHub update-branch on the original PR); a new PR is only for a change we author.
 // The new PR auto-merges when CI passes; ci-fix-cleanup.yml then closes the original PR.
 // Exits 0 on success (fix PR created), 1 on failure.
 //
@@ -29,7 +31,9 @@
 // Every run writes ci-fixer-stats.json + appends to $GITHUB_STEP_SUMMARY.
 // Categories (used to decide when to escalate to a paid-model second pass):
 //
-//   success:pre_a_merge              branch was behind → git merge fixed it
+//   success:pre_a_update_in_place    branch was behind, merges clean → original PR branch
+//                                    updated via GitHub update-branch (no new PR)
+//   skip:not_behind                  merge failed but branch already contains base → no-op
 //   success:pre_a_conflict_resolved  merge had conflicts → AI resolved them using PR purpose
 //   success:pre_b_permissions        job lacked permissions → workflow YAML patched
 //   success:ai                       3-stage free-model pipeline fixed it
@@ -40,6 +44,7 @@
 //   fail:ai_conflict_resolution AI tried to resolve conflicts but failed/left markers
 //   fail:permissions_no_workflow permission error but no patchable workflow found
 //   fail:race_pr_closed         PR was already closed/merged before we started
+//   fail:update_branch          clean merge, but GitHub refused update-branch (head moved)
 //   fail:ai_no_diagnose         Stage 1 could not identify root cause
 //   fail:ai_low_confidence      Stage 1 diagnosed but confidence too low to patch
 //   fail:ai_cannot_fix          Stage 3 returned CANNOT_FIX        ← paid-tier candidate
@@ -694,20 +699,39 @@ Return ONLY the resolved code — no conflict markers, no explanations, no markd
 // Detection: CI auto-merge step fails with "not up to date with the base branch"
 //            OR batch mode (always try merge regardless of log content).
 // Fix: git merge origin/<BASE_BRANCH>; if conflicts → AI resolution using PR purpose.
+//
+// A new fix PR is only for a change we author (conflict resolution, AI patch).
+// Branch merely behind + clean merge → no code of ours: `inPlace`, the caller
+// updates the ORIGINAL PR's branch via GitHub's update-branch (same PR, fresh CI).
+// Branch not behind at all → `noop`: the merge failure wasn't staleness.
 async function tryFixOutOfDate(failedLog, prPurposeArg) {
-  const logMatches = /not up to date with the base branch|head branch.*behind/i.test(failedLog);
+  const logMatches = /not up to date with the base branch|head branch.*behind|base branch policy prohibits the merge/i.test(failedLog);
   if (!BATCH_MODE && !logMatches) return null;
 
   log('pre-A', `${BATCH_MODE ? 'batch mode' : 'detected "not up to date"'} — merging origin/${BASE_BRANCH}...`);
+  sh(`git fetch origin ${BASE_BRANCH} --quiet`);
+  const headSha = sh('git rev-parse HEAD').trim();
   try {
-    sh(`git fetch origin ${BASE_BRANCH} --quiet`);
-    sh(`git merge origin/${BASE_BRANCH} --no-edit -m "merge: sync with ${BASE_BRANCH} before merge"`);
-    log('pre-A', 'merge successful — no code changes needed');
+    sh(`git merge-base --is-ancestor origin/${BASE_BRANCH} HEAD`);
+    log('pre-A', `branch already contains origin/${BASE_BRANCH} — nothing to merge`);
     return {
       ok: true,
-      category: 'success:pre_a_merge',
-      problem: `Branch was behind \`${BASE_BRANCH}\` — merged to bring it up to date`,
-      fix_approach: `Merged \`origin/${BASE_BRANCH}\` into the branch. No source code changes.`,
+      noop: true,
+      category: 'skip:not_behind',
+      problem: `Branch already contains \`${BASE_BRANCH}\` — the merge failure was not caused by a stale branch`,
+    };
+  } catch { /* exit 1 = behind → merge below */ }
+  try {
+    sh(`git merge origin/${BASE_BRANCH} --no-edit -m "merge: sync with ${BASE_BRANCH} before merge"`);
+    sh(`git reset --hard ${headSha}`); // the local merge was only a conflict probe
+    log('pre-A', 'clean merge — no code changes needed, will update the original PR branch in place');
+    return {
+      ok: true,
+      inPlace: true,
+      headSha,
+      category: 'success:pre_a_update_in_place',
+      problem: `Branch was behind \`${BASE_BRANCH}\` (merges cleanly)`,
+      fix_approach: `Updated the PR branch from \`${BASE_BRANCH}\` in place (GitHub update-branch). No source code changes, no new PR.`,
     };
   } catch (mergeErr) {
     const conflictedFiles = sh('git diff --name-only --diff-filter=U').trim().split('\n').filter(Boolean);
@@ -1028,6 +1052,38 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('log: group bodies dropped, step headers kept', lc.includes('▶ Run npm test') && !lc.includes('token: ***'));
   check('log: error lines survive the budget', lc.includes("Cannot find module '/w/test'") && lc.includes('not ok 1') && lc.includes('ERROR: Process completed with exit code 1'));
   check('log: within budget, post-job cleanup cut', estTokens(lc) <= 300 && !lc.includes('git version'), `~${estTokens(lc)}`);
+  // ── Pre-stage A: behind + clean merge → in place, never a new PR (trained-assist-agent#1663) ──
+  const gt = mkdtempSync(path.join(os.tmpdir(), 'autofix-behind-'));
+  const g = (...a) => execFileSync('git', a, { cwd: gt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  g('init', '-q', '--bare', 'origin.git');
+  g('clone', '-q', 'origin.git', 'w');
+  const gw = (...a) => execFileSync('git', a, { cwd: path.join(gt, 'w'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  gw('config', 'user.email', 't@t'); gw('config', 'user.name', 't');
+  gw('checkout', '-q', '-b', BASE_BRANCH);
+  writeFileSync(path.join(gt, 'w', 'a.txt'), 'a\n'); gw('add', '-A'); gw('commit', '-qm', 'base');
+  gw('push', '-q', 'origin', BASE_BRANCH);
+  gw('checkout', '-q', '-b', 'feat');
+  writeFileSync(path.join(gt, 'w', 'b.txt'), 'b\n'); gw('add', '-A'); gw('commit', '-qm', 'feat');
+  const cwd0 = process.cwd();
+  process.chdir(path.join(gt, 'w'));
+  try {
+    const behindLog = 'X Pull request o/r#1 is not mergeable: the base branch policy prohibits the merge.';
+    let pa = await tryFixOutOfDate(behindLog, '');
+    check('pre-A: up-to-date branch → noop, no fix PR', pa?.noop === true && pa.category === 'skip:not_behind');
+    gw('checkout', '-q', BASE_BRANCH);
+    writeFileSync(path.join(gt, 'w', 'c.txt'), 'c\n'); gw('add', '-A'); gw('commit', '-qm', 'main moved');
+    gw('push', '-q', 'origin', BASE_BRANCH);
+    gw('checkout', '-q', 'feat');
+    const featSha = gw('rev-parse', 'HEAD').trim();
+    pa = await tryFixOutOfDate(behindLog, '');
+    check('pre-A: behind + clean → in place, pinned to head', pa?.inPlace === true && pa.category === 'success:pre_a_update_in_place' && pa.headSha === featSha);
+    check('pre-A: conflict probe leaves the checkout untouched', gw('rev-parse', 'HEAD').trim() === featSha && !gw('status', '--porcelain').trim());
+    check('pre-A: unrelated failure log is not staleness', (await tryFixOutOfDate('Error: test failed', '')) === null);
+  } finally {
+    process.chdir(cwd0);
+    rmSync(gt, { recursive: true, force: true });
+  }
+
   globalThis.fetch = originalFetch;
   if (failed > 0) { console.error(`SELFTEST FAILED: ${failed} check(s)`); process.exit(1); }
   console.log('SELFTEST PASS');
@@ -1047,8 +1103,8 @@ try {
   sh('git config user.email "autofix@trained-assist.bot"');
 } catch { /* non-fatal — will fail later if identity really needed */ }
 
-// ── Race condition guard (skipped in batch mode) ─────────────────────────────
-if (!BATCH_MODE) {
+// ── Race condition guard (the CI-failure part is skipped in batch mode) ─────
+{
   try {
     const prViewRaw = sh(`gh pr view ${PR_NUMBER} -R ${REPO} --json state,statusCheckRollup`);
     const prInfo = JSON.parse(prViewRaw);
@@ -1058,7 +1114,7 @@ if (!BATCH_MODE) {
       process.exit(0); // not a real failure — nothing to do
     }
     const checks = prInfo.statusCheckRollup || [];
-    if (checks.length > 0 && !checks.some(c => c.conclusion === 'FAILURE' || c.conclusion === 'TIMED_OUT')) {
+    if (!BATCH_MODE && checks.length > 0 && !checks.some(c => c.conclusion === 'FAILURE' || c.conclusion === 'TIMED_OUT')) {
       writeStats('fail:race_pr_closed', { reason: 'CI no longer shows failures' });
       log('guard', `PR #${PR_NUMBER} CI no longer shows failures — aborting`);
       process.exit(0);
@@ -1221,6 +1277,26 @@ if (outOfDateResult) {
     const icon = outOfDateResult.category === 'fail:ai_conflict_resolution' ? '🤖' : '❌';
     await prComment(`${icon} Could not fix: ${outOfDateResult.reason}\n\n\`\`\`\n${outOfDateResult.detail || ''}\n\`\`\``);
     failWithStats(outOfDateResult.category, outOfDateResult.reason, { detail: outOfDateResult.detail });
+  }
+  if (outOfDateResult.noop) {
+    await prComment(`ℹ️ ${outOfDateResult.problem}. Nothing to fix in code — no fix PR created.`);
+    writeStats(outOfDateResult.category, { problem: outOfDateResult.problem });
+    process.exit(0);
+  }
+  if (outOfDateResult.inPlace) {
+    // expected_head_sha: if the author pushed since we checked out, GitHub refuses (422)
+    // instead of merging into a head we never looked at.
+    try {
+      sh(`gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/update-branch" -f expected_head_sha=${outOfDateResult.headSha}`);
+    } catch (e) {
+      const reason = `update-branch refused: ${String(e.stderr || e.message).slice(0, 200)}`;
+      await prComment(`❌ Branch is behind \`${BASE_BRANCH}\` but could not be updated in place — ${reason}`);
+      failWithStats('fail:update_branch', reason);
+    }
+    await prComment(`🔄 ${outOfDateResult.problem}\n\n**Fix:** ${outOfDateResult.fix_approach} CI re-runs on this PR.`);
+    writeStats(outOfDateResult.category, { problem: outOfDateResult.problem, fix: outOfDateResult.fix_approach });
+    console.log(`[autofix] PR #${PR_NUMBER} branch updated in place from ${BASE_BRANCH}`);
+    process.exit(0);
   }
   preStageDiagnosis = outOfDateResult;
 }

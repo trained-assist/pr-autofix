@@ -96,6 +96,10 @@ gh workflow run batch-fix-prs.yml --field pr_numbers="42,41,39"
 
 - Your `LLM_LADDER_TOKEN` and `AUTOFIX_PAT` never leave GitHub Actions
 - The fixer only reads the CI log, your source files, and git history
-- It never pushes to `main` or the original branch — always creates a new `fix/ci-*` branch
+- It never pushes code to `main` or the original branch — a change it authors (conflict resolution,
+  AI patch) always goes to a new `fix/ci-*` branch/PR
+- A branch that is only behind `main` and merges cleanly is **not** re-created as a new PR: the fixer
+  calls GitHub's update-branch on the original PR (pinned with `expected_head_sha`), so CI re-runs on
+  the same PR. Needs `AUTOFIX_PAT` — a push made with `GITHUB_TOKEN` does not trigger a new CI run
 - PRs marked `draft` are skipped
 - `fix/ci-*` branches are never re-fixed (prevents infinite loops)
