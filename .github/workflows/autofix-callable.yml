@@ -151,6 +151,9 @@ jobs:
           # Optional repo variables: coding-agent fix stage (issue #21).
           AUTOFIX_AGENT: ${{ vars.AUTOFIX_AGENT }}
           AUTOFIX_AGENT_TIMEOUT_MIN: ${{ vars.AUTOFIX_AGENT_TIMEOUT_MIN }}
+          # Optional repo variables: diff-gate size limits (defaults 15 files / 400 lines).
+          AUTOFIX_GATE_MAX_FILES: ${{ vars.AUTOFIX_GATE_MAX_FILES }}
+          AUTOFIX_GATE_MAX_LINES: ${{ vars.AUTOFIX_GATE_MAX_LINES }}
         run: node /tmp/autofix.mjs
 
       - name: Report unfixed failure

@@ -49,6 +49,8 @@
 //   fail:ai_model_error         llm-ladder error (worker unreachable / every rung failed)
 //   fail:agent_no_change        AUTOFIX_AGENT=1: the agent finished without changing any file
 //   fail:agent_error            AUTOFIX_AGENT=1: the agent could not run / timed out with no change
+//   fail:diff_rejected          the fix diff failed the deterministic gate (weakened tests, lock
+//                               files, too big) — never becomes a PR, whoever wrote it
 //   fail:other                  unexpected error
 //
 // ── Batch mode ──────────────────────────────────────────────────────────────────
@@ -142,6 +144,61 @@ Do NOT: commit, push, create branches or PRs, edit .github/workflows/, delete or
 Finish with one short paragraph: what was wrong and what you changed.`;
 }
 
+// The GitHub write token must be unusable while the agent runs. Removing it from the env
+// is not enough: actions/checkout persists it in the repo git config (an http.<url>.extraheader,
+// or an includeIf'd credentials file in newer checkout versions). Hide those entries for
+// the agent's run; restoreGitConfig() puts the config back byte-for-byte afterwards, which
+// also undoes anything the agent changed there (hooksPath, aliases, credential helpers).
+const GIT_CRED_KEY_RE = /^(http\..*\.extraheader|includeif\..*|credential\..*)$/i;
+function hideGitCredentials(cwd = process.cwd()) {
+  const cfgPath = path.join(cwd, '.git', 'config');
+  const saved = readFileSync(cfgPath);
+  let keys = [];
+  try { keys = sh('git config --local --name-only --list').split('\n').map(k => k.trim()).filter(k => GIT_CRED_KEY_RE.test(k)); } catch { /* no local config */ }
+  for (const k of [...new Set(keys)]) { try { sh(`git config --local --unset-all ${JSON.stringify(k)}`); } catch { /* already gone */ } }
+  return { cfgPath, saved, hidden: [...new Set(keys)] };
+}
+function restoreGitConfig(state) {
+  if (state) writeFileSync(state.cfgPath, state.saved);
+}
+
+// ── Fix-diff gate (deterministic) ──────────────────────────────────────────────
+// CI is the judge — so a fix may not weaken what CI checks. Applied to every AI/agent
+// fix before it is committed; pre-stage merges are exempt (their diff is main's).
+const GATE_MAX_FILES = Number(process.env.AUTOFIX_GATE_MAX_FILES) || 15;
+const GATE_MAX_LINES = Number(process.env.AUTOFIX_GATE_MAX_LINES) || 400;
+const TEST_PATH_RE = /(^|\/)(tests?|__tests__|spec)\/|[._-](test|spec)\.[cm]?[jt]sx?$|_test\.(go|py)$|(^|\/)test_[^/]*\.py$/i;
+const LOCK_PATH_RE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|go\.sum|poetry\.lock|composer\.lock|Gemfile\.lock)$/;
+const TEST_DISABLE_RE = /\b(?:it|test|describe|suite|context)\.(?:skip|only|todo)\s*\(|\bx(?:it|test|describe)\s*\(|\{\s*skip\s*:\s*true|@pytest\.mark\.(?:skip|xfail)|\bt\.Skip(?:Now|f)?\(|@(?:Disabled|Ignore)\b/;
+const ASSERT_RE = /\b(?:assert\w*|expect|should)\b|\.(?:toBe|toEqual|strictEqual|deepEqual|deepStrictEqual|match|throws|rejects)\b/;
+
+function checkFixDiff(diff, { failedLog = '' } = {}) {
+  const reasons = [];
+  const files = parseDiff(diff);
+  let changed = 0;
+  for (const f of files) {
+    const added = [], removed = [];
+    for (const h of f.hunks) for (const l of h.lines) {
+      if (l.startsWith('+')) added.push(l.slice(1));
+      else if (l.startsWith('-')) removed.push(l.slice(1));
+    }
+    changed += added.length + removed.length;
+    const p = f.path;
+    if (/^\.github\/workflows\//.test(p)) reasons.push(`${p}: CI workflow changed`);
+    if (LOCK_PATH_RE.test(p) && !/lock|npm ci|ERESOLVE|frozen|integrity|checksum/i.test(failedLog)) reasons.push(`${p}: lock file changed but the failure is not about dependencies`);
+    if (TEST_PATH_RE.test(p)) {
+      if (f.deleted) reasons.push(`${p}: test file deleted`);
+      const disabling = added.filter(l => TEST_DISABLE_RE.test(l));
+      if (disabling.length) reasons.push(`${p}: test disabled/focused (${disabling[0].trim().slice(0, 80)})`);
+      const lostAsserts = removed.filter(l => ASSERT_RE.test(l)).length - added.filter(l => ASSERT_RE.test(l)).length;
+      if (lostAsserts > 0) reasons.push(`${p}: ${lostAsserts} assertion(s) removed`);
+    }
+  }
+  if (files.length > GATE_MAX_FILES) reasons.push(`${files.length} files changed (max ${GATE_MAX_FILES})`);
+  if (changed > GATE_MAX_LINES) reasons.push(`${changed} lines changed (max ${GATE_MAX_LINES})`);
+  return { ok: reasons.length === 0, reasons, files: files.length, lines: changed };
+}
+
 // Runs the agent in the working tree. Returns { ok, summary, error }.
 function runAgentFix(prompt) {
   const dir = path.join(os.tmpdir(), `autofix-agent-${process.pid}`); // outside the repo: never committed
@@ -149,10 +206,14 @@ function runAgentFix(prompt) {
   const configPath = path.join(dir, 'opencode.json');
   writeFileSync(configPath, JSON.stringify(agentOpencodeConfig(), null, 2));
   // The agent gets the ladder token (its model access) but not the GitHub write token.
+  // HOME is a scratch dir too: whatever the agent writes to ~/.gitconfig etc. cannot
+  // affect the git commands autofix runs after it.
   const { GH_TOKEN: _gh, GITHUB_TOKEN: _gt, ...env } = process.env;
+  const home = path.join(dir, 'home');
+  mkdirSync(home, { recursive: true });
   const r = spawnSync(AGENT_BIN, ['run', '--auto', '-m', `ladder/${LADDER_MODEL}`, prompt], {
     cwd: process.cwd(),
-    env: { ...env, OPENCODE_CONFIG: configPath, XDG_DATA_HOME: path.join(dir, 'data') },
+    env: { ...env, HOME: home, OPENCODE_CONFIG: configPath, XDG_DATA_HOME: path.join(dir, 'data') },
     encoding: 'utf8',
     timeout: AGENT_TIMEOUT_MS,
     maxBuffer: 50 * 1024 * 1024,
@@ -1125,6 +1186,20 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('agent: model = ladder name', ac.model === 'ladder/deepseek' && !!ac.provider.ladder.models.deepseek?.tool_call);
   const ap = agentPrompt({ diagnosis: { problem: 'P', fix_approach: 'F', files_to_examine: ['a.js'] }, purpose: 'X', log: 'L', diff: 'D', base: 'main' });
   check('agent: prompt carries diagnosis/log/diff and forbids commits + workflow edits', ap.includes('P') && ap.includes('a.js') && /Do NOT: commit/.test(ap) && ap.includes('.github/workflows/'));
+  // ── Fix-diff gate ──
+  const mk = (file, lines, extra = '') => `diff --git a/${file} b/${file}\n${extra}--- a/${file}\n+++ b/${file}\n@@ -1,3 +1,3 @@\n${lines}\n`;
+  const okFix = checkFixDiff(mk('src/sum.js', '-  return a - b;\n+  return a + b;'));
+  check('gate: a plain source fix passes', okFix.ok && okFix.files === 1 && okFix.lines === 2);
+  check('gate: .skip in a test is rejected', !checkFixDiff(mk('tests/sum.test.js', "-it('adds', () => {\n+it.skip('adds', () => {")).ok);
+  check('gate: xit / pytest skip rejected', !checkFixDiff(mk('test/a.test.js', "+xit('x', () => {})")).ok && !checkFixDiff(mk('tests/test_a.py', '+@pytest.mark.skip')).ok);
+  check('gate: removed assertion rejected', !checkFixDiff(mk('src/__tests__/a.js', '-  expect(sum(2, 3)).toBe(5);')).ok);
+  check('gate: test file deletion rejected', !checkFixDiff(mk('test/a.test.js', '-assert.ok(1)', 'deleted file mode 100644\n')).ok);
+  check('gate: lock file only when the log is about deps', !checkFixDiff(mk('package-lock.json', '+x')).ok && checkFixDiff(mk('package-lock.json', '+x'), { failedLog: 'npm ci failed: lock file out of sync' }).ok);
+  check('gate: workflow edit rejected', !checkFixDiff(mk('.github/workflows/ci.yml', '-  run: npm test\n+  run: true')).ok);
+  const bigFix = Array.from({ length: GATE_MAX_FILES + 1 }, (_, i) => mk(`src/f${i}.js`, '+x')).join('');
+  check('gate: too many files rejected', !checkFixDiff(bigFix).ok);
+  check('gate: rewriting an assertion (same count) passes', checkFixDiff(mk('test/a.test.js', '-  expect(x).toBe(1);\n+  expect(x).toBe(2);')).ok);
+  check('creds: checkout credential keys are matched', ['http.https://github.com/.extraheader', 'includeIf.gitdir:/x/.git.path', 'credential.helper'].every(k => GIT_CRED_KEY_RE.test(k)) && !GIT_CRED_KEY_RE.test('user.name'));
   check('log: group bodies dropped, step headers kept', lc.includes('▶ Run npm test') && !lc.includes('token: ***'));
   check('log: error lines survive the budget', lc.includes("Cannot find module '/w/test'") && lc.includes('not ok 1') && lc.includes('ERROR: Process completed with exit code 1'));
   check('log: within budget, post-job cleanup cut', estTokens(lc) <= 300 && !lc.includes('git version'), `~${estTokens(lc)}`);
@@ -1407,7 +1482,14 @@ Rules:
   // ── Agent stage (replaces Stages 2–3) ──────────────────────────────────────
   await prComment(`🤖 Agent: fixing with opencode (ladder \`${LADDER_MODEL}\`) — reads files, runs the failing tests, iterates…`);
   const headBefore = sh('git rev-parse HEAD').trim();
-  const res = runAgentFix(agentPrompt({ diagnosis, purpose: prPurpose, log: failedLog, diff: prDiff, base: BASE_BRANCH }));
+  const creds = hideGitCredentials();
+  log('agent', `git credentials hidden for the agent run (${creds.hidden.length} entr${creds.hidden.length === 1 ? 'y' : 'ies'})`);
+  let res;
+  try {
+    res = runAgentFix(agentPrompt({ diagnosis, purpose: prPurpose, log: failedLog, diff: prDiff, base: BASE_BRANCH }));
+  } finally {
+    restoreGitConfig(creds);
+  }
   const changed = normalizeAgentChanges(headBefore);
   log('agent', `finished (ok=${res.ok}${res.error ? `, ${res.error}` : ''}); changed: ${changed.split('\n').filter(Boolean).length} path(s)`);
   if (!changed) {
@@ -1625,17 +1707,29 @@ const fixStrategy = preStageDiagnosis
 sh('git config user.name "trained-assist-autofix"');
 sh('git config user.email "autofix@trained-assist.bot"');
 sh('git add -A');
+
+// Deterministic gate on what actually changed (git, not the model's word). Pre-stage
+// merges/permission patches are exempt — their diff is main's, not an AI fix.
+if (!preStageDiagnosis) {
+  const gate = checkFixDiff(sh('git diff --cached --no-color'), { failedLog: failedLogRaw });
+  log('gate', `fix diff: ${gate.files} file(s), ${gate.lines} line(s) — ${gate.ok ? 'ok' : gate.reasons.join('; ')}`);
+  if (!gate.ok) {
+    sh('git reset -q');
+    await prComment(`❌ Fix rejected by the diff gate — no PR created\n\n**Cause:** ${diagnosis.problem}\n\n${gate.reasons.map(r => `- ${r}`).join('\n')}`);
+    failWithStats('fail:diff_rejected', gate.reasons.join('; ').slice(0, 300), { problem: diagnosis.problem, gate_reasons: gate.reasons.slice(0, 10), agent: !!diagnosis.agent });
+  }
+}
 // Pre-stage A (conflict resolution or clean merge) may have already committed.
 // Skip the commit if nothing is staged — avoids "nothing to commit" crash.
 if (sh('git status --porcelain').trim()) {
-  sh(`git commit -m "fix: auto-fix CI failure [autofix]
+  sh(`git -c core.hooksPath=/dev/null commit --no-verify -m "fix: auto-fix CI failure [autofix]
 
 Diagnosis: ${diagnosis.problem.slice(0, 120).replace(/"/g, "'")}
 Strategy: ${fixStrategy}"
 `);
 }
 sh(`git checkout -b ${fixBranch}`);
-sh(`git push origin ${fixBranch}`);
+sh(`git -c core.hooksPath=/dev/null push --no-verify origin ${fixBranch}`);
 
 log('publish', `pushed fix branch: ${fixBranch}`);
 
