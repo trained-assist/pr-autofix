@@ -129,7 +129,7 @@ The PR diff is parsed into hunks and shrunk PR-Agent style — asymmetric contex
 Every run writes `ci-fixer-stats.json` (uploaded as the `ci-fixer-stats` artifact) and a step
 summary: category, reason, token usage/cost per model. Categories are listed at the top of
 `scripts/autofix.mjs` — e.g. `success:agent`, `success:ai`, `success:pre_a_merge`,
-`fail:diff_rejected`, `fail:agent_no_change`, `fail:agent_error`, `fail:ai_model_error`.
+`fail:diff_rejected`, `fail:agent_no_change`, `fail:ai_model_error`. An agent error/timeout falls back to Stages 2–3 (stats field `agent_fallback`).
 
 ### Repo variables
 
