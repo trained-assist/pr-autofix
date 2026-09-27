@@ -40,6 +40,7 @@
 //   fail:ai_conflict_resolution AI tried to resolve conflicts but failed/left markers
 //   fail:permissions_no_workflow permission error but no patchable workflow found
 //   fail:race_pr_closed         PR was already closed/merged before we started
+//   fail:race_pr_superseded     PR still open but labelled `superseded` / head moved — agent superseded it mid-run
 //   fail:ai_no_diagnose         Stage 1 could not identify root cause
 //   fail:ai_low_confidence      Stage 1 diagnosed but confidence too low to patch
 //   fail:ai_cannot_fix          Stage 3 returned CANNOT_FIX        ← paid-tier candidate
@@ -367,6 +368,9 @@ function recordUsage(m, u) {
 let OR_KEY = OPENROUTER_API_KEY || '';
 let GO_KEY = OPENCODE_GO_API_KEY || '';
 let _goDisabled = false;
+// Expected head_sha of the original PR — captured on the first live fetch,
+// compared on every later guardPr() call (see the supersede guard below).
+let PR_HEAD_SHA = '';
 function goAvailable() { return !!GO_KEY && !_goDisabled; }
 
 // Cached list of free models discovered from OpenRouter /models (fetched once per run)
@@ -1065,6 +1069,20 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   check('unfenced kept', stripCodeFence('const a = 1;') === 'const a = 1;');
   check('guard rejects runaway', /runaway/.test(checkResolvedBlock(blk, blk.theirs + '\n' + 'q'.repeat(1000)) || ''));
 
+  // ── Supersede guard (trained-assist-engineering#27) ──
+  // prStaleReason is the pure decision behind every guardPr() call: open +
+  // no `superseded` label + stable head_sha = actionable.
+  PR_HEAD_SHA = '';
+  const openPr = { state: 'open', labels: [], head: { sha: 'abc123' } };
+  check('guard: open PR actionable', prStaleReason(openPr) === null);
+  check('guard: closed detected', /already closed/.test(prStaleReason({ state: 'closed', labels: [], head: { sha: 'abc123' } }) || ''));
+  check('guard: superseded label detected', /superseded/.test(prStaleReason({ state: 'open', labels: [{ name: 'superseded' }], head: { sha: 'abc123' } }) || ''));
+  check('guard: unrelated label ignored', prStaleReason({ state: 'open', labels: [{ name: 'wip' }], head: { sha: 'abc123' } }) === null);
+  PR_HEAD_SHA = 'abc123';
+  check('guard: head moved detected', /head moved/.test(prStaleReason({ state: 'open', labels: [], head: { sha: 'def456' } }) || ''));
+  check('guard: stable head ok', prStaleReason(openPr) === null);
+  PR_HEAD_SHA = '';
+
   // Ladder integrity: every rung is a :free model, stages are on the ladder.
   check('ladder non-empty', FREE_MODEL_LADDER.length >= 5);
   check('ladder all :free', FREE_MODEL_LADDER.every(m => m.endsWith(':free')));
@@ -1326,11 +1344,56 @@ try {
   sh('git config user.email "autofix@trained-assist.bot"');
 } catch { /* non-fatal — will fail later if identity really needed */ }
 
-// ── Race condition guard (skipped in batch mode) ─────────────────────────────
-if (!BATCH_MODE) {
+// ── Live-PR guard (supersede-aware, trained-assist-engineering#27) ─────────────
+// GitHub is the single source of truth for PR state. The agent supersedes a
+// broken PR by opening the replacement FIRST, then commenting → labelling
+// (`superseded`) → closing the old one. Between "decided" and "closed" the old
+// PR is still OPEN — so a one-shot start guard misses the race and the fixer
+// keeps acting on a stale branch. Every mutating step re-verifies against live
+// GitHub: still open, no `superseded` label, head_sha unchanged (captured on
+// the first fetch, compared on every subsequent one).
+function fetchLivePr() {
+  if (!REPO || !PR_NUMBER) return null;
   try {
-    const prViewRaw = sh(`gh pr view ${PR_NUMBER} -R ${REPO} --json state,statusCheckRollup`);
-    const prInfo = JSON.parse(prViewRaw);
+    return JSON.parse(sh(`gh api repos/${REPO}/pulls/${PR_NUMBER}`));
+  } catch (e) {
+    log('guard', `live-PR fetch failed (${e.message.slice(0, 80)}) — proceeding without live data`);
+    return null;
+  }
+}
+// Pure decision — why the PR is no longer actionable, or null if it still is.
+function prStaleReason(pr) {
+  if (!pr) return null;
+  if (pr.state !== 'open') return `PR #${PR_NUMBER} is already ${pr.state}`;
+  if ((pr.labels || []).some(l => l.name === 'superseded')) return `PR #${PR_NUMBER} is labelled superseded`;
+  if (PR_HEAD_SHA && pr.head?.sha && pr.head.sha !== PR_HEAD_SHA) return `PR #${PR_NUMBER} head moved (${PR_HEAD_SHA.slice(0, 7)} → ${pr.head.sha.slice(0, 7)})`;
+  return null;
+}
+// Re-verify before a mutating step. On stale → comment, record stats and exit 0
+// (not a real failure — someone else superseded the PR). Returns the live PR.
+async function guardPr(where) {
+  if (BATCH_MODE) return null; // batch mode targets stale branches, not a live PR
+  const pr = fetchLivePr();
+  if (pr?.head?.sha && !PR_HEAD_SHA) PR_HEAD_SHA = pr.head.sha;
+  const reason = prStaleReason(pr);
+  if (reason) {
+    await prComment(`🛑 Aborting at "${where}": ${reason} — not acting against a stale PR.`);
+    writeStats('fail:race_pr_superseded', { reason, where });
+    log('guard', `[${where}] ${reason} — aborting`);
+    process.exit(0); // not a real failure — nothing to do
+  }
+  log('guard', `[${where}] PR #${PR_NUMBER} actionable (open, no superseded, head stable)`);
+  return pr;
+}
+
+// ── Race condition guard (skipped in batch mode) ─────────────────────────────
+// Live-GitHub check: the PR must still be actionable (open, no `superseded`
+// label, head stable) AND CI must still show failures. guardPr captures the
+// head_sha here and re-verifies before every later mutating step.
+if (!BATCH_MODE) {
+  await guardPr('start');
+  try {
+    const prInfo = JSON.parse(sh(`gh pr view ${PR_NUMBER} -R ${REPO} --json state,statusCheckRollup`));
     if (prInfo.state !== 'OPEN') {
       writeStats('fail:race_pr_closed', { reason: `PR is already ${prInfo.state}` });
       log('guard', `PR #${PR_NUMBER} is already ${prInfo.state} — aborting`);
@@ -1772,6 +1835,10 @@ if (!preStageDiagnosis?.category.startsWith('success:pre_a')) {
 }
 
 // ── Create new fix branch + PR (never push to original branch) ───────────────
+// Re-check the original PR before publishing anything: if the agent superseded
+// it (comment + label) but hasn't closed it yet, this is exactly the moment
+// between "decided" and "closed" — abort instead of fixing a stale branch.
+await guardPr('before publish');
 
 const ts = Math.floor(Date.now() / 1000);
 const safeBranch = (ORIGINAL_BRANCH || 'unknown').replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 40);
@@ -1842,14 +1909,20 @@ try {
 }
 
 try {
-  sh(`gh pr merge --auto --squash "${newPRNumber}" -R "${REPO}"`);
-  log('publish', `auto-merge enabled on PR #${newPRNumber}`);
+  // Lock auto-merge to the exact pushed head — an out-of-date fix branch then
+  // physically cannot merge (check-then-act vs the merge moment).
+  const headSha = sh('git rev-parse HEAD');
+  sh(`gh pr merge --auto --squash "${newPRNumber}" -R "${REPO}" --match-head-commit "${headSha}"`);
+  log('publish', `auto-merge enabled on PR #${newPRNumber} (locked to ${headSha.slice(0, 7)})`);
 } catch (e) {
   log('publish', `auto-merge not available (${e.message.slice(0, 80)}) — PR will need manual merge`);
 }
 
 // Close the original PR immediately — don't rely on webhook events from ci-fix-cleanup.yml
 // which can be dropped by GitHub. The fix PR is now the source of truth.
+// Re-check first: if the agent already superseded the original to a DIFFERENT
+// PR, guardPr aborts and we leave it alone instead of double-closing.
+await guardPr('before closing original');
 try {
   sh(`gh pr close ${PR_NUMBER} -R "${REPO}" --comment "🤖 Superseded by #${newPRNumber}: ${newPRUrl} (pending CI + auto-merge)."`);
   log('publish', `closed original PR #${PR_NUMBER}`);
