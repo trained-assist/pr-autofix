@@ -178,8 +178,21 @@ const LOCK_PATH_RE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.
 const TEST_DISABLE_RE = /\b(?:it|test|describe|suite|context)\.(?:skip|only|todo)\s*\(|\bx(?:it|test|describe)\s*\(|\{\s*skip\s*:\s*true|@pytest\.mark\.(?:skip|xfail)|\bt\.Skip(?:Now|f)?\(|@(?:Disabled|Ignore)\b/;
 const ASSERT_RE = /\b(?:assert\w*|expect|should)\b|\.(?:toBe|toEqual|strictEqual|deepEqual|deepStrictEqual|match|throws|rejects)\b/;
 
+// Rule IDs (AC-44). Fixed dictionary: a new id is a new release tag, never a new ad-hoc string.
+// `reasons: string[]` is read in four places and collapsed into a PR comment, so it keeps its
+// shape; `violations` is the structured twin that lets a log say WHICH rule fired, not just that
+// something did. Both are always produced — see checkFixDiff.
+const RULE_IDS = new Set([
+  'workflow_edited', 'test_disabled', 'assertion_removed', 'test_file_deleted', 'lock_file_touched',
+  'too_many_files', 'too_many_lines', 'docs_link_broken', 'docs_json_invalid', 'docs_heading_missing',
+  'adapter_schema_violation', 'profile_unknown', 'check_command_failed', 'cap_exhausted',
+  'unsupported_by_profile',
+]);
+
 function checkFixDiff(diff, { failedLog = '' } = {}) {
   const reasons = [];
+  const violations = [];
+  const flag = (ruleId, path, message) => { reasons.push(`${path}: ${message}`); violations.push({ rule_id: ruleId, path, message }); };
   const files = parseDiff(diff);
   let changed = 0;
   for (const f of files) {
@@ -190,19 +203,19 @@ function checkFixDiff(diff, { failedLog = '' } = {}) {
     }
     changed += added.length + removed.length;
     const p = f.path;
-    if (/^\.github\/workflows\//.test(p)) reasons.push(`${p}: CI workflow changed`);
-    if (LOCK_PATH_RE.test(p) && !/lock|npm ci|ERESOLVE|frozen|integrity|checksum/i.test(failedLog)) reasons.push(`${p}: lock file changed but the failure is not about dependencies`);
+    if (/^\.github\/workflows\//.test(p)) flag('workflow_edited', p, 'CI workflow changed');
+    if (LOCK_PATH_RE.test(p) && !/lock|npm ci|ERESOLVE|frozen|integrity|checksum/i.test(failedLog)) flag('lock_file_touched', p, 'lock file changed but the failure is not about dependencies');
     if (TEST_PATH_RE.test(p)) {
-      if (f.deleted) reasons.push(`${p}: test file deleted`);
+      if (f.deleted) flag('test_file_deleted', p, 'test file deleted');
       const disabling = added.filter(l => TEST_DISABLE_RE.test(l));
-      if (disabling.length) reasons.push(`${p}: test disabled/focused (${disabling[0].trim().slice(0, 80)})`);
+      if (disabling.length) flag('test_disabled', p, `test disabled/focused (${disabling[0].trim().slice(0, 80)})`);
       const lostAsserts = removed.filter(l => ASSERT_RE.test(l)).length - added.filter(l => ASSERT_RE.test(l)).length;
-      if (lostAsserts > 0) reasons.push(`${p}: ${lostAsserts} assertion(s) removed`);
+      if (lostAsserts > 0) flag('assertion_removed', p, `${lostAsserts} assertion(s) removed`);
     }
   }
-  if (files.length > GATE_MAX_FILES) reasons.push(`${files.length} files changed (max ${GATE_MAX_FILES})`);
-  if (changed > GATE_MAX_LINES) reasons.push(`${changed} lines changed (max ${GATE_MAX_LINES})`);
-  return { ok: reasons.length === 0, reasons, files: files.length, lines: changed };
+  if (files.length > GATE_MAX_FILES) flag('too_many_files', '(diff)', `${files.length} files changed (max ${GATE_MAX_FILES})`);
+  if (changed > GATE_MAX_LINES) flag('too_many_lines', '(diff)', `${changed} lines changed (max ${GATE_MAX_LINES})`);
+  return { ok: reasons.length === 0, reasons, violations, files: files.length, lines: changed };
 }
 
 // Runs the agent in the working tree. Returns { ok, summary, error }.
@@ -271,6 +284,12 @@ function log(stage, msg) {
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 function writeStats(category, extra = {}) {
+  // AC-44 receipt. Every field is OPTIONAL: records written by older runs stay valid, and a
+  // consumer that predates these keys keeps working. What changes is that a NEW record can
+  // answer "which rule fired, on which tool build, over which paths, within what budget".
+  const violations = extra.gate_violations || [];
+  const firstRule = extra.rule_id || violations[0]?.rule_id || null;
+  const toolRef = (process.env.AUTOFIX_WORKFLOW_REF || '').split('@').pop() || 'unpinned:local';
   const stats = {
     ts: new Date().toISOString(),
     repo: REPO || '',
@@ -278,6 +297,25 @@ function writeStats(category, extra = {}) {
     branch: ORIGINAL_BRANCH || '',
     run_id: RUN_ID || '',
     category,
+    // ── AC-44 (additive; absent in records written before this contract) ──
+    rule_id: firstRule,
+    gate_violations: violations,
+    tool: {
+      name: 'pr-autofix',
+      version: process.env.AUTOFIX_TOOL_VERSION || toolRef,
+      commit: process.env.AUTOFIX_WORKFLOW_SHA || process.env.AUTOFIX_TOOL_COMMIT || 'unpinned:local',
+    },
+    attempt_count: extra.attempt_count ?? 1,
+    patch_refs: extra.patch_refs ?? [],
+    included_paths: extra.included_paths ?? [],
+    omitted_paths: extra.omitted_paths ?? [],
+    budget: extra.budget || {
+      diff_tokens: DIFF_TOKEN_BUDGET, diff_tokens_used: 0,
+      log_tokens: LOG_TOKEN_BUDGET, log_tokens_used: 0,
+      max_files: GATE_MAX_FILES, max_lines: GATE_MAX_LINES,
+    },
+    retention: extra.retention || { ttl_days: 90, artifact: `ci-fixer-stats-pr${PR_NUMBER || 'local'}-run${RUN_ID || '0'}` },
+    credentials: extra.credentials ?? [],
     ...extra,
     ...(typeof agentFellBack === 'string' ? { agent_fallback: agentFellBack } : {}),
     llm_usage: { ..._usage, cost_usd: Number(_usage.cost_usd.toFixed(6)) },
@@ -295,6 +333,7 @@ function writeStats(category, extra = {}) {
       ['Repo', stats.repo],
       extra.problem ? ['Root cause', extra.problem.slice(0, 200)] : null,
       extra.reason  ? ['Reason',     extra.reason.slice(0, 200)]  : null,
+      firstRule     ? ['Rule',       `\`${firstRule}\`${violations.length > 1 ? ` (+${violations.length - 1} more)` : ''}`] : null,
       extra.fix     ? ['Fix',        extra.fix.slice(0, 200)]     : null,
       extra.hint    ? ['Hint',       extra.hint.slice(0, 300)]    : null,
       _usage.calls  ? ['LLM', `${_usage.calls} calls, ${_usage.prompt_tokens} in / ${_usage.completion_tokens} out tokens, $${_usage.cost_usd.toFixed(5)} — ${Object.keys(_usage.by_model).join(', ')}`] : null,
@@ -482,18 +521,31 @@ function trimHunk(h, ctxBefore, ctxAfter, collapseDeletes = false) {
 //   then, in priority order: a file that doesn't fit is cut mid-additions (if
 //   enough budget is left to be useful) or listed by name as "over budget".
 // Files cited in the failing CI log are placed first so they survive longest.
-function compressDiff(diff, budgetTokens = DIFF_TOKEN_BUDGET, failedLogText = '') {
+function compressDiff(diff, budgetTokens = DIFF_TOKEN_BUDGET, failedLogText = '', meta = {}) {
   const files = parseDiff(diff);
-  if (!files.length) return String(diff || '').slice(0, budgetTokens * 4);
+  // `meta` is the AC-44 receipt: what actually made it into the prompt and what did not, plus
+  // the tokens spent. It is filled in place so the four existing call sites stay untouched and
+  // every one of them can opt in by passing a fourth argument.
+  const omittedDetail = [];
+  const note = (p, reason) => omittedDetail.push({ path: p, reason });
+  const finish = (text) => {
+    meta.tokens_used = estTokens(text);
+    meta.budget_tokens = budgetTokens;
+    meta.included_paths = includedDetail;
+    meta.omitted_paths = omittedDetail;
+    return text;
+  };
+  const includedDetail = [];
+  if (!files.length) return finish(String(diff || '').slice(0, budgetTokens * 4));
   const omitted = [];
   const cited = f => failedLogText && (failedLogText.includes(f.path) || failedLogText.includes(path.basename(f.path)));
   const useful = [];
   for (const f of files) {
-    if (NOISE_FILE_RE.test(f.path) || f.binary) { omitted.push(`${f.path} (lock/generated/binary)`); continue; }
-    if (f.deleted) { omitted.push(`${f.path} (deleted)`); continue; }
+    if (NOISE_FILE_RE.test(f.path) || f.binary) { omitted.push(`${f.path} (lock/generated/binary)`); note(f.path, 'lock_generated_binary'); continue; }
+    if (f.deleted) { omitted.push(`${f.path} (deleted)`); note(f.path, 'deleted'); continue; }
     const hunks = f.hunks.filter(h => h.lines.some(l => l[0] === '+'));
     const dropped = f.hunks.length - hunks.length;
-    if (!hunks.length) { if (f.hunks.length) omitted.push(`${f.path} (deletion-only)`); continue; }
+    if (!hunks.length) { if (f.hunks.length) { omitted.push(`${f.path} (deletion-only)`); note(f.path, 'deletion_only'); } continue; }
     useful.push({ ...f, hunks, dropped });
   }
   useful.sort((a, b) => (cited(b) ? 1 : 0) - (cited(a) ? 1 : 0));
@@ -512,21 +564,25 @@ function compressDiff(diff, budgetTokens = DIFF_TOKEN_BUDGET, failedLogText = ''
   const parts = [], rest = [];
   rendered.forEach((r, i) => {
     const t = estTokens(r) + 1;
-    if (used + t <= avail) { parts.push(r); used += t; return; }
+    if (used + t <= avail) { parts.push(r); used += t; includedDetail.push(useful[i].path); return; }
     const left = avail - used;
     if (left >= 200) {
       const cut = r.slice(0, left * 4 - 80);
       const kept = cut.slice(0, cut.lastIndexOf('\n'));
       const more = r.slice(kept.length).split('\n').filter(l => l.startsWith('+')).length;
       parts.push(`${kept}\n# … ${more} more added line(s) in ${useful[i].path} truncated (budget)`);
+      includedDetail.push(`${useful[i].path} (truncated)`);
       used = avail;
       return;
     }
     rest.push(useful[i].path);
   });
-  if (rest.length) omitted.push(...rest.map(p => `${p} (over budget)`));
+  if (rest.length) {
+    omitted.push(...rest.map(p => `${p} (over budget)`));
+    for (const p of rest) note(p, 'over_budget');
+  }
   if (omitted.length) parts.push(`# Compressed diff — not shown: ${omitted.join(', ')}.\n# Ask for a file via files_to_examine if you need it.`);
-  return parts.join('\n');
+  return finish(parts.join('\n'));
 }
 
 // CI log compression. Raw Actions job logs are mostly runner noise: ISO
@@ -1225,6 +1281,32 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
   const bigFix = Array.from({ length: GATE_MAX_FILES + 1 }, (_, i) => mk(`src/f${i}.js`, '+x')).join('');
   check('gate: too many files rejected', !checkFixDiff(bigFix).ok);
   check('gate: rewriting an assertion (same count) passes', checkFixDiff(mk('test/a.test.js', '-  expect(x).toBe(1);\n+  expect(x).toBe(2);')).ok);
+  // ── AC-44: the receipt (Z01 slice T2) ────────────────────────────────────────
+  const g1 = checkFixDiff(mk('.github/workflows/ci.yml', '-  run: npm test\n+  run: true'));
+  check('gate: reasons shape unchanged (string[])', Array.isArray(g1.reasons) && g1.reasons.every(r => typeof r === 'string'));
+  check('gate: violations carry rule_id + path + message', g1.violations.length === 1 && g1.violations[0].rule_id === 'workflow_edited' && g1.violations[0].path === '.github/workflows/ci.yml' && !!g1.violations[0].message);
+  const g2 = checkFixDiff(mk('tests/sum.test.js', "+it.skip('a', () => {})"));
+  check('gate: rule id discriminates (test_disabled ≠ workflow_edited)', g2.violations[0].rule_id === 'test_disabled');
+  const g3 = checkFixDiff(mk('src/__tests__/a.js', '-  expect(sum(2, 3)).toBe(5);'));
+  check('gate: assertion_removed rule id', g3.violations[0].rule_id === 'assertion_removed');
+  const g4 = checkFixDiff(mk('test/a.test.js', '-assert.ok(1)', 'deleted file mode 100644\n'));
+  check('gate: test_file_deleted rule id', g4.violations[0].rule_id === 'test_file_deleted');
+  const g5 = checkFixDiff(Array.from({ length: GATE_MAX_FILES + 1 }, (_, i) => mk(`src/f${i}.js`, '+x')).join(''));
+  check('gate: too_many_files rule id', g5.violations.some(v => v.rule_id === 'too_many_files'));
+  check('gate: every rule id is inside the fixed dictionary', [g1, g2, g3, g4, g5].every(g => g.violations.every(v => RULE_IDS.has(v.rule_id))));
+  check('gate: reasons and violations never diverge in count', [g1, g2, g3, g4, g5].every(g => g.reasons.length === g.violations.length));
+  check('gate: a clean diff has empty violations', checkFixDiff(mk('src/sum.js', '-a\n+b')).violations.length === 0);
+  const cm = {};
+  const cmText = compressDiff(mk('src/sum.js', '-  return a - b;\n+  return a + b;').replace('--- a/src/sum.js\n', '').replace('+++ b/src/sum.js\n', ''), 4000, '', cm);
+  check('meta: compressDiff fills included_paths', Array.isArray(cm.included_paths) && cm.included_paths.includes('src/sum.js'), JSON.stringify(cm.included_paths));
+  check('meta: compressDiff reports tokens_used and budget_tokens', typeof cm.tokens_used === 'number' && cm.tokens_used > 0 && cm.budget_tokens === 4000);
+  check('meta: compressDiff reports omitted_paths with reasons', Array.isArray(cm.omitted_paths) && cm.omitted_paths.every(o => o.path && o.reason));
+  check('meta: omitted lock file is labelled, not silently dropped', (() => {
+    const m2 = {};
+    compressDiff('diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,1 +1,1 @@\n-a\n+b\n', 4000, '', m2);
+    return m2.omitted_paths.some(o => o.path === 'package-lock.json' && o.reason === 'lock_generated_binary');
+  })());
+  check('meta: omitted_paths is []-safe when there is nothing to omit', Array.isArray((() => { const m3 = {}; compressDiff('', 4000, '', m3); return m3.omitted_paths; })()));
   check('creds: checkout credential keys are matched', ['http.https://github.com/.extraheader', 'includeIf.gitdir:/x/.git.path', 'credential.helper'].every(k => GIT_CRED_KEY_RE.test(k)) && !GIT_CRED_KEY_RE.test('user.name'));
   check('log: group bodies dropped, step headers kept', lc.includes('▶ Run npm test') && !lc.includes('token: ***'));
   check('log: error lines survive the budget', lc.includes("Cannot find module '/w/test'") && lc.includes('not ok 1') && lc.includes('ERROR: Process completed with exit code 1'));
@@ -1803,7 +1885,14 @@ if (!preStageDiagnosis) {
   if (!gate.ok) {
     sh('git reset -q');
     await prComment(`❌ Fix rejected by the diff gate — no PR created\n\n**Cause:** ${diagnosis.problem}\n\n${gate.reasons.map(r => `- ${r}`).join('\n')}`);
-    failWithStats('fail:diff_rejected', gate.reasons.join('; ').slice(0, 300), { problem: diagnosis.problem, gate_reasons: gate.reasons.slice(0, 10), agent: !!diagnosis.agent });
+    failWithStats('fail:diff_rejected', gate.reasons.join('; ').slice(0, 300), {
+      problem: diagnosis.problem,
+      gate_reasons: gate.reasons.slice(0, 10),
+      // AC-44: which rule fired, on which paths — not only a human-readable sentence.
+      rule_id: gate.violations[0].rule_id,
+      gate_violations: gate.violations.slice(0, 10),
+      agent: !!diagnosis.agent,
+    });
   }
 }
 // Pre-stage A (conflict resolution or clean merge) may have already committed.
