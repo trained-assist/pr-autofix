@@ -346,6 +346,27 @@ if (!fs.existsSync(CLI)) {
     .filter((f) => fs.existsSync(f))
     .find((f) => looksLikeSecretValue(fs.readFileSync(f, 'utf8')));
   check('S7 в log-записях нет значений секретов (AC-07)', !logSecret, logSecret ? path.basename(logSecret) : 'чисто');
+
+  // ── S7a: правда в записях, а не только форма ─────────────────────────────────
+  // Записи проверяются на ПОЛНОТУ выше; здесь — на ДОСТОВЕРНОСТЬ. Ровно тот класс регрессии,
+  // который проходит любую проверку формы: правдоподобный URL, собранный из run_id, и remote
+  // окружающего репозитория, выданный за remote подкаталога.
+  check('S7a patch_refs — ссылки на вызовы, не собранные URL',
+    brokenLog?.patch_refs?.every(r => !/^https?:\/\//.test(r)), JSON.stringify(brokenLog?.patch_refs));
+  check('S7a не-репозиторию не приписывается remote окружающего репозитория',
+    get(brokenLog, ['source', 'repo']) === '', `repo=${JSON.stringify(get(brokenLog, ['source', 'repo']))}`);
+  check('S7a коммиты не-репозитория остаются unknown, а не чужими',
+    get(brokenLog, ['source', 'head_commit']) === 'unknown' && get(brokenLog, ['source', 'base_commit']) === 'unknown');
+  check('S7a request_id детерминирован (без UUID и часов)',
+    get(brokenLog, ['request', 'request_id']) === 'local:verify:1', `request_id=${get(brokenLog, ['request', 'request_id'])}`);
+  check('S7a credentials — имена, без значений', Array.isArray(brokenLog?.credentials));
+
+  // Путь записи без каталога (`--log bare.json`) обязан работать: mkdirSync('') падает.
+  const bareDir = path.join(OUT, 'bare-log');
+  fs.mkdirSync(bareDir, { recursive: true });
+  const bare = run(process.execPath, [CLI, 'verify', '--repo', path.join(FX, 'node-clean'), '--log', 'bare.json'], { cwd: bareDir });
+  check('S7a --log без каталога пишет запись (mkdir не спотыкается)',
+    bare.code === 0 && fs.existsSync(path.join(bareDir, 'bare.json')), `code=${bare.code}`);
 }
 
 // ── C. Шаги в других репозиториях — не красные, но зафиксированы ──────────────

@@ -141,7 +141,10 @@ export function redactRecord(record) {
 
 export function writeLogRecord(file, record) {
   if (!file) return null;
-  fs.mkdirSync(file.replace(/\/[^/]+$/, ''), { recursive: true });
+  // `log.json` in the current directory is a perfectly normal --log argument, and
+  // mkdirSync('') throws — so the directory is created only when there IS one.
+  const dir = path.dirname(path.resolve(file));
+  if (dir && dir !== process.cwd()) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
   return file;
 }
