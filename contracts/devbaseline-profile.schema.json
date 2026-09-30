@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trained-assist.store/contracts/devbaseline-profile.schema.json",
+  "title": "devbaseline profile",
+  "description": "How a repository of a given repo_type is checked, fixed, verified and logged. A profile is owned by pr-autofix (single source of truth); a repository never copies it, it derives or pins it via .devbaseline.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "repo_type", "check", "fix", "verify", "context", "logs"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "repo_type": { "enum": ["docs", "node", "python", "mixed", "minimal"] },
+    "description": { "type": "string" },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands"],
+      "properties": {
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "build": { "type": ["array", "null"], "items": { "type": "string" } },
+        "working_dir": { "type": ["string", "null"] },
+        "needs": { "type": "array", "items": { "enum": ["node_modules", "python_env", "none"] } }
+      }
+    },
+    "fix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["autofix_callable", "deterministic", "cap"],
+      "properties": {
+        "autofix_callable": { "type": ["string", "null"] },
+        "deterministic": { "type": "array", "items": { "type": "string" } },
+        "cap": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "verify": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands"],
+      "properties": {
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "repeat_on_no_change": { "type": "boolean" }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["builder", "entrypoints", "exclude_paths"],
+      "properties": {
+        "builder": { "enum": ["external", "internal"] },
+        "entrypoints": { "type": "array", "items": { "type": "string" } },
+        "exclude_paths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "retention_days"],
+      "properties": {
+        "contract_version": { "type": "integer", "const": 1 },
+        "retention_days": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "diff_tokens": { "type": "integer", "minimum": 1 },
+        "log_tokens": { "type": "integer", "minimum": 1 },
+        "max_files": { "type": "integer", "minimum": 1 },
+        "max_lines": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

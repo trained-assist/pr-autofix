@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "id": "mixed",
+  "repo_type": "mixed",
+  "description": "Two stacks in one repository. Both entrypoint sets are kept and the check runs both halves — the point of a separate profile is that the mixed case must not be silently forced into one stack.",
+  "check": {
+    "commands": [
+      "node {{devbaseline}} run-derived-check --dir ."
+    ],
+    "build": null,
+    "working_dir": null,
+    "needs": [
+      "node_modules",
+      "python_env"
+    ]
+  },
+  "fix": {
+    "autofix_callable": ".github/workflows/autofix-callable.yml",
+    "deterministic": [],
+    "cap": 3
+  },
+  "verify": {
+    "commands": [
+      "node {{devbaseline}} run-derived-check --dir ."
+    ],
+    "repeat_on_no_change": true
+  },
+  "context": {
+    "builder": "external",
+    "entrypoints": [
+      "package.json",
+      "pyproject.toml",
+      "setup.py",
+      "Dockerfile",
+      "Makefile"
+    ],
+    "exclude_paths": [
+      "node_modules",
+      ".venv",
+      "venv",
+      "dist",
+      "build"
+    ]
+  },
+  "logs": {
+    "contract_version": 1,
+    "retention_days": 90
+  },
+  "budget": {
+    "diff_tokens": 4000,
+    "log_tokens": 2500,
+    "max_files": 15,
+    "max_lines": 400
+  }
+}

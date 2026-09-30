@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "id": "minimal",
+  "repo_type": "minimal",
+  "description": "Repository with no recognised entrypoint. Its check is an explicit no-op marked `missing`, not a silent pass: the coverage table must show the gap so it becomes a construction task instead of a green lie.",
+  "check": {
+    "commands": [
+      "node {{devbaseline}} check-docs --dir ."
+    ],
+    "build": null,
+    "working_dir": null,
+    "needs": [
+      "none"
+    ]
+  },
+  "fix": {
+    "autofix_callable": null,
+    "deterministic": [],
+    "cap": 0
+  },
+  "verify": {
+    "commands": [
+      "node {{devbaseline}} check-docs --dir ."
+    ],
+    "repeat_on_no_change": true
+  },
+  "context": {
+    "builder": "external",
+    "entrypoints": [
+      "README.md"
+    ],
+    "exclude_paths": [
+      ".git",
+      "node_modules"
+    ]
+  },
+  "logs": {
+    "contract_version": 1,
+    "retention_days": 90
+  },
+  "budget": {
+    "diff_tokens": 4000,
+    "log_tokens": 2500,
+    "max_files": 15,
+    "max_lines": 400
+  }
+}

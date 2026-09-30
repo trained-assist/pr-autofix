@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trained-assist.store/contracts/devbaseline-adapter.schema.json",
+  "title": "devbaseline repository adapter",
+  "description": "The thin per-repository config a repository stores. It exists ONLY to pin what cannot be derived from the file tree (check command, staging command, autofix ref, credential names). Everything derivable stays derived — the coverage table records `adapter: derived | file` so a reader always knows which is which.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "profile": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "build": { "type": ["array", "null"], "items": { "type": "string" } }
+      }
+    },
+    "staging": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required": { "type": "boolean" },
+        "command": { "type": ["string", "null"] }
+      }
+    },
+    "autofix": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ref": { "type": ["string", "null"] }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entrypoints": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "credentials": {
+      "description": "Names only. A value that looks like a secret is a schema violation, not a warning (AC-07).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "kind": { "enum": ["org_secret", "repo_secret", "env", "oidc"] }
+        }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retention_days": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
