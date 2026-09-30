@@ -129,6 +129,12 @@ export function buildLogRecord({
     retention: { ttl_days: ttlDays, artifact: source.artifact || `ci-fixer-stats-${source.pr || 'local'}-${runId}` },
     credentials,
     gate_violations: gateViolations,
+    // Additive (AC-44): what the CHECK itself found, as {rule_id, path, message} — the same
+    // shape autofix.mjs already writes. `gate_violations` keeps additionally the engine-level
+    // facts (why the pipeline stopped). Splitting them is what lets a reader answer both
+    // "what is wrong with the repository" and "why was nothing fixed" from one record; before
+    // this, the second answer overwrote the first.
+    rule_violations: gateViolations.filter(v => v && RULE_IDS.includes(v.rule_id) && !v.engine_fact),
     ...extra,
   };
   return redactRecord(record);
