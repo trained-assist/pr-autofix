@@ -1,0 +1,9 @@
+{
+  "name": "onboarding-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fixture repository for the Z01 baseline. Its check FAILS on purpose.",
+  "scripts": {
+    "test": "node check.js && node lint.js"
+  }
+}
