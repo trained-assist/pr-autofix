@@ -240,6 +240,13 @@ const LIVE_NO_STAGING_TREE = {
   '.github/workflows/ci.yml': 'name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n',
   '.github/workflows/staging-notes.yml': 'name: Notes\non: [push]\njobs:\n  notes:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo notes\n',
 };
+// Живой репозиторий, у которого дерево выглядит как docs (README, нет package.json), а адаптер
+// ЗАКРЕПЛЯЕТ профиль node. Схема адаптера рекламирует поле `profile`; до этого шага резолвер его
+// игнорировал, и «закрепить недеривируемое» — задокументированное лечение — не работало.
+const LIVE_PINNED_TREE = {
+  'README.md': '# Looks like docs, is pinned as node\n',
+  '.devbaseline.json': JSON.stringify({ schema_version: 1, profile: 'node' }, null, 2),
+};
 
 // 7. Endpoint песочницы (AC-09): собственный bare-репозиторий, не ssh-алиас `vm`.
 const ENDPOINT = path.join(RUN, 'endpoint.git');
@@ -254,6 +261,7 @@ const LIVE_REPOS = {
   'live-mixed': LIVE_TREE,
   'live-docs': LIVE_DOCS_TREE,
   'live-no-staging': LIVE_NO_STAGING_TREE,
+  'live-pinned': LIVE_PINNED_TREE,
 };
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 const apiServer = http.createServer((req, res) => {
@@ -490,6 +498,7 @@ if (!fs.existsSync(CLI)) {
   const liveMixed = liveRows.find(r => /live-mixed$/.test(r.repo));
   const liveDocs = liveRows.find(r => /live-docs$/.test(r.repo));
   const liveNoStg = liveRows.find(r => /live-no-staging$/.test(r.repo));
+  const livePinned = liveRows.find(r => /live-pinned$/.test(r.repo));
 
   // F1: производные колонки заполнены на ЖИВОМ пути — раньше все 25 репозиториев давали «—».
   // `autofix_ref` проверяется отдельно и только там, где фиксер вообще есть: у docs-профиля
@@ -513,6 +522,16 @@ if (!fs.existsSync(CLI)) {
   check('F1 живой docs: retention взят из адаптера, не из профиля',
     liveDocs?.logs?.retention_days === 30, `retention=${JSON.stringify(liveDocs?.logs)}`);
 
+  // Закрепление профиля адаптером: дерево выглядит как docs, адаптер говорит node. Схема
+  // адаптера рекламирует `profile`, и это единственный способ починить неверную деривацию
+  // в репозитории, где стека не видно в дереве. До фикса поле игнорировалось (мёртвый конфиг).
+  check('F1 закрепление профиля: адаптер профиля побеждает деривацию по дереву',
+    livePinned?.profile === 'node', `profile=${livePinned?.profile}`);
+  check('F1 закрепление профиля: строка помечена adapter=file',
+    livePinned?.adapter === 'file', `adapter=${livePinned?.adapter}`);
+  check('F1 закрепление профиля: staging_required следует за профилем, не за деревом',
+    livePinned?.staging_required === true, `required=${livePinned?.staging_required}`);
+
   // F2: staging определяется по ДЖОБАМ, а не по имени файла.
   check('F2 живой скан: staging-джоб внутри ci.yml найден, имя файла про staging не ищем',
     liveMixed?.staging_present === true, `staging_present=${liveMixed?.staging_present}`);
@@ -526,7 +545,7 @@ if (!fs.existsSync(CLI)) {
   const localOut = path.join(OUT, 'local-src');
   const localRun = cli(['inventory', '--repos', path.join(RUN, 'repos-local-src.json'), '--out', localOut]);
   const localRows = (readJson(path.join(localOut, 'repo-coverage.json'))?.repos) || [];
-  for (const name of ['live-mixed', 'live-docs', 'live-no-staging']) {
+  for (const name of ['live-mixed', 'live-docs', 'live-no-staging', 'live-pinned']) {
     const L = localRows.find(r => r.repo === `sandbox-src/${name}`);
     const V = liveRows.find(r => r.repo === `sandbox-live/${name}`);
     if (!L || !V) { fail(`F1 ${name}: строка найдена в обоих сканах`, `local=${!!L} live=${!!V}`); continue; }

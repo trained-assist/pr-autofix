@@ -106,13 +106,28 @@ export function profileHasBuild(profile) {
 
 /**
  * Resolve the effective profile for a repository.
- * @returns {{ok: true, profile: object, source: 'explicit'|'hint'|'derived', derivation: string}
+ *
+ * Precedence: an explicit `--profile` (a one-off diagnostic) beats the repository's own adapter,
+ * which beats a `type_hint` in the input list, which beats derivation from the file tree. The
+ * adapter sits above the hint because it is the repository's committed statement about itself;
+ * the hint is a property of whoever wrote the list.
+ *
+ * @param {{repoDir?: string, profileId?: string, adapterProfile?: string|null,
+ *          typeHint?: string|null, exists?: ((rel: string) => boolean)|null}} opts
+ * @returns {{ok: true, profile: object, source: 'explicit'|'adapter'|'hint'|'derived', derivation: string}
  *          |{ok: false, rule_id: string, message: string}}
  */
-export function resolveProfile({ repoDir, profileId = '', typeHint = null, exists = null } = {}) {
+export function resolveProfile({ repoDir, profileId = '', adapterProfile = null, typeHint = null, exists = null } = {}) {
   if (profileId) {
     const r = loadProfile(profileId);
     return r.ok ? { ok: true, profile: r.profile, source: 'explicit', derivation: 'requested with --profile' } : r;
+  }
+  if (adapterProfile) {
+    // `.devbaseline.json` advertises `profile` in the schema; ignoring it here made the pin a
+    // dead field, so a repository whose stack the tree does not reveal (a tooling repo with no
+    // package.json) had no way to correct its own derivation — the documented remedy did nothing.
+    const r = loadProfile(adapterProfile);
+    return r.ok ? { ok: true, profile: r.profile, source: 'adapter', derivation: `profile pinned in .devbaseline.json` } : r;
   }
   if (typeHint) {
     const r = loadProfile(typeHint);

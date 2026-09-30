@@ -88,7 +88,7 @@ export async function scanSource(entry, source, profileRef = toolVersion()) {
     return row;
   }
 
-  const prof = resolveProfile({ exists: source.has, typeHint: entry.type_hint || null });
+  const prof = resolveProfile({ exists: source.has, typeHint: entry.type_hint || null, adapterProfile: adapterResult.adapter?.profile || null });
   if (!prof.ok) {
     const row = EMPTY(repo, owner);
     row.notes = [`${prof.rule_id}: ${prof.message}`];
