@@ -131,6 +131,13 @@ summary: category, reason, token usage/cost per model. Categories are listed at 
 `scripts/autofix.mjs` — e.g. `success:agent`, `success:ai`, `success:pre_a_merge`,
 `fail:diff_rejected`, `fail:agent_no_change`, `fail:ai_model_error`. An agent error/timeout falls back to Stages 2–3 (stats field `agent_fallback`).
 
+Each record also carries the **receipt** (AC-44): `rule_id` + `gate_violations` (which rule fired, on
+which path), `tool` (name, version, commit — the version is the workflow ref the caller pinned),
+`attempt_count`, `patch_refs`, `included_paths` / `omitted_paths`, `budget`, `retention`, and
+`credentials` as **names**. Every one of those keys is optional, so records written before this
+contract stay valid and old consumers keep working. `rule_id` always comes from the fixed
+dictionary in `scripts/autofix.mjs` — a new rule is a new release tag, never a new ad-hoc string.
+
 ### Repo variables
 
 | Variable | Default | Effect |
@@ -173,3 +180,85 @@ gh workflow run batch-fix-prs.yml --field pr_numbers="42,41,39"
   the same PR. Needs `AUTOFIX_PAT` — a push made with `GITHUB_TOKEN` does not trigger a new CI run
 - PRs marked `draft` are skipped
 - `fix/ci-*` branches are never re-fixed (prevents infinite loops)
+
+---
+
+## Development baseline (inventory, profiles, adapter)
+
+`scripts/devbaseline.mjs` gives every participating repository the same four answers: **how is it
+checked, how is it fixed, how is it verified, and what does the log say.** The point is not a
+prettier report — it is that merge stops failing for the reason "this repo has no CI or staging",
+and that a log can prove how its result was assembled.
+
+```sh
+node scripts/devbaseline.mjs validate --all-profiles          # do the shipped profiles hold the contract?
+node scripts/devbaseline.mjs validate --repo <dir>            # which profile does this repo get, and why?
+node scripts/devbaseline.mjs verify   --repo <dir> --log f.json   # check → fix → verify again
+node scripts/devbaseline.mjs context  --manifest <f>         # fresh | stale | missing
+node scripts/devbaseline.mjs inventory --out <dir>           # the coverage table + construction tasks
+node scripts/devbaseline.mjs check-docs --dir <dir>          # links resolve, JSON parses, H1 present
+```
+
+Exit codes are the contract: `validate` 0/3 · `verify` 0 pass-or-no_change, 1 controlled failure,
+2 needs_human, 3 invalid config · `context` 0 fresh, 2 stale, 3 missing · `inventory` 0, or 4 with
+`--strict` when a repository is unreadable · `check-docs` 0/1.
+
+### Profiles, and why the adapter is optional
+
+`profiles/*.json` are the single source of truth, shipped here: `docs`, `node`, `python`, `mixed`,
+`minimal`. A repository does **not** have to carry a config file — the profile is derived from the
+file tree (presence of `package.json`, `pyproject.toml`/`setup.py`, or markdown, first match wins).
+`.devbaseline.json` exists only to pin what cannot be derived: the check command, the staging
+command, the autofix ref, the credential **names**. The coverage table records `adapter:
+derived | file` so a reader always knows which of the two a row was.
+
+A docs-only repository gets `check.build: null` and no application build — its check is Markdown,
+schema and context, not a compiler. The `minimal` profile's check is an explicit no-op marked
+`missing`, so a repository with no entrypoint shows up as a gap instead of a green tick.
+
+There is deliberately no `extends` in profiles. Five self-contained files cost less than a
+resolution order, and a profile-resolution order is exactly the class of bug a coverage table
+cannot explain when it goes wrong.
+
+### Credentials
+
+Names only, never values. A credential-shaped string in an adapter, a coverage row or a log record
+is a **schema violation**, not a warning — `scripts/lib/devbaseline/secrets.mjs` refuses to write
+one, and the inventory refuses to emit a table containing one.
+
+### One command instead of fifteen workflows
+
+```yaml
+devbaseline:
+  uses: trained-assist/pr-autofix/.github/workflows/devbaseline-callable.yml@v1
+  with:
+    mode: ci          # or: staging-gate
+```
+
+`mode=ci` answers "does this repository still pass its own check?"; `mode=staging-gate` also writes
+the repository's inventory row and construction tasks into the step summary. The workflow needs no
+token, writes nothing back into the caller, and takes its code from the ref you pinned it at.
+
+### pr-autofix's own staging gate
+
+`ci.yml` runs two jobs: `selftest` (the existing contract test) and `staging-gate`, whose body is
+`node scripts/sandbox/z01-devbaseline.mjs` — the same scenario rehearsal used during development.
+pr-autofix has no production service, so **staging here is a rehearsal of the battle path on
+fixtures, not a cloud check**, and it is never described as one: `node --check` on every script,
+every profile against its contract, an end-to-end `verify` (expected controlled failure), and a
+check that every `*-callable.yml` really declares `on: workflow_call` — the last one is the
+regression guard for the cleanup installer that used to point at a non-callable file.
+
+### Rehearsing the whole scenario locally
+
+```sh
+node scripts/sandbox/z01-devbaseline.mjs           # one command, deterministic pass/fail
+node scripts/sandbox/z01-devbaseline.mjs --keep    # keep the fixtures for inspection
+```
+
+Level **S3** — fixtures, mocked externals, fully offline (proxies point at a dead port and `PATH`
+is stripped to `node` and `git`, so "the inventory does not reach the network" and "construction
+tasks do not file an issue" are properties of the run rather than claims in a comment). Artifacts
+land in `.devbaseline-sandbox/` (git-ignored); override with `DEVBASELINE_SANDBOX_TMP`. S5
+(one procedure setup → run → evidence → teardown) and S8 (coverage drift) are owned by other
+repositories and are reported as `skip` with their owner, never as a green tick.

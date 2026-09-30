@@ -1,0 +1,127 @@
+name: devbaseline (callable)
+
+# Reusable workflow — one entry point for the development baseline of a repository that has no
+# baseline yet. Two modes, because they answer different questions:
+#
+#   mode=ci            "does this repository still pass its own check?"
+#   mode=staging-gate  "would this repository pass the merge gate?" (ci + the rehearsal below)
+#
+# Usage in your ci.yml:
+#
+#   devbaseline:
+#     uses: trained-assist/pr-autofix/.github/workflows/devbaseline-callable.yml@v1
+#     with:
+#       mode: ci
+#
+# Note what this workflow does NOT do: it does not install anything, does not write to the
+# caller repository, and does not need a token. Everything it needs is pinned by the `@ref` you
+# call it with — which is also why it is safe to call from a fork.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'ci | staging-gate'
+        required: true
+        type: string
+      profile:
+        description: 'Force a profile (docs|node|python|mixed|minimal). Empty = derive from the tree.'
+        required: false
+        type: string
+        default: ''
+      check_timeout_minutes:
+        description: 'Per-command timeout for the check step'
+        required: false
+        type: string
+        default: '20'
+
+jobs:
+  devbaseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The script comes from the pinned ref this workflow was called at, never from main.
+      # Same mechanism autofix-callable.yml uses, so a caller cannot drift onto a moving branch.
+      - name: Fetch the pinned devbaseline script
+        env:
+          WORKFLOW_REPO: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WORKFLOW_REPO" ] || [ -z "$WORKFLOW_SHA" ]; then
+            echo "Could not resolve the reusable-workflow identity — refusing to fall back to main" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/devbaseline"
+          base="https://raw.githubusercontent.com/${WORKFLOW_REPO}/${WORKFLOW_SHA}"
+          for f in scripts/devbaseline.mjs; do
+            curl -fsSL "$base/$f" -o "$RUNNER_TEMP/devbaseline/$(basename "$f")"
+          done
+          # The library modules travel with the CLI; without them the CLI cannot start.
+          curl -fsSL "$base/scripts/lib/devbaseline/profile.mjs"  -o "$RUNNER_TEMP/devbaseline/profile.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/adapter.mjs"  -o "$RUNNER_TEMP/devbaseline/adapter.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/schema.mjs"   -o "$RUNNER_TEMP/devbaseline/schema.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/secrets.mjs"  -o "$RUNNER_TEMP/devbaseline/secrets.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/log.mjs"      -o "$RUNNER_TEMP/devbaseline/log.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/run.mjs"      -o "$RUNNER_TEMP/devbaseline/run.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/context.mjs"  -o "$RUNNER_TEMP/devbaseline/context.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/check-docs.mjs" -o "$RUNNER_TEMP/devbaseline/check-docs.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/inventory.mjs" -o "$RUNNER_TEMP/devbaseline/inventory.mjs"
+          curl -fsSL "$base/scripts/lib/devbaseline/construction-tasks.mjs" -o "$RUNNER_TEMP/devbaseline/construction-tasks.mjs"
+          curl -fsSL "$base/contracts/devbaseline-profile.schema.json" -o "$RUNNER_TEMP/devbaseline/profile.schema.json"
+          curl -fsSL "$base/contracts/devbaseline-adapter.schema.json" -o "$RUNNER_TEMP/devbaseline/adapter.schema.json"
+          mkdir -p "$RUNNER_TEMP/devbaseline/profiles"
+          for p in docs node python mixed minimal; do
+            curl -fsSL "$base/profiles/$p.json" -o "$RUNNER_TEMP/devbaseline/profiles/$p.json"
+          done
+          node --check "$RUNNER_TEMP/devbaseline/devbaseline.mjs"
+
+      - name: Which baseline does this repository have?
+        id: shape
+        run: |
+          node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" validate --repo . --all-profiles | tee "$RUNNER_TEMP/shape.txt"
+          echo "profile_line=$(grep -m1 'profile ' "$RUNNER_TEMP/shape.txt" || echo unknown)" >> "$GITHUB_OUTPUT"
+
+      - name: Adapter is valid
+        if: inputs.profile == ''
+        run: node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" validate --repo .
+
+      - name: Documentation check
+        run: node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" check-docs --dir .
+
+      - name: Verify — check, fix if registered, verify again
+        timeout-minutes: ${{ fromJSON(inputs.check_timeout_minutes) }}
+        run: |
+          args=(verify --repo . --log devbaseline-verify.json)
+          [ -n "${{ inputs.profile }}" ] && args+=(--profile "${{ inputs.profile }}")
+          node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" "${args[@]}" && exit 0
+          code=$?
+          # 2 = needs_human: a real gap, but not a broken pipeline. Report it, do not hide it.
+          if [ "$code" = "2" ]; then
+            echo "::warning::devbaseline needs a human (profile has no fixer, or fix.cap is exhausted)"
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Upload the verify record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devbaseline-verify-${{ github.run_id }}
+          path: devbaseline-verify.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Inventory row for this repository
+        if: inputs.mode == 'staging-gate'
+        run: |
+          node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" inventory \
+            --out devbaseline-inventory \
+            --repos <(printf '[{"repo":"%s","type_hint":null,"ci_required":null,"path":"."}]\n' "$GITHUB_REPOSITORY")
+          cat devbaseline-inventory/repo-coverage.md >> "$GITHUB_STEP_SUMMARY"
+          echo '--- construction tasks (dry run, nothing filed) ---' >> "$GITHUB_STEP_SUMMARY"
+          cat devbaseline-inventory/construction-tasks.md >> "$GITHUB_STEP_SUMMARY"
