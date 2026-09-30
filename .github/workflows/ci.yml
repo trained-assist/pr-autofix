@@ -15,3 +15,21 @@ jobs:
           node-version: '22'
       - name: Contract self-test
         run: AUTOFIX_SELFTEST=1 node scripts/autofix.mjs
+
+  # Merging into this repo requires a green staging-gate (owner rule 2026-09-16).
+  # pr-autofix has no production service, so staging here is a REHEARSAL of the
+  # battle path on a fixture — node --check of every script, schema validation of
+  # every profile/adapter, an end-to-end `verify` (expected controlled failure),
+  # and a check that every reusable workflow declares `on: workflow_call`.
+  # Fidelity declaration (AC-06): this is NOT a cloud check and is never called one.
+  staging-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Staging rehearsal — scenario sandbox (level S3, fully offline)
+        run: node scripts/sandbox/z01-devbaseline.mjs
+      - name: Reusable workflows declare workflow_call
+        run: node scripts/devbaseline.mjs check-workflows --dir .github/workflows
