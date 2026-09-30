@@ -1,0 +1,152 @@
+[
+  {
+    "repo": "trained-assist/ai-agent-runner",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "Runner / API / artifact adapters (Scope границ, I00)"
+  },
+  {
+    "repo": "trained-assist/call-tips",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "call-tips desktop app; default branch master"
+  },
+  {
+    "repo": "trained-assist/call-tips-mac",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "call-tips macOS app; default branch master"
+  },
+  {
+    "repo": "trained-assist/cloud-auth-bridge",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "cloud auth bridge"
+  },
+  {
+    "repo": "trained-assist/pr-autofix",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "this repository — owner of the profiles and the CLI"
+  },
+  {
+    "repo": "trained-assist/pr-autofix-sandbox",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "sandbox checkout used by pr-autofix rehearsals"
+  },
+  {
+    "repo": "trained-assist/software-engineering-playbooks",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "playbook library; installer + setup orchestrator (Z01 owner T10)"
+  },
+  {
+    "repo": "trained-assist/trained-agent-architecture",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "architecture and plan repository; coverage-table owner (T11)"
+  },
+  {
+    "repo": "trained-assist/trained-assist-agent",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "agent core: runner, sessions, core MCP, web backend"
+  },
+  {
+    "repo": "trained-assist/trained-assist-bugs-and-features-pipeline",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "bugs and features pipeline"
+  },
+  {
+    "repo": "trained-assist/trained-assist-checklist",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "checklist service"
+  },
+  {
+    "repo": "trained-assist/trained-assist-control-plane",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "control plane (new repo 30.09.2026, I08 scope)"
+  },
+  {
+    "repo": "trained-assist/trained-assist-documents-skill",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "domain skill: documents"
+  },
+  {
+    "repo": "trained-assist/trained-assist-error-watcher",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "error watcher (new repo 30.09.2026)"
+  },
+  {
+    "repo": "trained-assist/trained-assist-free-models-benchmark",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "free models benchmark"
+  },
+  {
+    "repo": "trained-assist/trained-assist-freelance-skill",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "domain skill: freelance"
+  },
+  {
+    "repo": "trained-assist/trained-assist-hh-skill",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "domain skill: hh/recruiting"
+  },
+  {
+    "repo": "trained-assist/trained-assist-integration-gate",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "integration gate (new repo 30.09.2026)"
+  },
+  {
+    "repo": "trained-assist/trained-assist-llm-ladder",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "llm-ladder worker"
+  },
+  {
+    "repo": "trained-assist/trained-assist-marketing-skill",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "domain skill: marketing / customer development"
+  },
+  {
+    "repo": "trained-assist/trained-assist-sales-skill",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "domain skill: sales"
+  },
+  {
+    "repo": "trained-assist/trained-assist-search-skill",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "domain skill: search"
+  },
+  {
+    "repo": "trained-assist/trained-assist-speech-skill",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "domain skill: speech"
+  },
+  {
+    "repo": "trained-assist/trained-assist-tg-bot",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "Telegram gateway (Cloudflare Worker)"
+  },
+  {
+    "repo": "trained-assist/trained-assist-web",
+    "type_hint": null,
+    "ci_required": null,
+    "note": "web frontend/backend"
+  }
+]
