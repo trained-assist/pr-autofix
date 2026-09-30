@@ -29,6 +29,24 @@ export function loadAdapter(repoDir) {
   try { raw = fs.readFileSync(p, 'utf8'); } catch (e) {
     return { ok: false, rule_id: 'adapter_schema_violation', message: `${ADAPTER_FILENAME} is unreadable: ${e.message}`, violations: [] };
   }
+  return parseAdapterText(raw);
+}
+
+/**
+ * Parse adapter TEXT. `null`/`undefined` means the adapter file is absent — the honest
+ * `derived`, not a failure and not an empty object.
+ *
+ * This is the shared implementation: a live source reads the file over the API and validates it
+ * here, so "is this adapter valid" has exactly one answer whether the text came from disk or
+ * from the network. A live scan that skipped validation would report a broken repository as
+ * fine; a live scan that re-implemented the rules would drift from `validate`.
+ *
+ * @param {string|null|undefined} raw
+ * @returns {{ok: true, adapter: object|null, source: 'file'|'derived'}
+ *          | {ok: false, rule_id: string, message: string, violations: object[]}}
+ */
+export function parseAdapterText(raw) {
+  if (raw === null || raw === undefined) return { ok: true, adapter: null, source: 'derived' };
 
   let parsed;
   try { parsed = JSON.parse(raw); } catch (e) {
