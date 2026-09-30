@@ -13,7 +13,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { loadAdapter, effectiveConfig, ADAPTER_FILENAME } from './adapter.mjs';
 import { resolveProfile, expandCommand, profileHasBuild } from './profile.mjs';
-import { buildLogRecord, writeLogRecord, gitInfo, estTokens } from './log.mjs';
+import { buildLogRecord, writeLogRecord, gitInfo, estTokens, RULE_IDS } from './log.mjs';
 
 export const VERIFY_CODES = { pass: 0, failed: 1, needs_human: 2, invalid: 3 };
 const COMBINED_TIMEOUT_MS = 120_000;
@@ -34,6 +34,39 @@ function runAll(commands, cwd) {
 }
 
 const failedStep = (results) => results.find(r => r.code !== 0) || null;
+
+/**
+ * Recover the rule IDs a check reported from its own output.
+ *
+ * A failed check is only useful if the log says WHICH rule fired. Without this, a run whose
+ * profile has no fixer recorded `rule_id: unsupported_by_profile` — a fact about the ENGINE, not
+ * about the repository — and the real violation (`docs_heading_missing: checklist.md: no
+ * top-level (#) heading`) existed only in check_output, so the log said nothing was wrong while
+ * the repository was red. The AutoFix path already carries `violations[{rule_id,path,message}]`
+ * (autofix.mjs checkFixDiff); this reuses that shape rather than inventing a second one.
+ *
+ * Lines are the format `check-docs` prints verbatim (check-docs.mjs formatViolations):
+ * `<rule_id>: <path>: <message>`. A line whose first token is not in the fixed dictionary is
+ * chatter, not a violation — inventing a rule id for it would be worse than dropping it.
+ */
+export function parseCheckViolations(logText) {
+  const out = [];
+  const seen = new Set();
+  for (const line of String(logText || '').split('\n')) {
+    const m = /^\s*([a-z][a-z0-9_]*):\s+(\S.*)$/.exec(line);
+    if (!m) continue;
+    const [, ruleId, rest] = m;
+    if (!RULE_IDS.includes(ruleId)) continue;
+    const sep = rest.search(/:\s/);
+    const p = sep > 0 ? rest.slice(0, sep).trim() : '';
+    const message = sep > 0 ? rest.slice(sep + 1).trim() : rest.trim();
+    const key = `${ruleId}|${p}|${message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ rule_id: ruleId, path: p || '(check output)', message });
+  }
+  return out;
+}
 
 /**
  * Paths the run actually covered. Included = context entrypoints that exist in the tree
@@ -104,6 +137,10 @@ export function verify(input) {
   const bad = failedStep(checkResults);
   const logText = checkResults.map(r => r.output).join('\n');
   const budget = { ...config.budget, diff_tokens_used: estTokens(logText) };
+  // What the CHECK itself found. Empty when the check failed without naming a rule — then the
+  // generic `check_command_failed` stands, which is honest, rather than a guessed rule id.
+  const checkViolations = parseCheckViolations(logText);
+  const checkRuleId = checkViolations.length ? checkViolations[0].rule_id : null;
 
   const base = {
     profileId: profile.id, adapterSource: adapterResult.source, mode: 'verify', attempt,
@@ -125,12 +162,20 @@ export function verify(input) {
   const reason = `check step failed (exit ${bad.code}): ${bad.command}`;
 
   if (input.allowFix === false || !fixerRegistered) {
-    const ruleId = input.allowFix === false ? 'cap_exhausted' : 'unsupported_by_profile';
+    const engineRuleId = input.allowFix === false ? 'cap_exhausted' : 'unsupported_by_profile';
+    const message = fixerRegistered ? reason : `profile "${profile.id}" has no fixer for this repository (autofix_callable=${callableRel || 'null'}); ${reason}`;
     return {
       code: VERIFY_CODES.needs_human, profile: profile.id, adapter: adapterResult.source, outcome: 'needs_human',
       record: buildLogRecord({
-        ...base, outcome: 'needs_human', ruleId, reasonCode: ruleId, patchRefs: [],
-        gateViolations: [{ rule_id: ruleId, path: callableRel || profile.id, message: fixerRegistered ? reason : `profile "${profile.id}" has no fixer for this repository (autofix_callable=${callableRel || 'null'}); ${reason}` }],
+        // `rule_id` names the rule that FIRED (the check's own rule when it named one);
+        // `reason_code` names why the pipeline stopped here. They were the same field before,
+        // which meant "nothing could fix it" overwrote the fact that the repository is red.
+        ...base, outcome: 'needs_human', ruleId: checkRuleId || engineRuleId, reasonCode: engineRuleId, patchRefs: [],
+        extra: { stopped_because: engineRuleId },
+        gateViolations: [
+          ...checkViolations,
+          { rule_id: engineRuleId, path: callableRel || profile.id, message, engine_fact: true },
+        ],
       }),
     };
   }
@@ -139,8 +184,12 @@ export function verify(input) {
     return {
       code: VERIFY_CODES.needs_human, profile: profile.id, adapter: adapterResult.source, outcome: 'needs_human',
       record: buildLogRecord({
-        ...base, outcome: 'needs_human', ruleId: 'cap_exhausted', reasonCode: 'cap_exhausted', patchRefs: [],
-        gateViolations: [{ rule_id: 'cap_exhausted', path: profile.id, message: `fix.cap=${config.fix_cap} exhausted at attempt ${attempt}; ${reason}` }],
+        ...base, outcome: 'needs_human', ruleId: checkRuleId || 'cap_exhausted', reasonCode: 'cap_exhausted', patchRefs: [],
+        extra: { stopped_because: 'cap_exhausted' },
+        gateViolations: [
+          ...checkViolations,
+          { rule_id: 'cap_exhausted', path: profile.id, message: `fix.cap=${config.fix_cap} exhausted at attempt ${attempt}; ${reason}`, engine_fact: true },
+        ],
       }),
     };
   }
@@ -153,6 +202,9 @@ export function verify(input) {
   const stillBad = failedStep(verifyResults);
   const combinedLog = `${logText}\n${verifyResults.map(r => r.output).join('\n')}`;
   const finalBudget = { ...budget, diff_tokens_used: estTokens(combinedLog), log_tokens_used: estTokens(combinedLog) };
+  // Re-read the rules from the REPEAT run as well: the first run's rule may already be gone,
+  // and a "still failing" record naming only the first rule would point at a solved problem.
+  const remainingViolations = parseCheckViolations(verifyResults.map(r => r.output).join('\n'));
 
   if (!stillBad) {
     return {
@@ -167,8 +219,14 @@ export function verify(input) {
     code: VERIFY_CODES.failed, profile: profile.id, adapter: adapterResult.source, outcome: 'failed',
     record: buildLogRecord({
       ...base, logText: combinedLog, budget: finalBudget,
-      outcome: 'failed', ruleId: 'check_command_failed', reasonCode: 'check_failed', patchRefs,
-      gateViolations: [{ rule_id: 'check_command_failed', path: bad.command, message: `${reason}; still failing after the fix attempt (exit ${stillBad.code})` }],
+      outcome: 'failed',
+      ruleId: remainingViolations[0]?.rule_id || 'check_command_failed',
+      reasonCode: 'check_failed', patchRefs,
+      extra: { failed_command: bad.command, exit_code: stillBad.code },
+      gateViolations: [
+        ...remainingViolations,
+        { rule_id: 'check_command_failed', path: bad.command, message: `${reason}; still failing after the fix attempt (exit ${stillBad.code})`, engine_fact: true },
+      ],
     }),
   };
 }

@@ -7,13 +7,21 @@
 //
 // The repository list is an INPUT (inventory/repos.json), not a discovery scan: a table that
 // silently enumerated every repository in the organisation could not be checked by acceptance.
+//
+// ── One derivation, two sources ─────────────────────────────────────────────────
+// `scanSource` is the ONLY place a row is built. It talks to a repository exclusively through a
+// source (source.mjs), so the local checkout and the live GitHub API produce columns from the
+// same code and cannot disagree. The earlier shape — `scanLocal` filling 18 columns and
+// `scanRemote` filling 5 — is what made the live table empty and made pr-autofix report
+// `staging_present: no` for itself while its own staging-gate job was green.
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadAdapter, effectiveConfig, ADAPTER_FILENAME } from './adapter.mjs';
+import { parseAdapterText, effectiveConfig } from './adapter.mjs';
 import { resolveProfile, profileHasBuild, listProfileIds } from './profile.mjs';
 import { toolVersion } from './log.mjs';
 import { findSecretValues } from './secrets.mjs';
+import { localSource, liveSource, workflowFiles } from './source.mjs';
 
 export const COVERAGE_COLUMNS = [
   'repo', 'owner', 'type', 'profile', 'profile_ref', 'adapter', 'build', 'check', 'fix', 'verify',
@@ -30,44 +38,57 @@ const EMPTY = (repo, owner) => ({
 
 const DEFAULT_AUTOFIX_REF = 'v1.7.4';
 
-function workflows(dir) {
-  const d = path.join(dir, '.github', 'workflows');
-  if (!fs.existsSync(d)) return [];
-  return fs.readdirSync(d).filter(f => /\.ya?ml$/.test(f));
+// ── Staging detection: one definition, both paths ──────────────────────────────
+// A staging job is a JOB whose id/name mentions staging. A workflow FILE whose name mentions
+// staging is not one: in this very repository the `staging-gate` job lives inside ci.yml (proof:
+// CI run on merge-commit 335e7601, job staging-gate = success), so name-only detection wrote
+// `staging_present: no` for the one repository that certainly has staging — a false construction
+// task and a false merge blocker under R7.
+const STAGING_JOB_RE = /^\s{0,4}(?:staging|stage|deploy-staging)[\w-]*\s*:/m;
+const STAGING_GATE_RE = /\bstaging[-_]?gate\b/i;
+
+function textHasStagingJob(text) {
+  return STAGING_JOB_RE.test(text) || STAGING_GATE_RE.test(text);
 }
 
-/** A staging job is a job whose id/name mentions staging. Presence is NOT health. */
-function hasStagingJob(dir) {
-  const d = path.join(dir, '.github', 'workflows');
-  if (!fs.existsSync(d)) return false;
-  for (const f of fs.readdirSync(d).filter(x => /\.ya?ml$/.test(x))) {
-    let text = '';
-    try { text = fs.readFileSync(path.join(d, f), 'utf8'); } catch { continue; }
-    if (/^\s{0,4}(staging|stage|deploy-staging)[\w-]*\s*:/m.test(text) || /\bstaging[-_]?gate\b/i.test(text)) return true;
+/** @param {{readText: (rel: string) => Promise<string|null>, files: Set<string>}} source */
+async function hasStagingJob(source) {
+  for (const f of workflowFiles(source)) {
+    const text = await source.readText(f);
+    if (text !== null && textHasStagingJob(text)) return true;
   }
   return false;
 }
 
-export function scanLocal(entry, profileRef = toolVersion()) {
+/**
+ * Build one row from any source. `adapterRaw` is the adapter text (or null when absent).
+ * @param {{repo: string, owner: string, type_hint?: string|null, ci_required?: boolean|null,
+ *          note?: string}} entry
+ * @param {{kind: string, origin: string, readable: boolean, files: Set<string>,
+ *          has: (rel: string) => boolean, readText: (rel: string) => Promise<string|null>}} source
+ */
+export async function scanSource(entry, source, profileRef = toolVersion()) {
   const repo = entry.repo;
   const owner = repo.includes('/') ? repo.split('/')[0] : '';
-  const dir = path.resolve(entry.path);
   const notes = [];
 
-  if (!fs.existsSync(dir)) {
+  if (!source.readable) {
     const row = EMPTY(repo, owner);
-    row.notes = [`unreadable: local path does not exist (${entry.path})`];
+    row.notes = [`unreadable: ${source.kind === 'local' ? `local path does not exist` : `repository is not readable through the API`} (${entry.path || source.origin})`];
     return row;
   }
 
-  const adapterResult = loadAdapter(dir);
+  // The adapter is read through the source, so the live path validates the same file the local
+  // path does instead of silently assuming "no adapter".
+  const adapterRaw = await source.readText('.devbaseline.json');
+  const adapterResult = parseAdapterText(adapterRaw);
   if (!adapterResult.ok) {
     const row = EMPTY(repo, owner);
-    row.notes = [`adapter_schema_violation: ${adapterResult.message}`];
+    row.notes = [`${adapterResult.rule_id}: ${adapterResult.message}`];
     return row;
   }
 
-  const prof = resolveProfile({ repoDir: dir, typeHint: entry.type_hint || null });
+  const prof = resolveProfile({ exists: source.has, typeHint: entry.type_hint || null, adapterProfile: adapterResult.adapter?.profile || null });
   if (!prof.ok) {
     const row = EMPTY(repo, owner);
     row.notes = [`${prof.rule_id}: ${prof.message}`];
@@ -77,20 +98,24 @@ export function scanLocal(entry, profileRef = toolVersion()) {
   const profile = prof.profile;
   const config = effectiveConfig({ profile, adapter: adapterResult.adapter });
   const callableRel = config.fix_autofix_callable;
-  const entrypointsPresent = config.context_entrypoints.filter(e => fs.existsSync(path.join(dir, e)));
+  const entrypointsPresent = config.context_entrypoints.filter(e => source.has(e));
+  const wfFiles = workflowFiles(source);
 
-  const ciFiles = workflows(dir);
-  const ciPresent = ciFiles.length > 0;
-  const stagingPresent = hasStagingJob(dir) || Boolean(config.staging_command);
+  const ciPresent = wfFiles.length > 0;
+  const stagingPresent = (await hasStagingJob(source)) || Boolean(config.staging_command);
   const docsOnly = profile.repo_type === 'docs';
   const stagingRequired = docsOnly ? false : config.staging_required;
   if (docsOnly) notes.push('staging_required=false: docs_only');
   if (profile.id === 'minimal') notes.push('check: missing — no recognised entrypoint (profile minimal)');
-  if (callableRel && !fs.existsSync(path.join(dir, callableRel))) notes.push(`fix: missing — repository has no ${callableRel}`);
+  if (callableRel && !source.has(callableRel)) notes.push(`fix: missing — repository has no ${callableRel}`);
   if (!callableRel) notes.push(`fix: unsupported_by_profile (profile ${profile.id} declares no fixer)`);
   if (stagingRequired && !stagingPresent) notes.push('staging: missing — required but absent');
   if (!ciPresent) notes.push('ci: missing — no workflow in .github/workflows');
   if (adapterResult.adapter === null) notes.push(`adapter: derived (${prof.derivation})`);
+  if (source.kind === 'live') {
+    notes.push(`live: branch=${source.defaultBranch}, files=${source.files.size}, workflows=${wfFiles.length}${source.truncated ? ', tree TRUNCATED by GitHub — file list is partial' : ''}`);
+  }
+  if (entry.note) notes.push(`scope: ${entry.note}`);
 
   return {
     repo,
@@ -101,7 +126,7 @@ export function scanLocal(entry, profileRef = toolVersion()) {
     adapter: adapterResult.adapter === null ? 'derived' : 'file',
     build: profileHasBuild(profile),
     check: config.check_commands,
-    fix: { autofix_callable: callableRel, fixer_present: Boolean(callableRel) && fs.existsSync(path.join(dir, callableRel)), cap: config.fix_cap, supported: Boolean(callableRel) },
+    fix: { autofix_callable: callableRel, fixer_present: Boolean(callableRel) && source.has(callableRel), cap: config.fix_cap, supported: Boolean(callableRel) },
     verify: config.verify_commands,
     context: { builder: profile.context.builder, entrypoints_present: entrypointsPresent },
     logs: { contract_version: profile.logs.contract_version, retention_days: config.logs.retention_days },
@@ -115,43 +140,45 @@ export function scanLocal(entry, profileRef = toolVersion()) {
   };
 }
 
-/** Live mode: read-only metadata via the GitHub API. No writes, no tokens beyond the reader's. */
+/** Local checkout path (kept as a named export: the sandbox and callers address it directly). */
+export async function scanLocal(entry, profileRef = toolVersion()) {
+  return scanSource(entry, localSource(entry.path), profileRef);
+}
+
+/** Live path. Requires GH_TOKEN; without it the row says so instead of guessing. */
 async function scanRemote(entry, profileRef = toolVersion()) {
-  const row = EMPTY(entry.repo, entry.repo.includes('/') ? entry.repo.split('/')[0] : '');
+  const repo = entry.repo;
+  const parts = repo.split('/').filter(Boolean);
+  const owner = parts.length ? parts[0] : '';
+  if (parts.length !== 2) {
+    // Say what is wrong with the INPUT instead of asking the API about a name we invented.
+    // `owner/extra/name` used to be silently truncated to `owner/name` and came back as
+    // `unreadable: HTTP 404` — a fact about the API, offered as an answer about the repository.
+    const row = EMPTY(repo, owner);
+    row.notes = [`input_invalid: repository id must be "owner/name" (got "${repo}"); supply \`path\` for a local checkout`];
+    return row;
+  }
   if (!process.env.GH_TOKEN) {
+    const row = EMPTY(repo, owner);
     row.notes = ['unreadable: no local path and no GH_TOKEN — supply `path` (offline) or GH_TOKEN (live)'];
     return row;
   }
-  const [owner, name] = entry.repo.split('/');
-  const base = `https://api.github.com/repos/${owner}/${name}`;
-  const get = async (p) => {
-    const r = await fetch(`${base}${p}`, { headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' } });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
-  };
+  const name = parts[1];
   try {
-    const repo = await get('');
-    const wfs = await get('/actions/workflows?per_page=100');
-    const names = (wfs.workflows || []).map(w => w.name);
-    row.readable = true;
-    row.ci_present = names.length > 0;
-    row.ci_required = null;
-    row.staging_present = names.some(n => /staging/i.test(n));
-    row.autofix_ref = DEFAULT_AUTOFIX_REF;
-    row.notes.push(`live: default_branch=${repo.default_branch}, workflows=${names.length}`);
-    if (!row.staging_present) row.notes.push('staging: missing — no workflow named *staging*');
+    const source = await liveSource({ owner, name });
+    return await scanSource(entry, source, profileRef);
   } catch (e) {
+    const row = EMPTY(repo, owner);
     row.notes = [`unreadable: GitHub API ${e.message}`];
+    return row;
   }
-  row.profile_ref = profileRef;
-  return row;
 }
 
 /** @returns {Promise<{rows: object[], unreadable: number}>} */
 export async function buildCoverage(entries, { profileRef = toolVersion() } = {}) {
   const rows = [];
   for (const e of entries) {
-    rows.push(e.path ? scanLocal(e, profileRef) : await scanRemote(e, profileRef));
+    rows.push(e.path ? await scanLocal(e, profileRef) : await scanRemote(e, profileRef));
   }
   rows.sort((a, b) => a.repo.localeCompare(b.repo));
   return { rows, unreadable: rows.filter(r => !r.readable).length };

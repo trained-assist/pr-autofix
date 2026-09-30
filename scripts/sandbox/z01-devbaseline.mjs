@@ -34,10 +34,11 @@
 // Локальный bare-репозиторий как endpoint песочницы (AC-09) создаётся уже сейчас,
 // чтобы T10 не зависел от временного ssh-алиаса `vm`.
 
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import http from 'node:http';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..', '..');
@@ -109,6 +110,26 @@ function run(cmd, args, { cwd = REPO, env = {}, cleanPath = false } = {}) {
 /** node scripts/devbaseline.mjs <args> — единственная точка входа в проверяемый контракт. */
 const cli = (args, opts = {}) => run(process.execPath, [CLI, ...args], opts);
 
+/**
+ * Тот же CLI, но асинхронно.
+ *
+ * Нужен ровно в одном месте — там, где дочерний процесс должен обратиться к фиктивному
+ * GitHub API, который слушает ЭТОТ ЖЕ процесс. `spawnSync` блокирует event loop, а значит
+ * и accept() входящего соединения: синхронный запуск виснет до таймаута и даёт `code = -1`,
+ * который выглядит как «фича сломана», хотя сломана была песочница. Первая сборка этого блока
+ * упала именно так — 16 FAIL, все от одного тупика. Асинхронный spawn оставляет loop свободным.
+ */
+const cliAsync = (args, opts = {}) => new Promise((resolve) => {
+  const e = { ...process.env, ...OFFLINE_ENV, ...(opts.env || {}) };
+  const child = spawn(process.execPath, [CLI, ...args], { cwd: opts.cwd || REPO, env: e, encoding: 'utf8' });
+  let out = '';
+  child.stdout.on('data', d => { out += d; });
+  child.stderr.on('data', d => { out += d; });
+  const timer = setTimeout(() => child.kill('SIGKILL'), 120_000);
+  child.on('close', (status) => { clearTimeout(timer); resolve({ code: status ?? -1, out }); });
+  child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, out: String(e) }); });
+});
+
 // ── Рабочий каталог прогона (своя папка, не общий /tmp) ───────────────────────
 const RUN = path.resolve(process.env.DEVBASELINE_SANDBOX_TMP || path.join(REPO, '.devbaseline-sandbox'));
 const FX = path.join(RUN, 'fixtures');
@@ -156,8 +177,15 @@ w('node-broken/.github/workflows/autofix-callable.yml', 'name: autofix\non:\n  w
 
 // 4. no-fixer-app: check красный, но fixer'а в профиле нет → needs_human (код 2),
 //    а не controlled failure. Разделяет «есть чем чинить» и «чинить нечем».
+//    check печатает НАстоящее правило из словаря (docs_heading_missing) — иначе F4-регрессия
+//    (rule_id = unsupported_by_profile вместо правила check'а) была бы неотличима от нормы.
 w('no-fixer-app/package.json', JSON.stringify({ name: 'no-fixer-app', version: '1.0.0', scripts: { test: 'node check.js' } }, null, 2));
-w('no-fixer-app/check.js', CHECK_FAIL);
+w('no-fixer-app/check.js', 'console.error("docs_heading_missing: src/app.md: no top-level (#) heading");\nprocess.exit(1);\n');
+
+// 4a. no-fixer-silent: check красный и НИЧЕГО не называет → rule_id остаётся честным
+//     (engine-правило), а не выдуманным. Отличает «check назвал правило» от «check молчит».
+w('no-fixer-silent/package.json', JSON.stringify({ name: 'no-fixer-silent', version: '1.0.0', scripts: { test: 'node check.js' } }, null, 2));
+w('no-fixer-silent/check.js', CHECK_FAIL);
 
 // 5. broken-docs: контролируемое падение check-docs — битая относительная ссылка
 //    и невалидный JSON (rule IDs docs_link_broken / docs_json_invalid, §2.4).
@@ -176,9 +204,104 @@ const CTX_SHA = (run('git', ['rev-parse', 'HEAD'], { cwd: ctxRepo }).out || '').
 w('ctx-repo/.devbaseline-context.json', JSON.stringify({ schema_version: 1, source_commit: CTX_SHA, entrypoints: ['src/index.js'] }, null, 2));
 w('ctx-repo/.devbaseline-context.stale.json', JSON.stringify({ schema_version: 1, source_commit: '0'.repeat(40), entrypoints: ['src/index.js'] }, null, 2));
 
+// 6a. Фикстуры для ЖИВОГО пути inventory (F1/F2). Один и тот же набор файлов лежит на диске
+//     (live-src/) и обслуживается фиктивным GitHub API (см. фиктивный endpoint ниже).
+//     Две фикстуры разведены НАМЕРЕННО, чтобы детектор staging был обязан падать в обе стороны:
+//
+//       live-mixed       — файла *staging* НЕТ, джоб `staging-gate` живёт внутри ci.yml
+//                          (ровно как в самом pr-autofix). Детектор по ИМЕНИ файла сказал бы
+//                          `no` — это и есть дефект F2; по содержимому обязан сказать `yes`.
+//       live-no-staging  — файл *staging-notes.yml* ЕСТЬ, а джоба staging внутри нет.
+//                          Детектор по ИМЕНИ сказал бы `yes` — обратная ошибка. Обязан `false`.
+//
+//     Одна фикстура вместо двух проверила бы только половину: `yes` можно получить и неверно.
+const LIVE_TREE = {
+  'package.json': JSON.stringify({ name: 'live-mixed', version: '1.0.0', scripts: { test: 'node check.js' } }, null, 2),
+  'check.js': 'process.exit(0);\n',
+  '.github/workflows/ci.yml': 'name: CI\non: [push]\njobs:\n  selftest:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo selftest\n  staging-gate:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo staging\n',
+};
+// Живой docs-репозиторий: package.json нет, README есть → профиль docs (F1: type/profile/check/
+// fix/verify/context/logs заполняются по содержимому, а не остаются пустыми). И адаптер с
+// credential-именем (не значением) — колонки credentials/check строятся из файла-адаптера.
+const LIVE_DOCS_TREE = {
+  'README.md': '# Live docs\n\nДокументация без кода.\n',
+  'docs/guide.md': '# Гайд\n\nСсылка рабочая: [назад](../README.md).\n',
+  '.devbaseline.json': JSON.stringify({
+    schema_version: 1,
+    check: { commands: ['node {{devbaseline}} check-docs --dir .'] },
+    credentials: [{ name: 'DOCS_CHECK_TOKEN', kind: 'repo_secret' }],
+    logs: { retention_days: 30 },
+  }, null, 2),
+};
+// Живой репозиторий без staging-джоба, но С ФАЙЛОМ, названным *staging* — обратная сторона F2:
+// наличие файла не доказывает наличие джобы. Скан по имени здесь ответил бы yes и соврал.
+const LIVE_NO_STAGING_TREE = {
+  'README.md': '# No staging\n',
+  '.github/workflows/ci.yml': 'name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n',
+  '.github/workflows/staging-notes.yml': 'name: Notes\non: [push]\njobs:\n  notes:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo notes\n',
+};
+// Живой репозиторий, у которого дерево выглядит как docs (README, нет package.json), а адаптер
+// ЗАКРЕПЛЯЕТ профиль node. Схема адаптера рекламирует поле `profile`; до этого шага резолвер его
+// игнорировал, и «закрепить недеривируемое» — задокументированное лечение — не работало.
+const LIVE_PINNED_TREE = {
+  'README.md': '# Looks like docs, is pinned as node\n',
+  '.devbaseline.json': JSON.stringify({ schema_version: 1, profile: 'node' }, null, 2),
+};
+
 // 7. Endpoint песочницы (AC-09): собственный bare-репозиторий, не ssh-алиас `vm`.
 const ENDPOINT = path.join(RUN, 'endpoint.git');
 run('git', ['init', '-q', '--bare', ENDPOINT], { cwd: RUN });
+
+// 7a. Фиктивный GitHub API для ЖИВОГО пути (AC-09: свой endpoint, не чужой).
+//     Отвечает ровно теми запросами, которые делает liveSource(): repo, рекурсивное дерево,
+//     содержимое файла. Никакой сети — адрес слушается на 127.0.0.1 и подставляется через
+//     DEVBASELINE_GITHUB_API. Это позволяет проверять ЖИВОЙ код офлайн: тот же scanSource,
+//     тот же liveSource, другой адрес endpoint'а.
+const LIVE_REPOS = {
+  'live-mixed': LIVE_TREE,
+  'live-docs': LIVE_DOCS_TREE,
+  'live-no-staging': LIVE_NO_STAGING_TREE,
+  'live-pinned': LIVE_PINNED_TREE,
+};
+const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+const apiServer = http.createServer((req, res) => {
+  const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  const m = /^\/repos\/[^/]+\/([^/]+)(?:\/(.*))?$/.exec(req.url.split('?')[0]);
+  if (!m) return send(404, { message: 'Not Found' });
+  const [, name, rest] = m;
+  const tree = LIVE_REPOS[name];
+  if (!tree) return send(404, { message: 'Not Found' });
+  if (!rest) return send(200, { name, default_branch: 'main', private: false });
+  if (rest.startsWith('git/trees/')) {
+    // GitHub отдаёт в рекурсивном дереве и каталоги (type: tree). Они нужны: профиль docs
+    // спрашивает про наличие каталога `docs` как об entrypoint, и локальный источник отвечает
+    // на это existsSync. Без tree-записей живой скан ответил бы «нет», локальный «да».
+    const paths = Object.keys(tree).flatMap(p => {
+      const parts = p.split('/');
+      const dirs = parts.slice(0, -1).map((_, i) => ({ path: parts.slice(0, i + 1).join('/'), type: 'tree' }));
+      return [...dirs, { path: p, type: 'blob' }];
+    });
+    return send(200, { sha: '0'.repeat(40), truncated: false, tree: paths });
+  }
+  if (rest.startsWith('contents/')) {
+    const file = decodeURIComponent(rest.slice('contents/'.length).split('?')[0]);
+    if (!(file in tree)) return send(404, { message: 'Not Found' });
+    return send(200, { name: path.basename(file), path: file, encoding: 'base64', content: b64(tree[file]) });
+  }
+  return send(404, { message: 'Not Found' });
+});
+await new Promise((resolve) => apiServer.listen(0, '127.0.0.1', resolve));
+// unref обязателен: слушающий сокет держит event loop, и без unref успешный прогон (0 FAIL)
+// НИКОГДА не завершился бы — процесс висел до таймаута джобы. На падении это маскировалось
+// тем, что в конце стоит process.exit(1); на зелёном пути висели. Проверяется просто:
+// `time node scripts/sandbox/z01-devbaseline.mjs` обязан вернуть exit 0 сам, без timeout.
+apiServer.unref();
+const LIVE_API = `http://127.0.0.1:${apiServer.address().port}`;
+// Тот же набор файлов на диске: локальный скан обязан дать ТЕ ЖЕ производные колонки,
+// что и живой скан тех же файлов. Это и есть проверка «один вывод, два источника».
+for (const [name, files] of Object.entries(LIVE_REPOS)) {
+  for (const [rel, content] of Object.entries(files)) w(`live-src/${name}/${rel}`, content);
+}
 
 // 8. Список репозиториев для S1: локальные checkout'ы, `path` вместо GitHub API.
 const REPOS_FILE = path.join(RUN, 'repos.json');
@@ -188,6 +311,14 @@ fs.writeFileSync(REPOS_FILE, JSON.stringify([
   { repo: 'sandbox/node-broken', type_hint: 'node', path: path.join(FX, 'node-broken') },
   { repo: 'sandbox/unreadable', type_hint: null, path: path.join(FX, 'does-not-exist') },
 ], null, 2));
+
+// 8a. Те же файлы, что обслуживает фиктивный API, но прочитанные ДВУМЯ путями: локально (`path`)
+//     и «вживую» (GH_TOKEN + DEVBASELINE_GITHUB_API на фиктивный endpoint). Ни type_hint, ни
+//     path в живом списке нет — профиль выводится по тому, что источник действительно содержит.
+fs.writeFileSync(path.join(RUN, 'repos-live.json'), JSON.stringify(
+  Object.keys(LIVE_REPOS).map(name => ({ repo: `sandbox-live/${name}`, type_hint: null, ci_required: null })), null, 2));
+fs.writeFileSync(path.join(RUN, 'repos-local-src.json'), JSON.stringify(
+  Object.keys(LIVE_REPOS).map(name => ({ repo: `sandbox-src/${name}`, type_hint: null, ci_required: null, path: path.join(FX, 'live-src', name) })), null, 2));
 
 // ── A. Здоровье самой песочницы (должно быть зелёным ДО появления фичи) ────────
 group('A. здоровье песочницы (не зависит от фичи)');
@@ -325,10 +456,112 @@ if (!fs.existsSync(CLI)) {
   check('S6 needs_human: reason_code из словаря',
     ['cap_exhausted', 'unsupported_by_profile'].includes(noFixerLog?.reason_code), `reason_code=${noFixerLog?.reason_code}`);
 
+  // F4 (AC-44): лог обязан называть правило НАСТОЯЩЕГО check'а, а не только то, что чинить нечем.
+  // no-fixer-app печатает docs_heading_missing; engine-факт (unsupported_by_profile) уходит в
+  // reason_code/stopped_because. Раньше rule_id был ТОЛЬКО engine-фактом, и красный репозиторий
+  // выглядел в логе как «просто нет фиксера».
+  check('F4 needs_human: rule_id — правило check\'а, а не только про движок',
+    noFixerLog?.rule_id === 'docs_heading_missing', `rule_id=${noFixerLog?.rule_id}`);
+  check('F4 needs_human: reason_code остаётся про движок (engine-факт не потерян)',
+    noFixerLog?.reason_code === 'unsupported_by_profile', `reason_code=${noFixerLog?.reason_code}`);
+  check('F4 needs_human: stopped_because назван явно', noFixerLog?.stopped_because === 'unsupported_by_profile',
+    `stopped_because=${noFixerLog?.stopped_because}`);
+  check('F4 needs_human: нарушение check\'а в gate_violations с путём и сообщением',
+    (noFixerLog?.gate_violations || []).some(v => v.rule_id === 'docs_heading_missing' && v.path === 'src/app.md'),
+    JSON.stringify((noFixerLog?.gate_violations || []).slice(0, 2)));
+  check('F4 needs_human: rule_violations — отдельным аддитивным полем',
+    (noFixerLog?.rule_violations || []).some(v => v.rule_id === 'docs_heading_missing'),
+    JSON.stringify(noFixerLog?.rule_violations));
+  // Негативный контроль F4: check, который не называет правило, обязан НЕ выдумывать его.
+  const logSilent = readJson(cli(['verify', '--repo', path.join(FX, 'no-fixer-silent'), '--log',
+    path.join(OUT, 's6-nofixer-silent.json')]) && path.join(OUT, 's6-nofixer-silent.json'));
+  check('F4 негативный контроль: check без rule id → rule_id не выдуман',
+    logSilent?.rule_id === 'unsupported_by_profile', `rule_id=${logSilent?.rule_id}`);
+  check('F4 негативный контроль: выдуманных rule_violations нет',
+    (logSilent?.rule_violations || []).length === 0, JSON.stringify(logSilent?.rule_violations));
+
   const s6d = cli(['check-docs', '--dir', path.join(FX, 'broken-docs')]);
   check('S6 check-docs на битой документации → код 1', s6d.code === 1, `code=${s6d.code}`);
   check('S6 check-docs называет docs_link_broken', /docs_link_broken/.test(s6d.out), s6d.out.trim().slice(0, 160));
   check('S6 check-docs называет docs_json_invalid', /docs_json_invalid/.test(s6d.out));
+
+  // ── F1/F2: ЖИВОЙ путь inventory против локального, на одинаковых файлах ──────
+  // Живой скан идёт через фиктивный endpoint песочницы (свой, не api.github.com), поэтому
+  // проверяется РЕАЛЬНЫЙ код scanSource/liveSource, а не мок внутренних функций.
+  const LIVE_OUT = path.join(OUT, 'live');
+  const liveEnv = { GH_TOKEN: 'ghs_sandboxfixture0000000000000000000', DEVBASELINE_GITHUB_API: LIVE_API };
+  const liveRun = await cliAsync(['inventory', '--repos', path.join(RUN, 'repos-live.json'), '--out', LIVE_OUT], { env: liveEnv });
+  check('F1 живой inventory: код 0 на фиктивном endpoint', liveRun.code === 0,
+    `code=${liveRun.code}${liveRun.code !== 0 ? ` · ${liveRun.out.trim().split('\n').slice(-2).join(' | ').slice(0, 200)}` : ''}`);
+  const liveCov = readJson(path.join(LIVE_OUT, 'repo-coverage.json'));
+  const liveRows = liveCov?.repos || [];
+  const liveMixed = liveRows.find(r => /live-mixed$/.test(r.repo));
+  const liveDocs = liveRows.find(r => /live-docs$/.test(r.repo));
+  const liveNoStg = liveRows.find(r => /live-no-staging$/.test(r.repo));
+  const livePinned = liveRows.find(r => /live-pinned$/.test(r.repo));
+
+  // F1: производные колонки заполнены на ЖИВОМ пути — раньше все 25 репозиториев давали «—».
+  // `autofix_ref` проверяется отдельно и только там, где фиксер вообще есть: у docs-профиля
+  // (нет autofix_callable) закреплять ref нечего, и требование «заполнено» здесь было бы
+  // требованием выдумать значение — ровно тот класс дефекта, который карточка и закрывает.
+  const DERIVED = ['type', 'profile', 'adapter', 'build', 'check', 'fix', 'verify', 'context', 'logs'];
+  for (const [label, row] of [['live-mixed', liveMixed], ['live-docs', liveDocs]]) {
+    const empty = DERIVED.filter(c => row?.[c] === null || row?.[c] === undefined);
+    check(`F1 ${label}: производные колонки заполнены на живом пути (AC-40)`, row && empty.length === 0,
+      empty.length ? `пусто: ${empty.join(', ')}` : 'все заполнены');
+  }
+  check('F1 живой node-репозиторий: autofix_ref закреплён (есть фиксер)', liveMixed?.autofix_ref === 'v1.7.4',
+    `autofix_ref=${liveMixed?.autofix_ref}`);
+  check('F1 живой docs-репозиторий: autofix_ref честно пуст (профиль docs без фиксера)',
+    liveDocs?.autofix_ref === null && liveDocs?.fix?.supported === false,
+    `autofix_ref=${liveDocs?.autofix_ref} supported=${liveDocs?.fix?.supported}`);
+  check('F1 живой node-репозиторий получил профиль node', liveMixed?.profile === 'node', `profile=${liveMixed?.profile}`);
+  check('F1 живой docs-репозиторий получил профиль docs', liveDocs?.profile === 'docs', `profile=${liveDocs?.profile}`);
+  check('F1 живой docs: build=false (docs-only не получает application build)', liveDocs?.build === false, `build=${liveDocs?.build}`);
+  check('F1 живой docs: adapter прочитан с endpoint\'а (adapter=file)', liveDocs?.adapter === 'file', `adapter=${liveDocs?.adapter}`);
+  check('F1 живой docs: retention взят из адаптера, не из профиля',
+    liveDocs?.logs?.retention_days === 30, `retention=${JSON.stringify(liveDocs?.logs)}`);
+
+  // Закрепление профиля адаптером: дерево выглядит как docs, адаптер говорит node. Схема
+  // адаптера рекламирует `profile`, и это единственный способ починить неверную деривацию
+  // в репозитории, где стека не видно в дереве. До фикса поле игнорировалось (мёртвый конфиг).
+  check('F1 закрепление профиля: адаптер профиля побеждает деривацию по дереву',
+    livePinned?.profile === 'node', `profile=${livePinned?.profile}`);
+  check('F1 закрепление профиля: строка помечена adapter=file',
+    livePinned?.adapter === 'file', `adapter=${livePinned?.adapter}`);
+  check('F1 закрепление профиля: staging_required следует за профилем, не за деревом',
+    livePinned?.staging_required === true, `required=${livePinned?.staging_required}`);
+
+  // F2: staging определяется по ДЖОБАМ, а не по имени файла.
+  check('F2 живой скан: staging-джоб внутри ci.yml найден, имя файла про staging не ищем',
+    liveMixed?.staging_present === true, `staging_present=${liveMixed?.staging_present}`);
+  check('F2 имя workflow-файла само по себе НЕ считается staging (staging-notes.yml без джоба)',
+    liveNoStg?.staging_present === false,
+    `live-no-staging staging_present=${liveNoStg?.staging_present} (при наличии файла *staging*)`);
+  check('F2 живой скан: staging_required=true для node-профиля', liveMixed?.staging_required === true, `required=${liveMixed?.staging_required}`);
+
+  // Главное свойство F1: локальный и живой скан ТЕХ ЖЕ файлов обязаны дать ОДНИ И ТЕ ЖЕ
+  // производные колонки. Расхождение = две реализации вывода, то есть исходный дефект.
+  const localOut = path.join(OUT, 'local-src');
+  const localRun = cli(['inventory', '--repos', path.join(RUN, 'repos-local-src.json'), '--out', localOut]);
+  const localRows = (readJson(path.join(localOut, 'repo-coverage.json'))?.repos) || [];
+  for (const name of ['live-mixed', 'live-docs', 'live-no-staging', 'live-pinned']) {
+    const L = localRows.find(r => r.repo === `sandbox-src/${name}`);
+    const V = liveRows.find(r => r.repo === `sandbox-live/${name}`);
+    if (!L || !V) { fail(`F1 ${name}: строка найдена в обоих сканах`, `local=${!!L} live=${!!V}`); continue; }
+    const diffs = DERIVED.concat(['autofix_ref', 'ci_present', 'staging_present', 'staging_required'])
+      .filter(c => JSON.stringify(L[c]) !== JSON.stringify(V[c]));
+    check(`F1 ${name}: локальный и живой скан совпадают по производным колонкам`, diffs.length === 0,
+      diffs.length ? `расходятся: ${diffs.join(', ')}` : 'идентично');
+  }
+
+  // Негативный контроль F2: если бы staging считался по ИМЕНИ файла, live-no-staging дал бы yes.
+  // Проверка обязана быть способна упасть — иначе она ничего не доказывает.
+  check('F2 негативный контроль: фикстура действительно содержит файл *staging*',
+    fs.existsSync(path.join(FX, 'live-src', 'live-no-staging', '.github', 'workflows', 'staging-notes.yml')));
+  check('F2 негативный контроль: в live-mixed нет файла *staging*, но есть джоб',
+    !fs.existsSync(path.join(FX, 'live-src', 'live-mixed', '.github', 'workflows', 'staging-notes.yml'))
+    && /staging-gate/.test(LIVE_TREE['.github/workflows/ci.yml']));
 
   // ── S7: log-контракт AC-44 ─────────────────────────────────────────────────
   for (const [label, log] of [['failed', brokenLog], ['no_change', repeatLog], ['needs_human', noFixerLog]]) {

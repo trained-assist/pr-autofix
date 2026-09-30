@@ -69,26 +69,34 @@ export function validateAllProfiles() {
 }
 
 /**
- * Derive the profile id from a repository directory. Deterministic, offline, no name
- * heuristics. Order is load-bearing and is the first match wins:
+ * Derive the profile id from a set of file names. Deterministic, offline, no name heuristics.
+ * Order is load-bearing and is the first match wins:
  *   mixed  → both stacks present
  *   node   → package.json
  *   python → pyproject.toml / setup.py / requirements.txt
  *   docs   → no code stack, but a documentation entrypoint
  *   minimal→ nothing recognised (its check is an explicit `missing` no-op)
+ *
+ * Takes an `exists(name)` predicate rather than a directory so that the local checkout and the
+ * live tree are answered by ONE implementation. Deriving `docs` for a local path and `node` for
+ * the same repository read over the API would be a coverage table that disagrees with itself.
  */
-export function deriveProfileId(repoDir) {
-  const has = f => fs.existsSync(path.join(repoDir, f));
-  const node = SIGNALS.node.filter(has);
-  const python = SIGNALS.python.filter(has);
-  const docs = SIGNALS.docs.filter(has);
-  const gitOnly = ['.git'].every(has) && !node.length && !python.length && !docs.length;
+export function deriveProfileIdFromExists(exists) {
+  const node = SIGNALS.node.filter(exists);
+  const python = SIGNALS.python.filter(exists);
+  const docs = SIGNALS.docs.filter(exists);
+  const gitOnly = exists('.git') && !node.length && !python.length && !docs.length;
 
   if (node.length && python.length) return { id: 'mixed', reason: `both stacks present (${node.join(', ')} + ${python.join(', ')})` };
   if (node.length) return { id: 'node', reason: `${node.join(', ')} present` };
   if (python.length) return { id: 'python', reason: `${python.join(', ')} present` };
   if (docs.length) return { id: 'docs', reason: `no code stack, ${docs.join(', ')} present` };
   return { id: 'minimal', reason: gitOnly ? 'only git metadata, no recognised entrypoint' : 'no recognised entrypoint' };
+}
+
+/** Directory-shaped convenience wrapper over `deriveProfileIdFromExists`. */
+export function deriveProfileId(repoDir) {
+  return deriveProfileIdFromExists(f => fs.existsSync(path.join(repoDir, f)));
 }
 
 /** Does this profile run a build? Docs/minimal never do — checked as a property, not a comment. */
@@ -98,19 +106,35 @@ export function profileHasBuild(profile) {
 
 /**
  * Resolve the effective profile for a repository.
- * @returns {{ok: true, profile: object, source: 'explicit'|'hint'|'derived', derivation: string}
+ *
+ * Precedence: an explicit `--profile` (a one-off diagnostic) beats the repository's own adapter,
+ * which beats a `type_hint` in the input list, which beats derivation from the file tree. The
+ * adapter sits above the hint because it is the repository's committed statement about itself;
+ * the hint is a property of whoever wrote the list.
+ *
+ * @param {{repoDir?: string, profileId?: string, adapterProfile?: string|null,
+ *          typeHint?: string|null, exists?: ((rel: string) => boolean)|null}} opts
+ * @returns {{ok: true, profile: object, source: 'explicit'|'adapter'|'hint'|'derived', derivation: string}
  *          |{ok: false, rule_id: string, message: string}}
  */
-export function resolveProfile({ repoDir, profileId = '', typeHint = null } = {}) {
+export function resolveProfile({ repoDir, profileId = '', adapterProfile = null, typeHint = null, exists = null } = {}) {
   if (profileId) {
     const r = loadProfile(profileId);
     return r.ok ? { ok: true, profile: r.profile, source: 'explicit', derivation: 'requested with --profile' } : r;
+  }
+  if (adapterProfile) {
+    // `.devbaseline.json` advertises `profile` in the schema; ignoring it here made the pin a
+    // dead field, so a repository whose stack the tree does not reveal (a tooling repo with no
+    // package.json) had no way to correct its own derivation — the documented remedy did nothing.
+    const r = loadProfile(adapterProfile);
+    return r.ok ? { ok: true, profile: r.profile, source: 'adapter', derivation: `profile pinned in .devbaseline.json` } : r;
   }
   if (typeHint) {
     const r = loadProfile(typeHint);
     return r.ok ? { ok: true, profile: r.profile, source: 'hint', derivation: `type_hint in the repository list` } : r;
   }
-  const d = deriveProfileId(repoDir || TOOL_ROOT);
+  const has = exists || (repoDir ? f => fs.existsSync(path.join(repoDir, f)) : f => fs.existsSync(path.join(TOOL_ROOT, f)));
+  const d = deriveProfileIdFromExists(has);
   const r = loadProfile(d.id);
   return r.ok ? { ok: true, profile: r.profile, source: 'derived', derivation: d.reason } : r;
 }
