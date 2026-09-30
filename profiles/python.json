@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "id": "python",
+  "repo_type": "python",
+  "description": "Python project with pyproject.toml or setup.py.",
+  "check": {
+    "commands": [
+      "node {{devbaseline}} run-derived-check --dir ."
+    ],
+    "build": null,
+    "working_dir": null,
+    "needs": [
+      "python_env"
+    ]
+  },
+  "fix": {
+    "autofix_callable": ".github/workflows/autofix-callable.yml",
+    "deterministic": [],
+    "cap": 3
+  },
+  "verify": {
+    "commands": [
+      "node {{devbaseline}} run-derived-check --dir ."
+    ],
+    "repeat_on_no_change": true
+  },
+  "context": {
+    "builder": "external",
+    "entrypoints": [
+      "pyproject.toml",
+      "setup.py",
+      "src/__main__.py",
+      "main.py"
+    ],
+    "exclude_paths": [
+      ".venv",
+      "venv",
+      "dist",
+      "build",
+      "__pycache__"
+    ]
+  },
+  "logs": {
+    "contract_version": 1,
+    "retention_days": 90
+  },
+  "budget": {
+    "diff_tokens": 4000,
+    "log_tokens": 2500,
+    "max_files": 15,
+    "max_lines": 400
+  }
+}

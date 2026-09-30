@@ -1,0 +1,9 @@
+name: autofix (callable — fixture stub)
+on:
+  workflow_call:
+    inputs: {}
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo fix

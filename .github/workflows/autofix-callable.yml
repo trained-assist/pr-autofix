@@ -154,6 +154,11 @@ jobs:
           # Optional repo variables: diff-gate size limits (defaults 15 files / 400 lines).
           AUTOFIX_GATE_MAX_FILES: ${{ vars.AUTOFIX_GATE_MAX_FILES }}
           AUTOFIX_GATE_MAX_LINES: ${{ vars.AUTOFIX_GATE_MAX_LINES }}
+          # AC-44: which tool build produced this record. Same `job` context the script is
+          # fetched with — so the pin is established by the mechanism that already pins the
+          # script, and no new entity appears (Z01 design §2.4).
+          AUTOFIX_WORKFLOW_REF: ${{ job.workflow_ref }}
+          AUTOFIX_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: node /tmp/autofix.mjs
 
       - name: Report unfixed failure
