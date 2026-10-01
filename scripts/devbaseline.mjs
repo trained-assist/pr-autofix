@@ -23,9 +23,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 import {
-  TOOL_ROOT, listProfileIds, loadProfile, validateAllProfiles, resolveProfile, expandCommand,
+  TOOL_ROOT, listProfileIds, loadProfile, validateAllProfiles, expandCommand,
 } from './lib/devbaseline/profile.mjs';
 import { loadAdapter } from './lib/devbaseline/adapter.mjs';
+import { resolveRepo } from './lib/devbaseline/resolve.mjs';
 import { verify, VERIFY_CODES, writeLogRecord } from './lib/devbaseline/run.mjs';
 import { inspectContext } from './lib/devbaseline/context.mjs';
 import { buildCoverage, renderCoverageMd, COVERAGE_COLUMNS, assertNoSecretValues } from './lib/devbaseline/inventory.mjs';
@@ -82,7 +83,9 @@ function cmdValidate(flags) {
 
   if (flags.repo) {
     const dir = path.resolve(String(flags.repo));
-    const prof = resolveProfile({ repoDir: dir });
+    // Same seam as verify/inventory (R5): `validate` used to pass only `repoDir`, so a
+    // repository pinning a profile was reported here as the DERIVED one.
+    const prof = resolveRepo({ repoDir: dir });
     if (!prof.ok) { out(`${prof.rule_id}: ${prof.message}`); return 3; }
     out(`repo ${dir}: profile ${prof.profile.id} (${prof.source}: ${prof.derivation})`);
     if (prof.profile.check.build) out(`  note: this profile runs a build (${prof.profile.check.build.join(', ')})`);
