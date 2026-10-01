@@ -43,6 +43,7 @@ jobs:
           node scripts/sandbox/consumer-boundary.mjs
           node scripts/sandbox/repro-r3-gate.mjs
           node scripts/sandbox/repro-r5-resolver.mjs
+          node scripts/sandbox/repro-r1-remote-caller.mjs
           node scripts/sandbox/repro-r4-cleanup.mjs
       # R6: the receipt test existed but was wired into no job, so a green CI did not prove R6 —
       # the defect class this epic exists to kill, in the last place it was still alive. Its own

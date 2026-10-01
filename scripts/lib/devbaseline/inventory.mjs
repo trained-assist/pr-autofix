@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseAdapterText, effectiveConfig } from './adapter.mjs';
 import { profileHasBuild, listProfileIds } from './profile.mjs';
-import { resolveRepo } from './resolve.mjs';
+import { resolveRepo, resolveFixInstallation } from './resolve.mjs';
 import { toolVersion, TOOL_NAME } from './log.mjs';
 import { findSecretValues } from './secrets.mjs';
 import { localSource, liveSource, workflowFiles } from './source.mjs';
@@ -47,7 +47,7 @@ const EMPTY = (repo, owner) => ({
   autofix_ref: null, read_state: 'no_access', notes: [],
 });
 
-const DEFAULT_AUTOFIX_REF = 'v1.7.4';
+
 
 // ── Staging detection: one definition, both paths ──────────────────────────────
 // A staging job is a JOB whose id/name mentions staging. A workflow FILE whose name mentions
@@ -111,6 +111,7 @@ export async function scanSource(entry, source, profileRef = toolVersion()) {
   const profile = prof.profile;
   const config = effectiveConfig({ profile, adapter: adapterResult.adapter });
   const callableRel = config.fix_autofix_callable;
+  const fixInstallation = await resolveFixInstallation(source, callableRel, config.fix_ref || (callableRel ? (/^(v\d+\.\d+\.\d+|[0-9a-f]{40})$/.test(profileRef) ? profileRef : 'v1.7.4') : null));
   const entrypointsPresent = config.context_entrypoints.filter(e => source.has(e));
   const wfFiles = workflowFiles(source);
 
@@ -120,7 +121,7 @@ export async function scanSource(entry, source, profileRef = toolVersion()) {
   const stagingRequired = docsOnly ? false : config.staging_required;
   if (docsOnly) notes.push('staging_required=false: docs_only');
   if (profile.id === 'minimal') notes.push('check: missing — no recognised entrypoint (profile minimal)');
-  if (callableRel && !source.has(callableRel)) notes.push(`fix: missing — repository has no ${callableRel}`);
+  if (callableRel && fixInstallation.fixer_present === false) notes.push(`fix: missing — repository has no ${callableRel}`);
   if (!callableRel) notes.push(`fix: unsupported_by_profile (profile ${profile.id} declares no fixer)`);
   if (stagingRequired && !stagingPresent) notes.push('staging: missing — required but absent');
   if (!ciPresent) notes.push('ci: missing — no workflow in .github/workflows');
@@ -146,7 +147,7 @@ export async function scanSource(entry, source, profileRef = toolVersion()) {
     adapter: adapterResult.adapter === null ? 'derived' : 'file',
     build: profileHasBuild(profile),
     check: config.check_commands,
-    fix: { autofix_callable: callableRel, fixer_present: Boolean(callableRel) && source.has(callableRel), cap: config.fix_cap, supported: Boolean(callableRel) },
+    fix: { autofix_callable: callableRel, ...fixInstallation, cap: config.fix_cap, supported: Boolean(callableRel) },
     verify: config.verify_commands,
     context: { builder: profile.context.builder, entrypoints_present: entrypointsPresent },
     logs: { contract_version: profile.logs.contract_version, retention_days: config.logs.retention_days },
@@ -154,7 +155,7 @@ export async function scanSource(entry, source, profileRef = toolVersion()) {
     ci_required: typeof entry.ci_required === 'boolean' ? entry.ci_required : null,
     staging_present: stagingPresent,
     staging_required: stagingRequired,
-    autofix_ref: config.fix_ref || (callableRel ? DEFAULT_AUTOFIX_REF : null),
+    autofix_ref: fixInstallation.desired_ref,
     read_state: source.empty ? 'empty' : 'read',
     notes,
   };
