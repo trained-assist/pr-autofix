@@ -4,15 +4,20 @@
 // through the CLI, never by calling this module (AC-19):
 //   0 pass / no_change      1 controlled failure      2 needs_human      3 invalid config
 //
-// `needs_human` (2) is deliberately NOT a pipeline failure: either the profile has no fixer,
-// or `fix.cap` attempts are spent. It is reported with its own outcome and reason_code so the
-// number of unresolved cases is countable rather than anecdotal.
+// `needs_human` (2) means either the profile has no fixer, or `fix.cap` attempts are spent. It
+// keeps its own outcome and reason_code so the number of unresolved cases is countable rather
+// than anecdotal — and it BLOCKS the merge: the caller decides the colour through
+// gate.mjs, which treats only exit 0 as green. An earlier version of this comment claimed
+// needs_human was "deliberately NOT a pipeline failure", and a workflow branched on that claim to
+// turn exit 2 into a green required check. The classification was always worth keeping; the
+// exemption was not.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { loadAdapter, effectiveConfig, ADAPTER_FILENAME } from './adapter.mjs';
-import { resolveProfile, expandCommand, profileHasBuild } from './profile.mjs';
+import { effectiveConfig, ADAPTER_FILENAME } from './adapter.mjs';
+import { expandCommand, profileHasBuild } from './profile.mjs';
+import { resolveRepo } from './resolve.mjs';
 import { buildLogRecord, writeLogRecord, gitInfo, estTokens, RULE_IDS } from './log.mjs';
 
 export const VERIFY_CODES = { pass: 0, failed: 1, needs_human: 2, invalid: 3 };
@@ -115,15 +120,23 @@ export function verify(input) {
     return invalidConfig(repoDir, { ruleId: 'adapter_schema_violation', message: `repo directory does not exist: ${repoDir}` });
   }
 
-  const adapterResult = loadAdapter(repoDir);
-  if (!adapterResult.ok) return invalidConfig(repoDir, { ruleId: 'adapter_schema_violation', message: adapterResult.message });
+  // One seam for the profile AND the adapter (R5): `verify` used to re-read the adapter and pass
+  // only a subset of the resolver inputs, so a repository pinning a profile in
+  // .devbaseline.json got that profile in `inventory` and a derived one here. A malformed
+  // adapter surfaces as `ok: false` from the same call — it is never downgraded to `derived`.
+  const resolved = resolveRepo({ repoDir, profileId: input.profileId, typeHint: input.typeHint });
+  if (!resolved.ok) {
+    return invalidConfig(repoDir, {
+      ruleId: resolved.rule_id || 'adapter_schema_violation',
+      message: resolved.message,
+      adapterSource: resolved.adapterSource || 'derived',
+    });
+  }
+  const adapterSource = resolved.adapterSource;
 
-  const prof = resolveProfile({ repoDir, profileId: input.profileId, typeHint: input.typeHint });
-  if (!prof.ok) return invalidConfig(repoDir, { ruleId: prof.rule_id, message: prof.message, adapterSource: adapterResult.source });
-
-  const profile = prof.profile;
-  const config = effectiveConfig({ profile, adapter: adapterResult.adapter });
-  const { included, omitted } = coveragePaths(repoDir, config, adapterResult.source, profile.context.exclude_paths);
+  const profile = resolved.profile;
+  const config = effectiveConfig({ profile, adapter: resolved.adapter });
+  const { included, omitted } = coveragePaths(repoDir, config, adapterSource, profile.context.exclude_paths);
   const git = gitInfo(repoDir);
   const source = { repo: input.repo || git.repo || '', base_commit: git.base_commit, head_commit: git.head_commit, run_id: input.runId || 'local', pr: input.pr || '' };
 
@@ -143,7 +156,7 @@ export function verify(input) {
   const checkRuleId = checkViolations.length ? checkViolations[0].rule_id : null;
 
   const base = {
-    profileId: profile.id, adapterSource: adapterResult.source, mode: 'verify', attempt,
+    profileId: profile.id, adapterSource, mode: 'verify', attempt,
     source, includedPaths: included, omittedPaths: omitted, budget,
     ttlDays: config.logs.retention_days, credentials: config.credentials,
     checkOutput: checkResults.map(r => r.output).join('\n'), logText,
@@ -154,7 +167,7 @@ export function verify(input) {
     // green verify — including the very first one, and including every repeat. A separate
     // "first success" state would only mean "the log file did not exist yet".
     return {
-      code: VERIFY_CODES.pass, profile: profile.id, adapter: adapterResult.source, outcome: 'no_change',
+      code: VERIFY_CODES.pass, profile: profile.id, adapter: adapterSource, outcome: 'no_change',
       record: buildLogRecord({ ...base, outcome: 'no_change', ruleId: null, reasonCode: 'no_change', patchRefs: [] }),
     };
   }
@@ -165,7 +178,7 @@ export function verify(input) {
     const engineRuleId = input.allowFix === false ? 'cap_exhausted' : 'unsupported_by_profile';
     const message = fixerRegistered ? reason : `profile "${profile.id}" has no fixer for this repository (autofix_callable=${callableRel || 'null'}); ${reason}`;
     return {
-      code: VERIFY_CODES.needs_human, profile: profile.id, adapter: adapterResult.source, outcome: 'needs_human',
+      code: VERIFY_CODES.needs_human, profile: profile.id, adapter: adapterSource, outcome: 'needs_human',
       record: buildLogRecord({
         // `rule_id` names the rule that FIRED (the check's own rule when it named one);
         // `reason_code` names why the pipeline stopped here. They were the same field before,
@@ -182,7 +195,7 @@ export function verify(input) {
 
   if (attempt > config.fix_cap) {
     return {
-      code: VERIFY_CODES.needs_human, profile: profile.id, adapter: adapterResult.source, outcome: 'needs_human',
+      code: VERIFY_CODES.needs_human, profile: profile.id, adapter: adapterSource, outcome: 'needs_human',
       record: buildLogRecord({
         ...base, outcome: 'needs_human', ruleId: checkRuleId || 'cap_exhausted', reasonCode: 'cap_exhausted', patchRefs: [],
         extra: { stopped_because: 'cap_exhausted' },
@@ -208,7 +221,7 @@ export function verify(input) {
 
   if (!stillBad) {
     return {
-      code: VERIFY_CODES.pass, profile: profile.id, adapter: adapterResult.source, outcome: 'passed',
+      code: VERIFY_CODES.pass, profile: profile.id, adapter: adapterSource, outcome: 'passed',
       record: buildLogRecord({
         ...base, logText: combinedLog, budget: finalBudget,
         outcome: 'passed', ruleId: null, reasonCode: 'passed', patchRefs,
@@ -216,7 +229,7 @@ export function verify(input) {
     };
   }
   return {
-    code: VERIFY_CODES.failed, profile: profile.id, adapter: adapterResult.source, outcome: 'failed',
+    code: VERIFY_CODES.failed, profile: profile.id, adapter: adapterSource, outcome: 'failed',
     record: buildLogRecord({
       ...base, logText: combinedLog, budget: finalBudget,
       outcome: 'failed',

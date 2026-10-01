@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "tool": {
+    "name": "pr-autofix"
+  },
+  "generated_by": "devbaseline payload-manifest",
+  "entries": [
+    {
+      "path": "contracts/devbaseline-adapter.schema.json",
+      "sha256": "18e2efa26c32a2cbc6aaee6a0ebdcf9e51d9d711943118ad956b356671ac6de5",
+      "bytes": 2264
+    },
+    {
+      "path": "contracts/devbaseline-profile.schema.json",
+      "sha256": "acf6e6d38fcbe28e0c416bf86c7252a1f8cf9adbb45621b8058a1611ed68b816",
+      "bytes": 2936
+    },
+    {
+      "path": "profiles/docs.json",
+      "sha256": "67fced0452001285a77911ef269b48c38bb617790c7418acce0f8425ded4e1e4",
+      "bytes": 1034
+    },
+    {
+      "path": "profiles/minimal.json",
+      "sha256": "c8b03a95eaa10e117d97a20638982ebbf03fcfacc884faad2bae36f0aa8fb650",
+      "bytes": 1009
+    },
+    {
+      "path": "profiles/mixed.json",
+      "sha256": "38eb83115646e6696600778a9bf479b3258646caee4454e52b099a176e5e410b",
+      "bytes": 1199
+    },
+    {
+      "path": "profiles/node.json",
+      "sha256": "bebe8aa7890235cf132b0fa9f6e3c69e3feaccabb9bd3e764eedf7e339f9bed4",
+      "bytes": 1032
+    },
+    {
+      "path": "profiles/python.json",
+      "sha256": "ad6b86bea5196b701a1de0001dca62bdd4523c7d9d5bd836fbfca68c29bf0a3a",
+      "bytes": 1014
+    },
+    {
+      "path": "scripts/devbaseline.mjs",
+      "sha256": "0c4769d8133c1562c7deecf179303299c835a3a49e51fd8810b72e887bd33831",
+      "bytes": 19647
+    },
+    {
+      "path": "scripts/lib/devbaseline/adapter.mjs",
+      "sha256": "b5eaa598c253eeed5bfa8626e605ee6be4641ccbce68b910ea664a898437f32a",
+      "bytes": 4764
+    },
+    {
+      "path": "scripts/lib/devbaseline/check-docs.mjs",
+      "sha256": "b67d7bea27ab15f6f7637e10d15f425692a5bd7cd694700d6898699801b29663",
+      "bytes": 3348
+    },
+    {
+      "path": "scripts/lib/devbaseline/cleanup.mjs",
+      "sha256": "02f1a3429e6e163adb31aed3b488b395a719a09d1de3980d6b41d6cd8e32dc32",
+      "bytes": 3530
+    },
+    {
+      "path": "scripts/lib/devbaseline/construction-tasks.mjs",
+      "sha256": "786cf18117336007f5919b429ede11fd0cd92b92acceea93a4600adb4d01a7e4",
+      "bytes": 4312
+    },
+    {
+      "path": "scripts/lib/devbaseline/context.mjs",
+      "sha256": "0847052c0069c4a3d3f0560e1e92aa6260cc2d869ff16fe5c1ed36ba4f0c8870",
+      "bytes": 3048
+    },
+    {
+      "path": "scripts/lib/devbaseline/gate.mjs",
+      "sha256": "a9f0709856af3a7beae82c3d996cf6b8f41be7f6c67c0bd35d892d04d42ae0ba",
+      "bytes": 5930
+    },
+    {
+      "path": "scripts/lib/devbaseline/inventory.mjs",
+      "sha256": "db6236b2621635cf4f0ee12fc46c34fd2d744590fe9f99828c579064eb02fc86",
+      "bytes": 10989
+    },
+    {
+      "path": "scripts/lib/devbaseline/log.mjs",
+      "sha256": "b3b0c42834d19aff2604a846f33a793a03118e84c98060420a7728f10009e420",
+      "bytes": 6734
+    },
+    {
+      "path": "scripts/lib/devbaseline/payload.mjs",
+      "sha256": "2a35dee46d0e6362e6f20a3610b792f697206b3a26dca6d08a683e0b73d25671",
+      "bytes": 5509
+    },
+    {
+      "path": "scripts/lib/devbaseline/profile.mjs",
+      "sha256": "9e8d0e1d195878102a445a08b2139275864470978782a8fdfbf0814e7c5c27d8",
+      "bytes": 7333
+    },
+    {
+      "path": "scripts/lib/devbaseline/resolve.mjs",
+      "sha256": "a4748bfc1b2d06b30401439cbceb80cf7b590b6e72d683c0247cd927b5980145",
+      "bytes": 3143
+    },
+    {
+      "path": "scripts/lib/devbaseline/run.mjs",
+      "sha256": "930376ca0b053193cf36fd18606937376928dff1c4f99f35d0c19fe0ef75dca6",
+      "bytes": 13061
+    },
+    {
+      "path": "scripts/lib/devbaseline/schema.mjs",
+      "sha256": "b1d6c0d074b5ddd2e6d0dabc0d15559188096bf971567015142f1c253c172706",
+      "bytes": 3434
+    },
+    {
+      "path": "scripts/lib/devbaseline/secrets.mjs",
+      "sha256": "d987adfb66b86203f755c0533fdb65c47e26684ffbedfcbb98d530379345ac7f",
+      "bytes": 2684
+    },
+    {
+      "path": "scripts/lib/devbaseline/source.mjs",
+      "sha256": "fdecbc782496e574a4ff2ee4f82da8293e905188ed6c6a9a5038d68de5fa69f9",
+      "bytes": 4556
+    }
+  ]
+}

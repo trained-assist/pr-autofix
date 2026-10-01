@@ -45,9 +45,17 @@ jobs:
         with:
           node-version: '22'
 
-      # The script comes from the pinned ref this workflow was called at, never from main.
-      # Same mechanism autofix-callable.yml uses, so a caller cannot drift onto a moving branch.
-      - name: Fetch the pinned devbaseline script
+      # Everything below runs against the PINNED payload, downloaded as a tree from the commit
+      # this workflow was called at — never from main, never as a flat copy.
+      #
+      # Why it is shaped this way (R2): the previous loader kept a hand-written list of ~20 files,
+      # wrote them FLAT via `$(basename "$f")`, and proved them with `node --check`. The CLI
+      # imports ./lib/devbaseline/*.mjs, so the first real run failed with ERR_MODULE_NOT_FOUND
+      # while the check stayed GREEN — `node --check` parses one file and never resolves imports.
+      # Now the composition of the payload is declared in payload.manifest.json, the layout
+      # preserves the tree, both directions are verified (missing AND undeclared), and the payload
+      # is then RUN — `payload-verify` needs the CLI, so a broken payload cannot pass silently.
+      - name: Fetch the pinned devbaseline payload
         env:
           WORKFLOW_REPO: ${{ job.workflow_repository }}
           WORKFLOW_SHA: ${{ job.workflow_sha }}
@@ -56,56 +64,43 @@ jobs:
             echo "Could not resolve the reusable-workflow identity — refusing to fall back to main" >&2
             exit 1
           fi
-          mkdir -p "$RUNNER_TEMP/devbaseline"
           base="https://raw.githubusercontent.com/${WORKFLOW_REPO}/${WORKFLOW_SHA}"
-          for f in scripts/devbaseline.mjs; do
-            curl -fsSL "$base/$f" -o "$RUNNER_TEMP/devbaseline/$(basename "$f")"
-          done
-          # The library modules travel with the CLI; without them the CLI cannot start.
-          curl -fsSL "$base/scripts/lib/devbaseline/profile.mjs"  -o "$RUNNER_TEMP/devbaseline/profile.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/adapter.mjs"  -o "$RUNNER_TEMP/devbaseline/adapter.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/schema.mjs"   -o "$RUNNER_TEMP/devbaseline/schema.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/secrets.mjs"  -o "$RUNNER_TEMP/devbaseline/secrets.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/log.mjs"      -o "$RUNNER_TEMP/devbaseline/log.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/run.mjs"      -o "$RUNNER_TEMP/devbaseline/run.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/context.mjs"  -o "$RUNNER_TEMP/devbaseline/context.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/check-docs.mjs" -o "$RUNNER_TEMP/devbaseline/check-docs.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/inventory.mjs" -o "$RUNNER_TEMP/devbaseline/inventory.mjs"
-          curl -fsSL "$base/scripts/lib/devbaseline/construction-tasks.mjs" -o "$RUNNER_TEMP/devbaseline/construction-tasks.mjs"
-          curl -fsSL "$base/contracts/devbaseline-profile.schema.json" -o "$RUNNER_TEMP/devbaseline/profile.schema.json"
-          curl -fsSL "$base/contracts/devbaseline-adapter.schema.json" -o "$RUNNER_TEMP/devbaseline/adapter.schema.json"
-          mkdir -p "$RUNNER_TEMP/devbaseline/profiles"
-          for p in docs node python mixed minimal; do
-            curl -fsSL "$base/profiles/$p.json" -o "$RUNNER_TEMP/devbaseline/profiles/$p.json"
-          done
-          node --check "$RUNNER_TEMP/devbaseline/devbaseline.mjs"
+          printf '%s' "$base" > "$RUNNER_TEMP/payload-base.txt"
+          curl -fsSL "$base/payload.manifest.json" -o "$RUNNER_TEMP/payload.manifest.json"
+          # fetch-payload.mjs is the one file that must exist before the manifest can be honoured.
+          curl -fsSL "$base/scripts/fetch-payload.mjs" -o "$RUNNER_TEMP/fetch-payload.mjs"
+          # --run payload-verify: proves completeness AND executes the CLI from the tree.
+          node "$RUNNER_TEMP/fetch-payload.mjs" \
+            --manifest "$RUNNER_TEMP/payload.manifest.json" \
+            --from-file "$RUNNER_TEMP/payload-base.txt" \
+            --dest "$RUNNER_TEMP/devbaseline" \
+            --run payload-verify --manifest "$RUNNER_TEMP/payload.manifest.json" --dir "$RUNNER_TEMP/devbaseline"
 
       - name: Which baseline does this repository have?
         id: shape
         run: |
-          node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" validate --repo . --all-profiles | tee "$RUNNER_TEMP/shape.txt"
+          node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" validate --repo . --all-profiles | tee "$RUNNER_TEMP/shape.txt"
           echo "profile_line=$(grep -m1 'profile ' "$RUNNER_TEMP/shape.txt" || echo unknown)" >> "$GITHUB_OUTPUT"
 
       - name: Adapter is valid
         if: inputs.profile == ''
-        run: node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" validate --repo .
+        run: node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" validate --repo .
 
       - name: Documentation check
-        run: node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" check-docs --dir .
+        run: node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" check-docs --dir .
 
-      - name: Verify — check, fix if registered, verify again
+      # The gate, as ONE line and ONE owner (R3). The previous version branched on exit code 2 in
+      # shell and exited 0 — `needs_human` reported as a green required check, so a repository with
+      # no fixer (or an exhausted fix.cap) merged while nobody was fixing it. The colour mapping now
+      # lives in scripts/lib/devbaseline/gate.mjs, which also EXECUTES the adapter's
+      # staging.command — declared in the schema, returned by effectiveConfig, and previously run
+      # nowhere. needs_human still keeps its own outcome/reason_code in the log record.
+      - name: Gate — verify, plus the staging command this repository declares
         timeout-minutes: ${{ fromJSON(inputs.check_timeout_minutes) }}
         run: |
-          args=(verify --repo . --log devbaseline-verify.json)
+          args=(gate --repo . --log devbaseline-verify.json)
           [ -n "${{ inputs.profile }}" ] && args+=(--profile "${{ inputs.profile }}")
-          node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" "${args[@]}" && exit 0
-          code=$?
-          # 2 = needs_human: a real gap, but not a broken pipeline. Report it, do not hide it.
-          if [ "$code" = "2" ]; then
-            echo "::warning::devbaseline needs a human (profile has no fixer, or fix.cap is exhausted)"
-            exit 0
-          fi
-          exit "$code"
+          node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" "${args[@]}"
 
       - name: Upload the verify record
         if: always()
@@ -119,7 +114,7 @@ jobs:
       - name: Inventory row for this repository
         if: inputs.mode == 'staging-gate'
         run: |
-          node "$RUNNER_TEMP/devbaseline/devbaseline.mjs" inventory \
+          node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" inventory \
             --out devbaseline-inventory \
             --repos <(printf '[{"repo":"%s","type_hint":null,"ci_required":null,"path":"."}]\n' "$GITHUB_REPOSITORY")
           cat devbaseline-inventory/repo-coverage.md >> "$GITHUB_STEP_SUMMARY"

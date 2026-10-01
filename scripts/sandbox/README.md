@@ -61,6 +61,18 @@ AC-44, `rule_id` из фиксированного словаря, `no_change` �
 достоверность: идеально сфабрикованная запись форму проходит. Достоверность лога ловится
 семантическими проверками S1/S4/S6 (это и показал пробник «лжец»).
 
+## R6 — регрессия receipt'а (красный тест до фикса)
+
+```sh
+node scripts/sandbox/repro-r6-receipt.mjs          # exit 1 = дефект воспроизведён
+```
+
+Исполняемый путь failed→fix→verify→receipt с **stub-провайдером** (локальный llm-ladder
+HTTP-сервер) и **mock GitHub** (`gh`-заглушка на PATH). Проверяет, что `ci-fixer-stats.json`
+(AC-44) несёт фактические данные. На неисправленном коде красный: `patch_refs: []`,
+`included_paths: []`, `budget.diff_tokens_used: 0`, `tool.commit` = env, а не реальный SHA.
+Зелёным становится после wiring'а meta в production call sites (pr-autofix#35).
+
 ## Связанные документы
 
 * Сценарий: `docs/user-scenarios/onboarding/z01-inventory-dev-baseline.md` (шаги S1–S8)

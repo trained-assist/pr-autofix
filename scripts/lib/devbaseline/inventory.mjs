@@ -18,7 +18,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseAdapterText, effectiveConfig } from './adapter.mjs';
-import { resolveProfile, profileHasBuild, listProfileIds } from './profile.mjs';
+import { profileHasBuild, listProfileIds } from './profile.mjs';
+import { resolveRepo } from './resolve.mjs';
 import { toolVersion } from './log.mjs';
 import { findSecretValues } from './secrets.mjs';
 import { localSource, liveSource, workflowFiles } from './source.mjs';
@@ -87,8 +88,10 @@ export async function scanSource(entry, source, profileRef = toolVersion()) {
     row.notes = [`${adapterResult.rule_id}: ${adapterResult.message}`];
     return row;
   }
-
-  const prof = resolveProfile({ exists: source.has, typeHint: entry.type_hint || null, adapterProfile: adapterResult.adapter?.profile || null });
+  // One seam with validate/verify (R5). The adapter is read through the SOURCE (local path or the
+  // GitHub API), so what was read is passed in rather than re-read from disk — two reads would be
+  // two answers to "what did this repository pin".
+  const prof = resolveRepo({ repoDir: '.', exists: source.has, typeHint: entry.type_hint || null, adapter: adapterResult });
   if (!prof.ok) {
     const row = EMPTY(repo, owner);
     row.notes = [`${prof.rule_id}: ${prof.message}`];

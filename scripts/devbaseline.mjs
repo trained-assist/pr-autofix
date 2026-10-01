@@ -13,6 +13,9 @@
 //   check-docs     --dir <d>                                          0 ok · 1 violations
 //   check-workflows --dir <d>                                         0 ok · 1 violations
 //   run-derived-check --dir <d>                                       0 ok · 1 failed
+//   payload-manifest [--out <f>] [--check]                            0 written/current · 1 stale
+//   payload-verify   [--manifest <f>] [--dir <d>]                     0 complete · 1 incomplete
+//   gate           --repo <d> [--profile id] [--log f]                0 gate green · 1 gate red
 //
 // run-derived-check is referenced BY the profiles (check.commands) — it is the derivation step
 // that turns a package.json / pyproject.toml into an actual command, kept as a subcommand so a
@@ -23,15 +26,18 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 import {
-  TOOL_ROOT, listProfileIds, loadProfile, validateAllProfiles, resolveProfile, expandCommand,
+  TOOL_ROOT, listProfileIds, loadProfile, validateAllProfiles, expandCommand,
 } from './lib/devbaseline/profile.mjs';
 import { loadAdapter } from './lib/devbaseline/adapter.mjs';
+import { resolveRepo } from './lib/devbaseline/resolve.mjs';
 import { verify, VERIFY_CODES, writeLogRecord } from './lib/devbaseline/run.mjs';
 import { inspectContext } from './lib/devbaseline/context.mjs';
 import { buildCoverage, renderCoverageMd, COVERAGE_COLUMNS, assertNoSecretValues } from './lib/devbaseline/inventory.mjs';
 import { buildConstructionTasks, renderConstructionTasksMd } from './lib/devbaseline/construction-tasks.mjs';
 import { checkDocs, formatViolations } from './lib/devbaseline/check-docs.mjs';
 import { toolVersion, TOOL_NAME } from './lib/devbaseline/log.mjs';
+import { cmdGate } from './lib/devbaseline/gate.mjs';
+import { renderManifest, verifyManifest, readManifest, MANIFEST_FILENAME } from './lib/devbaseline/payload.mjs';
 
 const DEFAULT_REPOS_FILE = path.join(TOOL_ROOT, 'inventory', 'repos.json');
 
@@ -82,7 +88,9 @@ function cmdValidate(flags) {
 
   if (flags.repo) {
     const dir = path.resolve(String(flags.repo));
-    const prof = resolveProfile({ repoDir: dir });
+    // Same seam as verify/inventory (R5): `validate` used to pass only `repoDir`, so a
+    // repository pinning a profile was reported here as the DERIVED one.
+    const prof = resolveRepo({ repoDir: dir });
     if (!prof.ok) { out(`${prof.rule_id}: ${prof.message}`); return 3; }
     out(`repo ${dir}: profile ${prof.profile.id} (${prof.source}: ${prof.derivation})`);
     if (prof.profile.check.build) out(`  note: this profile runs a build (${prof.profile.check.build.join(', ')})`);
@@ -185,6 +193,21 @@ function cmdCheckWorkflows(flags) {
     // A file named *-callable.yml that cannot be called is the exact regression R26 describes:
     // an installer points at it, the consumer's `uses:` silently fails to compose.
     if (!/workflow_call\s*:/.test(text)) violations.push(`${f}: named as callable but does not declare \`on: workflow_call\``);
+    // A delivery boundary that can drift is not a boundary. R2: templates/batch-fix-prs.yml
+    // fetched the tool from `main` — the exact invariant autofix-callable.yml refuses to break —
+    // so a caller pinned a commit and executed whatever the branch held. Rule, not a one-off fix:
+    // the same mistake in the next template must fail here too.
+    if (/raw\.githubusercontent\.com\/[^\s"']+\/(main|master)\//.test(text)) {
+      violations.push(`${f}: downloads the tool from a moving branch (main/master) — pin a commit SHA`);
+    }
+    // Fail-open around a NETWORK or DESTRUCTIVE call (R4 class, §5.4). `gh … 2>/dev/null || echo
+    // NOT_FOUND` and `… || true` make "I could not ask GitHub" indistinguishable from "the thing
+    // does not exist" — and the step then reports success having done nothing. Scoped to `gh` and
+    // `curl` deliberately: a `grep` that finds no marker IS "no marker", and flagging that would
+    // be a rule nobody could satisfy.
+    for (const m of text.matchAll(/^.*\b(?:gh|curl)\b[^\n]*\|\|\s*(?:true|echo\b[^\n]*).*$/gm)) {
+      violations.push(`${f}: swallows a gh/curl failure with \`||\` — an unreachable API must not read as "nothing to do": ${m[0].trim().slice(0, 120)}`);
+    }
   }
   out(`check-workflows: ${files.length} workflow file(s) in ${path.relative(process.cwd(), dir) || '.'} · ${violations.length} violation(s)`);
   if (violations.length) violations.forEach(v => out(`  · ${v}`));
@@ -224,6 +247,54 @@ function cmdRunDerivedCheck(flags) {
   return r.status === null ? 1 : r.status;
 }
 
+// ── payload-manifest / payload-verify ──────────────────────────────────────────
+// The delivery boundary as a checked artifact (R2). `--check` is the CI mode: verify only, never
+// write, so CI cannot "fix" a stale manifest by regenerating it and going green.
+function cmdPayloadManifest(flags) {
+  const file = path.resolve(String(flags.out || path.join(TOOL_ROOT, MANIFEST_FILENAME)));
+  const rendered = renderManifest({
+    repoDir: TOOL_ROOT,
+    toolSha: flags.sha ? String(flags.sha) : process.env.DEVBASELINE_TOOL_SHA || null,
+    toolRef: flags.ref ? String(flags.ref) : process.env.DEVBASELINE_TOOL_REF || null,
+  });
+  if (flags.check) {
+    const onDisk = readManifest(file);
+    if (!onDisk.ok) { out(`payload-manifest: ${onDisk.message}`); return 1; }
+    const v = verifyManifest(onDisk.manifest, TOOL_ROOT);
+    if (!v.ok) {
+      out(`payload-manifest: STALE — ${file}`);
+      for (const p of v.missing) out(`  · missing: ${p}`);
+      for (const p of v.hash_mismatch) out(`  · changed since the manifest was written: ${p}`);
+      for (const p of v.undeclared) out(`  · in the tree but NOT declared: ${p}`);
+      if (v.reason) out(`  · ${v.reason}`);
+      out('  → regenerate: node scripts/devbaseline.mjs payload-manifest --out ' + file);
+      return 1;
+    }
+    out(`payload-manifest: current — ${onDisk.manifest.entries.length} entries, hashes match the tree`);
+    return 0;
+  }
+  fs.writeFileSync(file, `${JSON.stringify(rendered, null, 2)}\n`);
+  out(`payload-manifest: ${rendered.entries.length} entries → ${path.relative(process.cwd(), file) || file}`);
+  return 0;
+}
+
+function cmdPayloadVerify(flags) {
+  const file = path.resolve(String(flags.manifest || path.join(TOOL_ROOT, MANIFEST_FILENAME)));
+  const dir = path.resolve(String(flags.dir || TOOL_ROOT));
+  const m = readManifest(file);
+  if (!m.ok) { out(`payload-verify: ${m.message}`); return 1; }
+  const v = verifyManifest(m.manifest, dir);
+  out(`payload-verify: ${m.manifest.entries.length} declared · ${v.ok ? 'complete and matching' : 'INCOMPLETE'}`);
+  if (!v.ok) {
+    for (const p of v.missing) out(`  · missing: ${p}`);
+    for (const p of v.hash_mismatch) out(`  · hash mismatch: ${p}`);
+    for (const p of v.undeclared) out(`  · undeclared in tree: ${p}`);
+    if (v.reason) out(`  · ${v.reason}`);
+    return 1;
+  }
+  return 0;
+}
+
 // ── dispatch ───────────────────────────────────────────────────────────────────
 const HELP = `devbaseline — inventory and a common development baseline for participating repositories.
 
@@ -234,6 +305,9 @@ const HELP = `devbaseline — inventory and a common development baseline for pa
   check-docs       --dir <d>
   check-workflows  --dir <d>
   run-derived-check --dir <d>
+  payload-manifest [--out <f>] [--check] [--sha <s>] [--ref <r>]
+  payload-verify   [--manifest <f>] [--dir <d>]
+  gate             --repo <d> [--profile <id>] [--log <f>]
 
 Profiles live in profiles/ (single source of truth). A repository stores only a thin
 .devbaseline.json adapter pinning what cannot be derived: check command, staging command,
@@ -252,6 +326,9 @@ async function main() {
     case 'check-docs': return cmdCheckDocs(flags);
     case 'check-workflows': return cmdCheckWorkflows(flags);
     case 'run-derived-check': return cmdRunDerivedCheck(flags);
+    case 'payload-manifest': return cmdPayloadManifest(flags);
+    case 'payload-verify': return cmdPayloadVerify(flags);
+    case 'gate': return cmdGate(flags);
     default:
       out(`unknown command "${command}"${positional.length ? ` (args: ${positional.join(' ')})` : ''}`);
       out(HELP);

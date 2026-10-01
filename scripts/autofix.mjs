@@ -290,6 +290,14 @@ function writeStats(category, extra = {}) {
   const violations = extra.gate_violations || [];
   const firstRule = extra.rule_id || violations[0]?.rule_id || null;
   const toolRef = (process.env.AUTOFIX_WORKFLOW_REF || '').split('@').pop() || 'unpinned:local';
+  // A "commit" that is not a 40-hex SHA is not a commit. AUTOFIX_WORKFLOW_SHA was recorded
+  // verbatim, so an absent or non-SHA env value landed in the receipt as a plausible-looking
+  // commit field (R6). The shape is checked; an invalid value degrades to `unpinned:local` and
+  // says so, instead of asserting a provenance that does not exist.
+  const declaredCommit = extra.tool_commit || process.env.AUTOFIX_WORKFLOW_SHA || process.env.AUTOFIX_TOOL_COMMIT || '';
+  const commitIsSha = /^[0-9a-f]{40}$/.test(String(declaredCommit));
+  const toolCommit = commitIsSha ? declaredCommit : 'unpinned:local';
+  const patchRefs = extra.patch_refs ?? [];
   const stats = {
     ts: new Date().toISOString(),
     repo: REPO || '',
@@ -303,10 +311,14 @@ function writeStats(category, extra = {}) {
     tool: {
       name: 'pr-autofix',
       version: process.env.AUTOFIX_TOOL_VERSION || toolRef,
-      commit: process.env.AUTOFIX_WORKFLOW_SHA || process.env.AUTOFIX_TOOL_COMMIT || 'unpinned:local',
+      commit: toolCommit,
     },
     attempt_count: extra.attempt_count ?? 1,
-    patch_refs: extra.patch_refs ?? [],
+    patch_refs: patchRefs,
+    // Why patch_refs is what it is. Acceptance asks for a no-change repeat to carry NO patch —
+    // but "nothing needed changing" and "the writer never filled this in" are different facts,
+    // and an empty array cannot tell them apart. `applied` | `none_required` | `not_attempted`.
+    patch_refs_source: extra.patch_refs_source || (patchRefs.length ? 'applied' : 'not_attempted'),
     included_paths: extra.included_paths ?? [],
     omitted_paths: extra.omitted_paths ?? [],
     budget: extra.budget || {
@@ -1427,10 +1439,20 @@ if (failedLog) log('input', `CI log compressed: ~${rawLogTokens} → ~${estToken
 // version every prompt sees (issue #7 — no more blind 10k-char slice).
 let prDiffRaw = '';
 let prDiff = '';
+// The AC-44 receipt is filled HERE, on the wire, not declared at the writer (R6). `compressDiff`
+// already computes what entered the prompt, what was omitted and the tokens spent — it fills
+// `meta` in place — but the production call sites passed no meta, so ci-fixer-stats.json reported
+// patch_refs=[], included_paths=[] and budget.diff_tokens_used=0 while the run had in fact done all
+// of that work. The selftest fed the function a hand-written object instead, so the test asserted
+// the writer's contract, never the artifact's.
+const receiptMeta = { included_paths: [], omitted_paths: [], tokens_used: 0 };
+let logTokensUsed = 0;
+let fixAttempts = 1; // edit attempts actually spent; the agent path spends exactly one
 try {
   sh(`git fetch origin ${BASE_BRANCH} --quiet`);
   prDiffRaw = sh(`git diff origin/${BASE_BRANCH}...HEAD`);
-  prDiff = compressDiff(prDiffRaw, DIFF_TOKEN_BUDGET, failedLog);
+  prDiff = compressDiff(prDiffRaw, DIFF_TOKEN_BUDGET, failedLog, receiptMeta);
+  logTokensUsed = estTokens(failedLog);
   log('input', `diff compressed: ~${estTokens(prDiffRaw)} → ~${estTokens(prDiff)} tokens`);
 } catch { /* best effort */ }
 
@@ -1770,6 +1792,8 @@ Rules:
   let stage3Content, applied = null;
   const messages3 = [{ role: 'system', content: stage3System }, { role: 'user', content: stage3User }];
   for (let attempt = 1; attempt <= 2 && !applied; attempt++) {
+    // How many edit attempts this run actually spent — the receipt states it rather than always 1.
+    fixAttempts = attempt;
     try {
       stage3Content = await callModel(STAGE3_MODEL, messages3, false, { reasoning: true });
     } catch (e) {
@@ -1897,13 +1921,20 @@ if (!preStageDiagnosis) {
 }
 // Pre-stage A (conflict resolution or clean merge) may have already committed.
 // Skip the commit if nothing is staged — avoids "nothing to commit" crash.
-if (sh('git status --porcelain').trim()) {
+const fixStagedSomething = Boolean(sh('git status --porcelain').trim());
+if (fixStagedSomething) {
   sh(`git -c core.hooksPath=/dev/null commit --no-verify -m "fix: auto-fix CI failure [autofix]
 
 Diagnosis: ${diagnosis.problem.slice(0, 120).replace(/"/g, "'")}
 Strategy: ${fixStrategy}"
 `);
 }
+// What the FIX commit actually contains, read from git rather than from the model's word —
+// the same determinism the diff gate uses.
+const fixCommitSha = sh('git rev-parse HEAD').trim();
+const fixPaths = sh(`git show --name-only --format= ${fixCommitSha}`).split('\n').map(s => s.trim()).filter(Boolean);
+log('gate', `fix commit ${fixCommitSha.slice(0, 8)}: ${fixPaths.length} path(s)`);
+
 sh(`git checkout -b ${fixBranch}`);
 sh(`git -c core.hooksPath=/dev/null push --no-verify origin ${fixBranch}`);
 
@@ -1986,6 +2017,25 @@ writeStats(preStageDiagnosis ? preStageDiagnosis.category : diagnosis.agent ? 's
   fix_branch: fixBranch,
   fix_pr: newPRNumber,
   strategy: fixStrategy,
+  // ── AC-44, filled from the run itself (R6) ──
+  // tool.commit is the FIX commit, not AUTOFIX_WORKFLOW_SHA: the former is what this run
+  // produced, the latter is which build of the tool ran — and an env value that happens to be
+  // absent was being recorded as a commit. writeStats validates the 40-hex shape below.
+  tool_commit: fixCommitSha,
+  attempt_count: Number(process.env.AUTOFIX_ATTEMPT) || fixAttempts,
+  // A run that committed nothing gets NO patch ref — and says why (`none_required`), so a repeat
+  // that changed nothing is distinguishable from a writer that filled nothing in. Recording the
+  // pre-existing HEAD as a "fix commit" would be a fabricated provenance.
+  patch_refs: fixStagedSomething ? [`commit:${fixCommitSha}`] : [],
+  patch_refs_source: fixStagedSomething ? 'applied' : 'none_required',
+  included_paths: fixStagedSomething ? fixPaths : [],
+  omitted_paths: receiptMeta.omitted_paths || [],
+  prompt_included_paths: receiptMeta.included_paths || [],
+  budget: {
+    diff_tokens: DIFF_TOKEN_BUDGET, diff_tokens_used: receiptMeta.tokens_used || 0,
+    log_tokens: LOG_TOKEN_BUDGET, log_tokens_used: logTokensUsed,
+    max_files: GATE_MAX_FILES, max_lines: GATE_MAX_LINES,
+  },
 });
 
 console.log(`[autofix] fix PR #${newPRNumber} created (strategy: ${fixStrategy})`);
