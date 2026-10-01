@@ -36,6 +36,7 @@ import { buildCoverage, renderCoverageMd, COVERAGE_COLUMNS, assertNoSecretValues
 import { buildConstructionTasks, renderConstructionTasksMd } from './lib/devbaseline/construction-tasks.mjs';
 import { checkDocs, formatViolations } from './lib/devbaseline/check-docs.mjs';
 import { toolVersion, TOOL_NAME } from './lib/devbaseline/log.mjs';
+import { cmdGate } from './lib/devbaseline/gate.mjs';
 import { renderManifest, verifyManifest, readManifest, MANIFEST_FILENAME } from './lib/devbaseline/payload.mjs';
 
 const DEFAULT_REPOS_FILE = path.join(TOOL_ROOT, 'inventory', 'repos.json');
@@ -312,7 +313,7 @@ async function main() {
     case 'run-derived-check': return cmdRunDerivedCheck(flags);
     case 'payload-manifest': return cmdPayloadManifest(flags);
     case 'payload-verify': return cmdPayloadVerify(flags);
-    case 'gate': return (await import('./lib/devbaseline/gate.mjs')).cmdGate(flags);
+    case 'gate': return cmdGate(flags);
     default:
       out(`unknown command "${command}"${positional.length ? ` (args: ${positional.join(' ')})` : ''}`);
       out(HELP);
