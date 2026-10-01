@@ -287,11 +287,21 @@ check('the plan touches only this PR\'s own fix branch',
 check('main is refused, never deleted', /REFUSED\s+main/.test(a.stdout),
   a.stdout.trim().split('\n').filter(l => /main/.test(l)).join(' | ').slice(0, 200));
 
-// Scenario B — an unusable scope must refuse everything and fail loudly.
+// Scenario B — an unusable scope must refuse everything AND fail loudly.
+// The check is three-part on purpose: `exit !== 0` alone was satisfiable by ANY crash of the
+// step (the unbound-variable defect made it "pass" for the wrong reason), and "nothing was
+// deleted" alone is also true of a step that died before it could act. What must hold is: the job
+// failed, it said why in those words, and no branch was scheduled for deletion.
 const b = await runJob({ inputs: { ...IN_A, pr_number: '' }, secrets: SEC, ghMode: 'ok' });
+const bSaid = `${b.stdout}\n${b.stderr}`;
 check('an unusable pr scope fails the job instead of widening to every branch',
-  b.code !== 0 && !/would-delete\s+pr-autofix-fix\/(11|22)/.test(b.stdout),
-  `exit ${b.code}; ${b.stdout.trim().split('\n').filter(l => /would-delete/.test(l)).join(' | ')}`);
+  b.code !== 0
+  && /pr_number scope was not usable/.test(bSaid)
+  && !/would-delete\s+pr-autofix-fix\/(11|22)/.test(b.stdout),
+  `exit ${b.code}; refused-marker=${/pr_number scope was not usable/.test(bSaid)}; would-delete=${b.stdout.match(/would-delete\s*\S+/g)?.join(' ') || '—'}`);
+check('every branch is REFUSED, not merely left undeleted (the reason is visible in the plan)',
+  /REFUSED\s+pr-autofix-fix\/11-a/.test(b.stdout) && /REFUSED\s+pr-autofix-fix\/22-b/.test(b.stdout),
+  b.stdout.trim().split('\n').filter(l => /REFUSED/.test(l)).join(' | ') || 'no REFUSED line');
 
 // Scenario C — the API is down: this is a failure, never "nothing to delete".
 const c = await runJob({ inputs: IN_A, secrets: SEC, ghMode: 'api-down' });
