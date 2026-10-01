@@ -36,7 +36,7 @@ export function buildConstructionTasks(rows) {
         ['AC-20', 'AC-21']);
     }
     if (r.fix && r.fix.supported && r.fix.fixer_present === false) {
-      add(r.repo, 'fix_missing', 'fix_upgrade', 'fix_unverified', `${r.repo}: AutoFix callable is declared but not installed`,
+      add(r.repo, 'fix_missing', `${r.repo}: AutoFix callable is declared but not installed`,
         `Install ${r.fix.autofix_callable}@${r.autofix_ref || 'the pinned ref'} via the setup procedure (setup → run → evidence → teardown).`,
         ['AC-21', 'AC-44']);
     }

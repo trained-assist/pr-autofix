@@ -111,7 +111,7 @@ export async function scanSource(entry, source, profileRef = toolVersion()) {
   const profile = prof.profile;
   const config = effectiveConfig({ profile, adapter: adapterResult.adapter });
   const callableRel = config.fix_autofix_callable;
-  const fixInstallation = await resolveFixInstallation(source, callableRel, config.fix_ref || (callableRel ? profileRef : null));
+  const fixInstallation = await resolveFixInstallation(source, callableRel, config.fix_ref || (callableRel ? (/^(v\d+\.\d+\.\d+|[0-9a-f]{40})$/.test(profileRef) ? profileRef : 'v1.7.4') : null));
   const entrypointsPresent = config.context_entrypoints.filter(e => source.has(e));
   const wfFiles = workflowFiles(source);
 

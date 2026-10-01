@@ -62,8 +62,8 @@
     },
     {
       "path": "scripts/lib/devbaseline/construction-tasks.mjs",
-      "sha256": "20252fcdf087d92f4c969c8af0d9326d93cab3400af3a6b97ef1c5e91e208f31",
-      "bytes": 5587
+      "sha256": "55e0392a4309fbb71cdaa632a536431f79502779adfdd75e0785931dfdc7e17e",
+      "bytes": 5554
     },
     {
       "path": "scripts/lib/devbaseline/context.mjs",
@@ -77,8 +77,8 @@
     },
     {
       "path": "scripts/lib/devbaseline/inventory.mjs",
-      "sha256": "e869aa689eeb02f749d6060c274cc3e909c7b1427790ab7fa3fc4ae9390f4caf",
-      "bytes": 13801
+      "sha256": "91c3e8d96a568ad3f4b5a0d9a10f4d7e5b22230728110f7ae66bae444512c86b",
+      "bytes": 13867
     },
     {
       "path": "scripts/lib/devbaseline/log.mjs",
