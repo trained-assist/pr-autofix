@@ -1,11 +1,11 @@
-// Construction tasks: the `missing`/`unreadable` rows of the coverage table, turned into work.
+// Construction tasks: the `missing`/`no_access` rows of the coverage table, turned into work.
 //
 // Dry-run is the DEFAULT and `--apply` is the exception (R6): creating issues in repositories
 // owned by other people is an outward-facing action, and a mistake there is not revertible by
 // reverting a commit here. This module only produces the list; who opens the issues is a
 // separate, explicit step.
 
-export const TASK_KINDS = ['unreadable', 'staging_missing', 'ci_missing', 'fix_missing', 'check_missing', 'context_missing', 'ci_required_unknown'];
+export const TASK_KINDS = ['no_access', 'staging_missing', 'ci_missing', 'fix_missing', 'check_missing', 'context_missing', 'ci_required_unknown'];
 
 /** One task per real gap. Ordering is by repository so two runs produce the same list. */
 export function buildConstructionTasks(rows) {
@@ -13,10 +13,16 @@ export function buildConstructionTasks(rows) {
   const add = (repo, kind, title, detail, refs) => tasks.push({ repo, kind, title, detail, refs });
 
   for (const r of rows) {
-    if (!r.readable) {
-      add(r.repo, 'unreadable', `${r.repo}: unreadable — inventory cannot see this repository`,
+    if (r.read_state === 'no_access') {
+      add(r.repo, 'no_access', `${r.repo}: not visible to the coverage reader`,
         (r.notes || []).join('; ') || 'repository could not be scanned',
         ['AC-40', 'AC-21']);
+      continue;
+    }
+    if (r.read_state === 'empty') {
+      add(r.repo, 'no_access', `${r.repo}: no tree on its default branch — nothing to cover yet`,
+        'A repository with no commit has no workflows, no adapter and no profile. Onboard it after the first push; until then it is a known empty state, not a blind spot.',
+        ['AC-40']);
       continue;
     }
     if (r.type && r.staging_required === true && !r.staging_present) {
