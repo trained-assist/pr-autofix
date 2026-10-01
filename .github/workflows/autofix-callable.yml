@@ -95,29 +95,25 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.gh_token || github.token }}
 
-      - name: Download autofix script
+      # R1 — THE DELIVERY BOUNDARY. This step used to download ONE file
+      # (`curl … /scripts/autofix.mjs -o /tmp/autofix.mjs`) and "prove" it with `node --check`,
+      # a check that parses a single file and never resolves imports. The day autofix.mjs gained
+      # its first relative import, every consumer would have run a script that could not start
+      # behind a green check — exactly the R2 class, one workflow over. The same mechanism as
+      # ci-fix-cleanup.yml / devbaseline-callable.yml now delivers the TREE of the commit this
+      # workflow was called at: every relative import comes with it, so no file list exists to go
+      # stale. The `job` context (not `github`) identifies the workflow that DEFINES this job:
+      # inside a reusable workflow `github.workflow_ref` is the CALLER's workflow, and fetching
+      # from that ref 404s — autofix would never run. persist-credentials: false leaves no token
+      # in the clone; the caller token is still used by the `actions/checkout` step above.
+      - name: Materialize the pinned tool tree
         if: steps.guard.outputs.skip == 'false'
-        env:
-          # Pin the script to THIS reusable workflow's own version, never to a moving
-          # `main`. The `job` context (not `github`) describes the workflow file that
-          # defines this job: inside a reusable workflow `github.workflow_ref` is the
-          # CALLER's workflow (e.g. .../ci.yml@refs/pull/1435/merge), so fetching
-          # `scripts/autofix.mjs` from this repo at that ref 404s and autofix never runs.
-          # job.workflow_repository + job.workflow_sha identify the exact
-          # autofix-callable.yml commit the consumer invoked (e.g. @v1.2).
-          WORKFLOW_REPO: ${{ job.workflow_repository }}
-          WORKFLOW_SHA: ${{ job.workflow_sha }}
-          WORKFLOW_REF: ${{ job.workflow_ref }}
-        run: |
-          if [ -z "$WORKFLOW_REPO" ] || [ -z "$WORKFLOW_SHA" ]; then
-            echo "Could not resolve reusable-workflow identity (repo='$WORKFLOW_REPO' sha='$WORKFLOW_SHA') — refusing to fall back to main" >&2
-            exit 1
-          fi
-          echo "Fetching autofix.mjs from $WORKFLOW_REPO@$WORKFLOW_SHA ($WORKFLOW_REF)"
-          curl -fsSL \
-            "https://raw.githubusercontent.com/${WORKFLOW_REPO}/${WORKFLOW_SHA}/scripts/autofix.mjs" \
-            -o /tmp/autofix.mjs
-          node --check /tmp/autofix.mjs && echo "script syntax OK"
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: pr-autofix
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         if: steps.guard.outputs.skip == 'false'
@@ -159,7 +155,13 @@ jobs:
           # script, and no new entity appears (Z01 design §2.4).
           AUTOFIX_WORKFLOW_REF: ${{ job.workflow_ref }}
           AUTOFIX_WORKFLOW_SHA: ${{ job.workflow_sha }}
-        run: node /tmp/autofix.mjs
+        run: |
+          set -euo pipefail
+          if [ ! -f pr-autofix/scripts/autofix.mjs ]; then
+            echo "::error::the pinned tool tree is not in the workspace — refusing to run autofix"
+            exit 1
+          fi
+          node pr-autofix/scripts/autofix.mjs
 
       - name: Report unfixed failure
         if: steps.guard.outputs.skip == 'false' && steps.autofix.outcome != 'success'

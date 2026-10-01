@@ -82,18 +82,19 @@ jobs:
       # violated exactly the invariant autofix-callable.yml enforces: a caller invoking it by a
       # moving branch would execute whatever main happened to hold. The refusal to fall back is
       # deliberate — a silent fallback to `main` is how a gate stops being a gate.
-      - name: Download the autofix script pinned to this run
-        env:
-          TOOL_SHA: ${{ github.workflow_sha }}
-        run: |
-          if [ -z "$TOOL_SHA" ]; then
-            echo "Could not resolve the workflow commit — refusing to fall back to main" >&2
-            exit 1
-          fi
-          curl -fsSL \
-            "https://raw.githubusercontent.com/trained-assist/pr-autofix/${TOOL_SHA}/scripts/autofix.mjs" \
-            -o "$RUNNER_TEMP/autofix.mjs"
-          node --check "$RUNNER_TEMP/autofix.mjs"
+      #
+      # R1: it downloaded ONE file and "proved" it with `node --check`, which never resolves
+      # imports — the day autofix.mjs gained its first relative import this template would run a
+      # script that cannot start behind a green check. It also downloaded to $RUNNER_TEMP and then
+      # ran `/tmp/autofix.mjs`, two different paths on a GitHub runner. Same mechanism as the
+      # reusable workflows now: the whole pinned tree, so every import comes with it.
+      - name: Materialize the pinned tool tree
+        uses: actions/checkout@v4
+        with:
+          repository: trained-assist/pr-autofix
+          ref: ${{ github.workflow_sha }}
+          path: pr-autofix
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -112,7 +113,13 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ matrix.pr }}
           ORIGINAL_BRANCH: ${{ steps.pr-info.outputs.branch }}
-        run: node /tmp/autofix.mjs
+        run: |
+          set -euo pipefail
+          if [ ! -f pr-autofix/scripts/autofix.mjs ]; then
+            echo "::error::the pinned tool tree is not in the workspace — refusing to run autofix"
+            exit 1
+          fi
+          node pr-autofix/scripts/autofix.mjs
 
       - name: Upload stats
         if: always()

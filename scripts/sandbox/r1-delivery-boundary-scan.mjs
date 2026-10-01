@@ -112,9 +112,12 @@ for (const wf of workflows) {
     // Which repo scripts does this job actually execute, and in which delivery phase?
     const executed = new Map();
     // A workflow addresses a tool script through a shell variable ($GITHUB_ACTION_PATH/…,
-    // ${RUNNER_TEMP}/…, "$GITHUB_WORKSPACE/pr-autofix/scripts/…"); strip ANY variable prefix so the
-    // reference resolves to a real repo path, whatever form the workflow used to reach it.
-    const stripVar = (r) => r.replace(/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\//, '').replace(/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}\//, '');
+    // ${RUNNER_TEMP}/…, "$GITHUB_WORKSPACE/pr-autofix/scripts/…") or a checkout directory
+    // (`pr-autofix/scripts/…`). Anchoring on the `scripts/` segment is what makes both resolve —
+    // stripping only `$VAR/` prefixes silently stopped EXAMINING a workflow the moment a fixed
+    // prefix appeared, which is the same false green this scanner exists to prevent: fewer
+    // scripts looked at, and a clean report.
+    const stripVar = (r) => { const i = r.indexOf('scripts/'); return i === -1 ? r : r.slice(i); };
     for (const s of steps) {
       const run = String(s.run || '');
       for (const m of run.matchAll(/[\w./{}$-]*scripts\/[\w.-]+\.mjs/g)) {
