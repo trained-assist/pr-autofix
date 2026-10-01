@@ -257,6 +257,8 @@ run('git', ['init', '-q', '--bare', ENDPOINT], { cwd: RUN });
 //     содержимое файла. Никакой сети — адрес слушается на 127.0.0.1 и подставляется через
 //     DEVBASELINE_GITHUB_API. Это позволяет проверять ЖИВОЙ код офлайн: тот же scanSource,
 //     тот же liveSource, другой адрес endpoint'а.
+// Репозитории, у которых метаданные читаются, а дерево на ветке по умолчанию отсутствует.
+const EMPTY_REPOS = new Set(['live-empty']);
 const LIVE_REPOS = {
   'live-mixed': LIVE_TREE,
   'live-docs': LIVE_DOCS_TREE,
@@ -269,8 +271,22 @@ const apiServer = http.createServer((req, res) => {
   const m = /^\/repos\/[^/]+\/([^/]+)(?:\/(.*))?$/.exec(req.url.split('?')[0]);
   if (!m) return send(404, { message: 'Not Found' });
   const [, name, rest] = m;
+  // Пустой репозиторий обрабатываем ДО проверки дерева: у него нет записи в LIVE_REPOS,
+  // и без этого условия запрос дерева уходил в ветку «репозиторий не найден».
+  if (EMPTY_REPOS.has(name)) {
+    if (!rest) return send(200, { name, default_branch: 'main', private: false });
+    if (rest.startsWith('git/trees/')) return send(404, { message: 'Git Repository is empty.' });
+    return send(404, { message: 'Not Found' });
+  }
   const tree = LIVE_REPOS[name];
-  if (!tree) return send(404, { message: 'Not Found' });
+  if (!tree) {
+    // R8: два разных 404 — два разных факта. `live-invisible` отказывается отдавать МЕТАДАННЫЕ
+    // (репозиторий не виден этому читателю), `live-empty` отдаёт метаданные, но не дерево
+    // (репозиторий читаем, но на ветке по умолчанию нет коммита). Раньше оба давали одну строку
+    // `unreadable: HTTP 404`, и таблица менялась от того, КАКИМ читателем её сгенерировали.
+    if (EMPTY_REPOS.has(name)) return send(200, { name, default_branch: 'main', private: false });
+    return send(404, { message: 'Not Found' });
+  }
   if (!rest) return send(200, { name, default_branch: 'main', private: false });
   if (rest.startsWith('git/trees/')) {
     // GitHub отдаёт в рекурсивном дереве и каталоги (type: tree). Они нужны: профиль docs
@@ -317,6 +333,11 @@ fs.writeFileSync(REPOS_FILE, JSON.stringify([
 //     path в живом списке нет — профиль выводится по тому, что источник действительно содержит.
 fs.writeFileSync(path.join(RUN, 'repos-live.json'), JSON.stringify(
   Object.keys(LIVE_REPOS).map(name => ({ repo: `sandbox-live/${name}`, type_hint: null, ci_required: null })), null, 2));
+// R8: два репозитория, которые обязаны различаться по СОСТОЯНИЮ, а не по тексту ошибки.
+fs.writeFileSync(path.join(RUN, 'repos-live-r8.json'), JSON.stringify([
+  { repo: 'sandbox-live/live-empty', type_hint: null, ci_required: null },
+  { repo: 'sandbox-live/live-invisible', type_hint: null, ci_required: null },
+], null, 2));
 fs.writeFileSync(path.join(RUN, 'repos-local-src.json'), JSON.stringify(
   Object.keys(LIVE_REPOS).map(name => ({ repo: `sandbox-src/${name}`, type_hint: null, ci_required: null, path: path.join(FX, 'live-src', name) })), null, 2));
 
@@ -387,7 +408,7 @@ if (!fs.existsSync(CLI)) {
   const rows = Array.isArray(cov) ? cov : (cov?.repos || cov?.rows || []);
   check('S1 inventory: строка на каждый репозиторий', rows.length === 4, `rows=${rows.length}`);
   for (const col of ['repo', 'type', 'profile', 'adapter', 'check', 'fix', 'verify', 'context', 'logs',
-    'ci_present', 'ci_required', 'staging_present', 'staging_required', 'readable', 'profile_ref']) {
+    'ci_present', 'ci_required', 'staging_present', 'staging_required', 'read_state', 'profile_ref']) {
     check(`S1 колонка ${col} есть (AC-40)`, rows.length > 0 && rows.every((r) => Object.hasOwn(r, col)));
   }
   const docRow = rows.find((r) => /docs-only/.test(r.repo || ''));
@@ -396,8 +417,8 @@ if (!fs.existsSync(CLI)) {
   check('S1 docs-only получает профиль docs', docRow?.profile === 'docs', `profile=${docRow?.profile}`);
   check('S1 node-репо получает профиль node', brokenRow?.profile === 'node', `profile=${brokenRow?.profile}`);
   check('S1 adapter помечен derived|file', ['derived', 'file'].includes(docRow?.adapter), `adapter=${docRow?.adapter}`);
-  check('S1 недоступный репозиторий → readable:false', unreadRow?.readable === false, `readable=${unreadRow?.readable}`);
-  check('S1 недоступный репозиторий даёт код 4', s1.code === 4 || unreadRow?.readable === false, `code=${s1.code}`);
+  check('S1 недоступный репозиторий → read_state:no_access', unreadRow?.read_state === 'no_access', `read_state=${unreadRow?.read_state}`);
+  check('S1 недоступный репозиторий даёт код 4', s1.code === 4 || unreadRow?.read_state === 'no_access', `code=${s1.code}`);
 
   // ── S2: docs-only не запускает build ────────────────────────────────────────
   const docsDir = path.join(FX, 'docs-only');
@@ -414,7 +435,7 @@ if (!fs.existsSync(CLI)) {
   check('S3 construction-tasks.md сформирован', fs.existsSync(tasks));
   const tasksText = fs.existsSync(tasks) ? fs.readFileSync(tasks, 'utf8') : '';
   check('S3 missing-методы перечислены как construction tasks',
-    /missing/i.test(tasksText) && (/unreadable/i.test(tasksText) || /staging/i.test(tasksText)));
+    /missing/i.test(tasksText) && (/no_access/i.test(tasksText) || /staging/i.test(tasksText)));
   // PATH без gh: если бы dry-run был не dry-run, он бы упал, а не «успешно» ничего не сделал.
   check('S3 dry-run пережил запуск без gh в PATH (Issue не создавался)', s1.code === 0 || s1.code === 4, `code=${s1.code}`);
 
@@ -539,6 +560,49 @@ if (!fs.existsSync(CLI)) {
     liveNoStg?.staging_present === false,
     `live-no-staging staging_present=${liveNoStg?.staging_present} (при наличии файла *staging*)`);
   check('F2 живой скан: staging_required=true для node-профиля', liveMixed?.staging_required === true, `required=${liveMixed?.staging_required}`);
+
+  // ── R8: читаемость — состояние таблицы, а не свойство читателя ────────────────
+  // Дефект: строка `unreadable: GitHub API HTTP 404` ставилась и для репозитория, которого
+  // читатель не видит, и для репозитория без коммита. Первый — задача по выдаче доступа,
+  // второй — задача по первому коммиту; в таблице они были одним и тем же текстом, а в
+  // byte-exact гейте делали результат зависимым от того, КАКИМ читателем прогнали генерацию.
+  const R8_OUT = path.join(OUT, 'r8');
+  const r8Run = await cliAsync(['inventory', '--repos', path.join(RUN, 'repos-live-r8.json'), '--out', R8_OUT], { env: liveEnv });
+  check('R8 живой inventory: код 0 (невидимый репозиторий — данные, не поломка)', r8Run.code === 0, `code=${r8Run.code}`);
+  const r8Rows = readJson(path.join(R8_OUT, 'repo-coverage.json'))?.repos || [];
+  const r8Empty = r8Rows.find(r => /live-empty$/.test(r.repo));
+  const r8Invisible = r8Rows.find(r => /live-invisible$/.test(r.repo));
+  check('R8 репозиторий без коммита → read_state=empty, а не no_access', r8Empty?.read_state === 'empty',
+    `read_state=${r8Empty?.read_state}`);
+  check('R8 репозиторий без коммита НЕ считается невидимым', r8Empty?.read_state !== 'no_access',
+    `read_state=${r8Empty?.read_state}`);
+  check('R8 репозиторий без коммита не порождает construction task на доступ',
+    !/no_access/.test(r8Empty?.notes?.join(' ') || ''), `notes=${JSON.stringify(r8Empty?.notes)}`);
+  check('R8 невидимый репозиторий → read_state=no_access', r8Invisible?.read_state === 'no_access',
+    `read_state=${r8Invisible?.read_state}`);
+  check('R8 невидимый репозиторий: остальные колонки НЕ выдуманы (profile=null)',
+    r8Invisible?.profile === null && r8Invisible?.ci_present === false,
+    `profile=${r8Invisible?.profile} ci_present=${r8Invisible?.ci_present}`);
+  check('R8 невидимый репозиторий даёт код 4 под --strict',
+    (await cliAsync(['inventory', '--repos', path.join(RUN, 'repos-live-r8.json'), '--out', path.join(OUT, 'r8-strict'), '--strict'], { env: liveEnv })).code === 4,
+    'strict обязан отказать на слепом пятне');
+  // Сравниваемое артефакт: невидимая строка сравнивается только (repo, read_state), поэтому
+  // генерация другим уполномоченным читателем не меняет ответ гейта.
+  const r8Stable = readJson(path.join(R8_OUT, 'repo-coverage.stable.json'));
+  check('R8 записан repo-coverage.stable.json', r8Stable !== null);
+  const stableEmpty = r8Stable?.repos?.find(r => /live-empty$/.test(r.repo));
+  const stableInvisible = r8Stable?.repos?.find(r => /live-invisible$/.test(r.repo));
+  check('R8 stable: читаемая строка сравнивается целиком', stableEmpty && Object.keys(stableEmpty).length > 2,
+    stableEmpty ? `полей=${Object.keys(stableEmpty).length}` : 'нет строки');
+  check('R8 stable: невидимая строка сравнивается только (repo, read_state)',
+    stableInvisible && Object.keys(stableInvisible).sort().join(',') === 'read_state,repo',
+    stableInvisible ? `поля=${Object.keys(stableInvisible).join(',')}` : 'нет строки');
+  // Волатильные счётчики не должны находиться в сравниваемом артефакте: иначе гейт краснеет
+  // на каждом чужом коммите и его отключат.
+  const fullEmpty = r8Empty?.notes?.join(' ') || '';
+  check('R8 в заметке живого скана нет счётчика файлов (волатилен для byte-exact гейта)',
+    !/files=\d+/.test(fullEmpty), fullEmpty);
+  check('R8 в заметке живого скана нет счётчика workflow-файлов', !/workflows=\d+/.test(fullEmpty), fullEmpty);
 
   // Главное свойство F1: локальный и живой скан ТЕХ ЖЕ файлов обязаны дать ОДНИ И ТЕ ЖЕ
   // производные колонки. Расхождение = две реализации вывода, то есть исходный дефект.

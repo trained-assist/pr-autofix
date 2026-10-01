@@ -44,6 +44,9 @@ export function localSource(dir) {
     kind: 'local',
     origin: root,
     readable,
+    // Three states, not two. A missing directory and a directory the reader may not open are
+    // different facts, and the difference is a construction task, not a formatting detail.
+    readState: readable ? 'read' : 'no_access',
     files,
     has: (rel) => files.has(String(rel).replace(/^\.\//, '')),
     async readText(rel) {
@@ -63,6 +66,14 @@ export function localSource(dir) {
  * because "what exists" and "what is in it" must be answered from the same snapshot: two
  * separate listings can straddle a push and produce a row that never existed.
  *
+ * Readability is answered in TWO steps, because GitHub answers `404` for two different reasons:
+ * the repository does not exist, or this token may not see it. They are the same HTTP status and
+ * opposite facts, so a repository whose METADATA reads (and whose tree does not — a repository
+ * with no commit on its default branch) is READ, and simply empty. Before this split that
+ * repository was reported as `unreadable`, which told the reader to go and fix permissions for a
+ * repository that needed nothing — and, worse, put a row whose content depended on the TOKEN's
+ * scope inside a byte-exact drift gate (R8).
+ *
  * @param {{owner: string, name: string, token?: string, fetchImpl?: typeof fetch}} opts
  */
 export async function liveSource({ owner, name, token = process.env.GH_TOKEN, fetchImpl = fetch }) {
@@ -75,12 +86,29 @@ export async function liveSource({ owner, name, token = process.env.GH_TOKEN, fe
     return r.json();
   };
 
-  const repo = await call('');
+  let repo;
+  try {
+    repo = await call('');
+  } catch (e) {
+    // Metadata itself is refused: the repository is invisible to THIS reader. Which of the two
+    // reasons it is, we cannot know from the status code, and we do not guess.
+    const err = new Error(`HTTP ${/(\d{3})/.exec(e.message)?.[1] || '?'}`);
+    err.readerScope = true;
+    throw err;
+  }
   const branch = repo.default_branch;
 
   // Blobs and trees are both recorded: a directory is a legitimate answer to `has('docs')`,
   // and the local path answers it with existsSync — the two must agree.
-  const tree = await call(`/git/trees/${encodeURIComponent(branch)}?recursive=1`);
+  let tree = { tree: [], truncated: false };
+  let empty = false;
+  try {
+    tree = await call(`/git/trees/${encodeURIComponent(branch)}?recursive=1`);
+  } catch {
+    // The repository answered, so it is readable. A default branch with no tree is a repository
+    // with no commit yet — a real, onboardable state.
+    empty = true;
+  }
   const files = new Set((tree.tree || []).map(e => e.path));
 
   const cache = new Map();
@@ -103,6 +131,8 @@ export async function liveSource({ owner, name, token = process.env.GH_TOKEN, fe
     kind: 'live',
     origin: `${ghApiBase()}/repos/${owner}/${name}@${branch}`,
     readable: true,
+    readState: 'read',
+    empty,
     defaultBranch: branch,
     truncated: tree.truncated === true,
     files,

@@ -9,7 +9,7 @@
 //   verify         --repo <d> [--profile id] [--log f] [--attempt n]  0 pass/no_change · 1 failed
 //                                                                   2 needs_human · 3 invalid config
 //   context        --manifest <f>                                    0 fresh · 2 stale · 3 missing
-//   inventory      --out <d> [--repos <f>] [--strict]                0 ok · 4 unreadable (--strict)
+//   inventory      --out <d> [--repos <f>] [--strict]                0 ok · 4 not visible (--strict)
 //   check-docs     --dir <d>                                          0 ok · 1 violations
 //   check-workflows --dir <d>                                         0 ok · 1 violations
 //   run-derived-check --dir <d>                                       0 ok · 1 failed
@@ -32,7 +32,7 @@ import { loadAdapter } from './lib/devbaseline/adapter.mjs';
 import { resolveRepo } from './lib/devbaseline/resolve.mjs';
 import { verify, VERIFY_CODES, writeLogRecord } from './lib/devbaseline/run.mjs';
 import { inspectContext } from './lib/devbaseline/context.mjs';
-import { buildCoverage, renderCoverageMd, COVERAGE_COLUMNS, assertNoSecretValues } from './lib/devbaseline/inventory.mjs';
+import { buildCoverage, renderCoverageMd, renderStableJson, COVERAGE_COLUMNS, assertNoSecretValues } from './lib/devbaseline/inventory.mjs';
 import { buildConstructionTasks, renderConstructionTasksMd } from './lib/devbaseline/construction-tasks.mjs';
 import { checkDocs, formatViolations } from './lib/devbaseline/check-docs.mjs';
 import { toolVersion, TOOL_NAME } from './lib/devbaseline/log.mjs';
@@ -161,13 +161,17 @@ async function cmdInventory(flags) {
 
   fs.writeFileSync(path.join(outDir, 'repo-coverage.json'), `${JSON.stringify({ generated_by: `${TOOL_NAME} ${profileRef}`, columns: COVERAGE_COLUMNS, repos: rows }, null, 2)}\n`);
   fs.writeFileSync(path.join(outDir, 'repo-coverage.md'), renderCoverageMd({ rows, profileRef, unreadable }));
+  // The gate compares THIS file, not the full table: a row the reader could not see is compared
+  // by (repo, read_state) only, so the gate's answer does not depend on which authorized reader
+  // ran it. Without it the gate compared a table whose content changed with the token's scope.
+  fs.writeFileSync(path.join(outDir, 'repo-coverage.stable.json'), renderStableJson({ rows, profileRef, unreadable }));
   fs.writeFileSync(path.join(outDir, 'construction-tasks.md'), renderConstructionTasksMd({ tasks, profileRef, applied: false }));
 
-  out(`inventory: ${rows.length} repositories · ${unreadable} unreadable · profile_ref ${profileRef}`);
-  for (const r of rows) out(`  ${r.readable ? 'ok      ' : 'unreadabl'} ${r.repo} · profile=${r.profile ?? '—'} · adapter=${r.adapter ?? '—'} · ci=${r.ci_present} · staging=${r.staging_present}/${r.staging_required ?? '—'}`);
-  out(`written: ${path.relative(process.cwd(), outDir) || outDir}/repo-coverage.{json,md}, construction-tasks.md (dry-run — no issue was created)`);
+  out(`inventory: ${rows.length} repositories · ${unreadable} not visible · profile_ref ${profileRef}`);
+  for (const r of rows) out(`  ${r.read_state.padEnd(9)} ${r.repo} · profile=${r.profile ?? '—'} · adapter=${r.adapter ?? '—'} · ci=${r.ci_present} · staging=${r.staging_present}/${r.staging_required ?? '—'}`);
+  out(`written: ${path.relative(process.cwd(), outDir) || outDir}/repo-coverage.{json,md,stable.json}, construction-tasks.md (dry-run — no issue was created)`);
 
-  // Report-only by default: an unreadable repository is data, not a broken run. `--strict` is for
+  // Report-only by default: a repository this reader cannot see is data, not a broken run. `--strict` is for
   // the gate that must not accept a blind spot (design §2.1 lists 4; the rehearsal demands 0).
   return flags.strict && unreadable ? 4 : 0;
 }
