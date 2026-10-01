@@ -55,7 +55,7 @@ function mockGh({ branches, listExit = 0 }) {
   writeFileSync(path.join(bin, 'gh'), script);
   chmodSync(path.join(bin, 'gh'), 0o755);
   return { bin, log, marker, deletedBranches: () => (existsSync(log)
-    ? readFileSync(log, 'utf8').split('\n').filter(l => /-X DELETE/.test(l)).map(l => decodeURIComponent(l.split('/').pop()))
+    ? readFileSync(log, 'utf8').split('\n').filter(l => /-X DELETE/.test(l)).map(l => decodeURIComponent(l.split('git/refs/heads/')[1] || l.split('/').pop()))
     : []) };
 }
 
