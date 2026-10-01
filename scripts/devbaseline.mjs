@@ -13,6 +13,9 @@
 //   check-docs     --dir <d>                                          0 ok · 1 violations
 //   check-workflows --dir <d>                                         0 ok · 1 violations
 //   run-derived-check --dir <d>                                       0 ok · 1 failed
+//   payload-manifest [--out <f>] [--check]                            0 written/current · 1 stale
+//   payload-verify   [--manifest <f>] [--dir <d>]                     0 complete · 1 incomplete
+//   gate           --repo <d> [--profile id] [--log f]                0 gate green · 1 gate red
 //
 // run-derived-check is referenced BY the profiles (check.commands) — it is the derivation step
 // that turns a package.json / pyproject.toml into an actual command, kept as a subcommand so a
@@ -33,6 +36,7 @@ import { buildCoverage, renderCoverageMd, COVERAGE_COLUMNS, assertNoSecretValues
 import { buildConstructionTasks, renderConstructionTasksMd } from './lib/devbaseline/construction-tasks.mjs';
 import { checkDocs, formatViolations } from './lib/devbaseline/check-docs.mjs';
 import { toolVersion, TOOL_NAME } from './lib/devbaseline/log.mjs';
+import { renderManifest, verifyManifest, readManifest, MANIFEST_FILENAME } from './lib/devbaseline/payload.mjs';
 
 const DEFAULT_REPOS_FILE = path.join(TOOL_ROOT, 'inventory', 'repos.json');
 
@@ -227,6 +231,54 @@ function cmdRunDerivedCheck(flags) {
   return r.status === null ? 1 : r.status;
 }
 
+// ── payload-manifest / payload-verify ──────────────────────────────────────────
+// The delivery boundary as a checked artifact (R2). `--check` is the CI mode: verify only, never
+// write, so CI cannot "fix" a stale manifest by regenerating it and going green.
+function cmdPayloadManifest(flags) {
+  const file = path.resolve(String(flags.out || path.join(TOOL_ROOT, MANIFEST_FILENAME)));
+  const rendered = renderManifest({
+    repoDir: TOOL_ROOT,
+    toolSha: flags.sha ? String(flags.sha) : process.env.DEVBASELINE_TOOL_SHA || null,
+    toolRef: flags.ref ? String(flags.ref) : process.env.DEVBASELINE_TOOL_REF || null,
+  });
+  if (flags.check) {
+    const onDisk = readManifest(file);
+    if (!onDisk.ok) { out(`payload-manifest: ${onDisk.message}`); return 1; }
+    const v = verifyManifest(onDisk.manifest, TOOL_ROOT);
+    if (!v.ok) {
+      out(`payload-manifest: STALE — ${file}`);
+      for (const p of v.missing) out(`  · missing: ${p}`);
+      for (const p of v.hash_mismatch) out(`  · changed since the manifest was written: ${p}`);
+      for (const p of v.undeclared) out(`  · in the tree but NOT declared: ${p}`);
+      if (v.reason) out(`  · ${v.reason}`);
+      out('  → regenerate: node scripts/devbaseline.mjs payload-manifest --out ' + file);
+      return 1;
+    }
+    out(`payload-manifest: current — ${onDisk.manifest.entries.length} entries, hashes match the tree`);
+    return 0;
+  }
+  fs.writeFileSync(file, `${JSON.stringify(rendered, null, 2)}\n`);
+  out(`payload-manifest: ${rendered.entries.length} entries → ${path.relative(process.cwd(), file) || file}`);
+  return 0;
+}
+
+function cmdPayloadVerify(flags) {
+  const file = path.resolve(String(flags.manifest || path.join(TOOL_ROOT, MANIFEST_FILENAME)));
+  const dir = path.resolve(String(flags.dir || TOOL_ROOT));
+  const m = readManifest(file);
+  if (!m.ok) { out(`payload-verify: ${m.message}`); return 1; }
+  const v = verifyManifest(m.manifest, dir);
+  out(`payload-verify: ${m.manifest.entries.length} declared · ${v.ok ? 'complete and matching' : 'INCOMPLETE'}`);
+  if (!v.ok) {
+    for (const p of v.missing) out(`  · missing: ${p}`);
+    for (const p of v.hash_mismatch) out(`  · hash mismatch: ${p}`);
+    for (const p of v.undeclared) out(`  · undeclared in tree: ${p}`);
+    if (v.reason) out(`  · ${v.reason}`);
+    return 1;
+  }
+  return 0;
+}
+
 // ── dispatch ───────────────────────────────────────────────────────────────────
 const HELP = `devbaseline — inventory and a common development baseline for participating repositories.
 
@@ -237,6 +289,9 @@ const HELP = `devbaseline — inventory and a common development baseline for pa
   check-docs       --dir <d>
   check-workflows  --dir <d>
   run-derived-check --dir <d>
+  payload-manifest [--out <f>] [--check] [--sha <s>] [--ref <r>]
+  payload-verify   [--manifest <f>] [--dir <d>]
+  gate             --repo <d> [--profile <id>] [--log <f>]
 
 Profiles live in profiles/ (single source of truth). A repository stores only a thin
 .devbaseline.json adapter pinning what cannot be derived: check command, staging command,
@@ -255,6 +310,9 @@ async function main() {
     case 'check-docs': return cmdCheckDocs(flags);
     case 'check-workflows': return cmdCheckWorkflows(flags);
     case 'run-derived-check': return cmdRunDerivedCheck(flags);
+    case 'payload-manifest': return cmdPayloadManifest(flags);
+    case 'payload-verify': return cmdPayloadVerify(flags);
+    case 'gate': return (await import('./lib/devbaseline/gate.mjs')).cmdGate(flags);
     default:
       out(`unknown command "${command}"${positional.length ? ` (args: ${positional.join(' ')})` : ''}`);
       out(HELP);
