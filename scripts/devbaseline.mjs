@@ -16,6 +16,8 @@
 //   payload-manifest [--out <f>] [--check]                            0 written/current · 1 stale
 //   payload-verify   [--manifest <f>] [--dir <d>]                     0 complete · 1 incomplete
 //   gate           --repo <d> [--profile id] [--log f]                0 gate green · 1 gate red
+//   receipt-check  --log <f>                                         0 consistent · 1 self-contradictory
+//                                                                   · 2 unreadable
 //
 // run-derived-check is referenced BY the profiles (check.commands) — it is the derivation step
 // that turns a package.json / pyproject.toml into an actual command, kept as a subcommand so a
@@ -37,6 +39,7 @@ import { buildConstructionTasks, renderConstructionTasksMd } from './lib/devbase
 import { checkDocs, formatViolations } from './lib/devbaseline/check-docs.mjs';
 import { toolVersion, TOOL_NAME } from './lib/devbaseline/log.mjs';
 import { cmdGate } from './lib/devbaseline/gate.mjs';
+import { checkReceipt } from './lib/devbaseline/receipt.mjs';
 import { renderManifest, verifyManifest, readManifest, MANIFEST_FILENAME } from './lib/devbaseline/payload.mjs';
 
 const DEFAULT_REPOS_FILE = path.join(TOOL_ROOT, 'inventory', 'repos.json');
@@ -299,6 +302,35 @@ function cmdPayloadVerify(flags) {
   return 0;
 }
 
+// ── receipt-check ──────────────────────────────────────────────────────────────
+// R2 — the independent reader of a persisted receipt. Until now the JSON `gate` writes was loaded
+// as the verify artifact and opened by nobody: a blocked merge left `outcome: no_change` in it and
+// the file was never checked against its own contents, so the workflow's colour came from stdout
+// (which is read once) and the artifact disagreed with reality in the one case that matters.
+//
+// Exit contract, deliberately narrow so this can be wired with `if: always()`:
+//   0  the receipt is readable and does not contradict itself — ANY verdict passes, red or green;
+//   1  the receipt contradicts itself (e.g. `blocks: false` next to `verify_exit: 1` + failing
+//      staging) — a defect in the RECORD, not in the repository;
+//   2  the receipt is unreadable.
+// It does NOT re-judge the gate. The gate's colour is already the gate step's job; this catches the
+// case where the two disagree, which is precisely the R2 failure.
+function cmdReceiptCheck(flags) {
+  const file = flags.log || flags.file;
+  if (!file || file === true) die(2, 'receipt-check: --log <receipt.json> is required');
+  const r = checkReceipt(String(file));
+  out(`receipt-check: ${file} → ${r.code === 0 ? 'consistent' : r.code === 1 ? 'SELF-CONTRADICTORY' : 'unreadable'}`);
+  if (r.has_gate && r.recomputed) {
+    const g = r.receipt?.gate || {};
+    out(`  stored:   blocks=${JSON.stringify(g.blocks ?? null)} verdict=${JSON.stringify(g.verdict ?? null)} reason_code=${JSON.stringify(g.reason_code ?? null)}`);
+    out(`  recomputed: blocks=${r.recomputed.blocks} verdict=${r.recomputed.verdict} reason_code=${JSON.stringify(r.recomputed.reason_code)} (verify exit ${r.recomputed.verify_exit})`);
+  } else if (r.code === 0) {
+    out('  no gate block in this record (written by an older version) — nothing to reconcile');
+  }
+  for (const p of r.problems || []) out(`  · ${p}`);
+  return r.code;
+}
+
 // ── dispatch ───────────────────────────────────────────────────────────────────
 const HELP = `devbaseline — inventory and a common development baseline for participating repositories.
 
@@ -312,6 +344,7 @@ const HELP = `devbaseline — inventory and a common development baseline for pa
   payload-manifest [--out <f>] [--check] [--sha <s>] [--ref <r>]
   payload-verify   [--manifest <f>] [--dir <d>]
   gate             --repo <d> [--profile <id>] [--log <f>]
+  receipt-check    --log <receipt.json>                             0 consistent · 1 contradicts itself · 2 unreadable
 
 Profiles live in profiles/ (single source of truth). A repository stores only a thin
 .devbaseline.json adapter pinning what cannot be derived: check command, staging command,
@@ -333,6 +366,7 @@ async function main() {
     case 'payload-manifest': return cmdPayloadManifest(flags);
     case 'payload-verify': return cmdPayloadVerify(flags);
     case 'gate': return cmdGate(flags);
+    case 'receipt-check': return cmdReceiptCheck(flags);
     default:
       out(`unknown command "${command}"${positional.length ? ` (args: ${positional.join(' ')})` : ''}`);
       out(HELP);

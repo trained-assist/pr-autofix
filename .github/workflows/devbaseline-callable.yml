@@ -99,6 +99,31 @@ jobs:
           [ -n "${{ inputs.profile }}" ] && args+=(--profile "${{ inputs.profile }}")
           node pr-autofix/scripts/devbaseline.mjs "${args[@]}"
 
+      # R2 — the INDEPENDENT reader of the record the gate just wrote. `if: always()`: the receipt of a
+      # failed gate is exactly the one worth checking. It does NOT re-judge the gate — that colour
+      # is the gate step's own job and is unchanged — it opens the persisted JSON and asks whether
+      # the verdict stored in it agrees with the verify_exit and staging stored next to it. Until
+      # this step nothing ever opened that file (the scan showed zero production readers), so a
+      # blocked merge could sit on disk as `outcome: no_change` with `gate_violations: []` and only
+      # stdout would say otherwise. Fails only on a SELF-CONTRADICTORY record; a legitimately red
+      # repository is not red twice for the same reason, and a missing record is left to the gate.
+      - name: The record agrees with itself (receipt-check)
+        if: always()
+        run: |
+          set +e
+          if [ ! -f devbaseline-verify.json ]; then
+            echo "no receipt was written — the gate step's own colour decides this job"
+            exit 0
+          fi
+          node pr-autofix/scripts/devbaseline.mjs receipt-check --log devbaseline-verify.json
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::error::the gate wrote a receipt that cannot be read"
+            exit 1
+          fi
+          exit "$code"
+
       - name: Upload the verify record
         if: always()
         uses: actions/upload-artifact@v4

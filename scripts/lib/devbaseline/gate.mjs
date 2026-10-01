@@ -117,7 +117,18 @@ export function cmdGate(flags = {}) {
   for (const v of gate.record.gate_violations) out(`  · ${v.rule_id}: ${v.path}: ${v.message}`);
 
   if (flags.log) {
-    writeLogRecord(String(flags.log), gate.record);
+    // R2: persist the GATE verdict, not the record of the verify run it contains. The two answers
+    // are different facts — "what is wrong with the repository" (outcome/rule_id) and "does this
+    // block the merge" (gate.*) — and writing only the first let a red staging leave `no_change`
+    // on disk as the audit artifact of a blocked merge.
+    const gateBlock = {
+      verdict: gate.verdict,
+      blocks: gate.blocks,
+      verify_exit: gate.code,
+      reason_code: gate.reason_code ?? null,
+      staging: { declared: gate.staging.declared, command: gate.staging.command ?? null, code: gate.staging.code },
+    };
+    writeLogRecord(String(flags.log), { ...gate.record, gate: gateBlock, patch: { commit: null, source: 'none' } });
     out(`log: ${flags.log}`);
   }
   return gate.blocks ? 1 : 0;

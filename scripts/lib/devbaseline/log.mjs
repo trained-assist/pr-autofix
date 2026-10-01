@@ -38,7 +38,15 @@ export function toolVersion() {
 }
 
 export function toolCommit() {
-  return process.env.AUTOFIX_TOOL_COMMIT || process.env.AUTOFIX_WORKFLOW_SHA || process.env.GITHUB_WORKFLOW_SHA || 'unpinned:local';
+  // R3: the TOOL BUILD, and only ever the tool build. This used to be overridable by an
+  // `extra.tool_commit` slot, which the autofix call site filled with the CONSUMER's patch commit —
+  // so a record read as "pr-autofix built this" while naming the repository it fixed. Two
+  // different entities shared one field, and a test rewritten under the new meaning kept it green.
+  // The patch has its own slot (`patch.commit`); the tool build comes from the environment that
+  // pins it, and anything that is not a 40-hex commit degrades to an honest `unpinned:local`
+  // instead of asserting a provenance that does not exist.
+  const declared = process.env.AUTOFIX_TOOL_COMMIT || process.env.AUTOFIX_WORKFLOW_SHA || process.env.GITHUB_WORKFLOW_SHA || '';
+  return /^[0-9a-f]{40}$/.test(String(declared)) ? String(declared) : 'unpinned:local';
 }
 
 /** Rough token estimate — the same ~4-chars-per-token heuristic autofix.mjs uses. */
@@ -83,6 +91,9 @@ export function buildLogRecord({
   ttlDays = 90,
   credentials = [],
   gateViolations = [],
+  gateVerdict = null,
+  patchCommit = null,
+  patchSource = 'none',
   checkOutput = '',
   logText = '',
   extra = {},
@@ -126,7 +137,35 @@ export function buildLogRecord({
       max_files: b.max_files,
       max_lines: b.max_lines,
     },
-    retention: { ttl_days: ttlDays, artifact: source.artifact || `ci-fixer-stats-${source.pr || 'local'}-${runId}` },
+    // R2 — THE GATE VERDICT, PERSISTED. This record used to be written by `gate` while carrying
+    // only the VERIFY record: a failed staging command left `outcome: no_change`, empty
+    // `gate_violations` and the verify reason behind — the artifact said "nothing changed" about a
+    // run that blocked the merge. The verdict lived in stdout, which nobody reads twice. It is in
+    // the record now, and `gate` is what a reader re-derives from `verify_exit` + `staging`
+    // (scripts/lib/devbaseline/receipt.mjs). Additive: a record written before this has no `gate`
+    // block and stays valid.
+    gate: gateVerdict ? {
+      verdict: gateVerdict.verdict ?? null,
+      blocks: gateVerdict.blocks ?? null,
+      verify_exit: gateVerdict.verify_exit ?? null,
+      reason_code: gateVerdict.reason_code ?? null,
+      staging: {
+        declared: gateVerdict.staging?.declared ?? false,
+        command: gateVerdict.staging?.command ?? null,
+        code: gateVerdict.staging?.code ?? null,
+      },
+    } : null,
+    // R3 — THE PATCH IS NOT THE TOOL. `patch_refs` says where the change is; `patch.commit` says
+    // which commit this run produced; `tool.commit` (above) says which build of pr-autofix ran.
+    // Three entities, three slots, and none of them is an `extra.<key>` a call site can overwrite.
+    patch: { commit: patchCommit || null, source: patchSource || 'none' },
+    retention: {
+      ttl_days: ttlDays,
+      // R4 — a deadline nobody can compute. `written_at` is what makes the TTL a date; without it
+      // `ttl_days` is a number and nothing on earth can decide whether this record is expired.
+      written_at: new Date().toISOString(),
+      artifact: source.artifact || `ci-fixer-stats-${source.pr || 'local'}-${runId}`,
+    },
     credentials,
     gate_violations: gateViolations,
     // Additive (AC-44): what the CHECK itself found, as {rule_id, path, message} — the same

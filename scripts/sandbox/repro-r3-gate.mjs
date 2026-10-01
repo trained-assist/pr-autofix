@@ -17,6 +17,11 @@
 //   C. a declared staging.command is executed (a marker file proves it ran);
 //   D. the classification is not lost: needs_human still records its own outcome/reason_code.
 //
+//   E. (R2) the PERSISTED receipt, in three states — green gate, red staging, needs_human —
+//      contains the gate verdict, and the independent reader `receipt-check` accepts each one;
+//      a receipt edited into a lie (`blocks: false` next to a failing staging) is REJECTED, and a
+//      missing record is reported as unreadable rather than as consistent.
+//
 //   node scripts/sandbox/repro-r3-gate.mjs
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
@@ -118,6 +123,78 @@ try {
   const gNone = gate(fNone);
   check('verify 0 with no declared staging → GREEN', gNone.code === 0, `exit ${gNone.code}`);
   check('the gate reports that no staging command is declared', /staging: none declared/.test(gNone.out), gNone.out.trim().slice(0, 200));
+
+  // ── E. the PERSISTED receipt in three states, plus the reader that checks it ─────
+  // R2: the JSON `gate` writes used to be loaded as the verify artifact and opened by nobody, so a
+  // red staging left `outcome: no_change` in it while stdout said `staging_command_failed` — the
+  // artifact contradicted the run, in the record everyone would have read a second time.
+  const receiptCheck = (file) => {
+    const r = spawnSync('node', [CLI, 'receipt-check', '--log', file],
+      { cwd: ROOT, encoding: 'utf8', timeout: 60_000, env: { ...process.env, DEVBASELINE_OFFLINE: '1' } });
+    return { code: r.status, out: `${r.stdout || ''}${r.stderr || ''}` };
+  };
+  const readJson = (f) => JSON.parse(readFileSync(f, 'utf8'));
+  const logFor = (fixtureDir, name) => {
+    const f = path.join(root, name);
+    gate(fixtureDir, ['--log', f]);
+    return f;
+  };
+
+  const states = [
+    ['green gate', logFor(fOk, 'receipt-green.json')],
+    ['red staging', logFor(fStagingFail, 'receipt-staging.json')],
+    ['needs_human', logFor(fHuman, 'receipt-needs-human.json')],
+  ];
+  const receipts = [];
+  for (const [label, file] of states) {
+    let rec = null;
+    try { rec = readJson(file); } catch { /* reported below */ }
+    check(`the ${label} receipt is written as JSON`, !!rec, `${file} — ${rec ? '' : 'unreadable'}`);
+    if (!rec) continue;
+    receipts.push([label, rec]);
+    check(`the ${label} receipt carries a persisted gate block`, rec.gate && typeof rec.gate.blocks === 'boolean',
+      JSON.stringify(rec.gate));
+    if (rec.gate) {
+      check(`the ${label} receipt stores the verify exit beside the verdict`, Number.isInteger(rec.gate.verify_exit),
+        String(rec.gate.verify_exit));
+      // The classification is NOT lost by persisting the verdict — two questions, two answers.
+      check(`the ${label} receipt keeps verify's own outcome as well`,
+        typeof rec.outcome === 'string' && rec.outcome.length > 0, `outcome=${JSON.stringify(rec.outcome)} reason_code=${JSON.stringify(rec.reason_code)}`);
+      const rc = receiptCheck(file);
+      check(`receipt-check accepts the ${label} receipt`, rc.code === 0, `exit ${rc.code}; ${rc.out.trim().slice(0, 200)}`);
+    }
+  }
+  // The exact defect: verify green, declared staging exit 3 — the record must BLOCK and say why.
+  // Null-safe on purpose: on UNFIXED code the record simply has no gate block, and a probe that
+  // crashes there reports a harness error instead of the defect it was written to catch.
+  const stagingRec = receipts.find(([l]) => l === 'red staging')?.[1];
+  if (stagingRec && stagingRec.gate) {
+    check('a failing staging command is persisted as blocks=true, reason staging_command_failed',
+      stagingRec.gate?.blocks === true && stagingRec.gate?.reason_code === 'staging_command_failed',
+      JSON.stringify(stagingRec.gate));
+    check('the failing staging exit code is persisted, not only printed',
+      stagingRec.gate?.staging?.declared === true && stagingRec.gate?.staging?.code === 3,
+      JSON.stringify(stagingRec.gate?.staging));
+  }
+  // A reader is only a reader if it can say NO. Rewrite the record into the old lie and check it.
+  if (stagingRec && stagingRec.gate) {
+    const liar = JSON.parse(JSON.stringify(stagingRec));
+    liar.gate.blocks = false;
+    liar.gate.verdict = 'passed';
+    liar.gate.reason_code = 'no_change';
+    const liarFile = path.join(root, 'receipt-liar.json');
+    writeFileSync(liarFile, `${JSON.stringify(liar, null, 2)}\n`);
+    const lr = receiptCheck(liarFile);
+    check('a receipt that contradicts its own evidence is REJECTED (exit 1)', lr.code === 1,
+      `exit ${lr.code}; ${lr.out.trim().replace(/\n/g, ' | ').slice(0, 300)}`);
+    check('the reader names WHAT contradicts (staging exit vs blocks)',
+      /staging/.test(lr.out) && /blocks/.test(lr.out), lr.out.trim().replace(/\n/g, ' | ').slice(0, 300));
+  }
+  const missing = receiptCheck(path.join(root, 'no-such-receipt.json'));
+  check('a record that cannot be read is UNREADABLE (exit 2), never "consistent"', missing.code === 2,
+    `exit ${missing.code}`);
+  check('the workflow runs receipt-check after the gate, with if: always()',
+    /receipt-check/.test(wf) && /if:\s*always\(\)[\s\S]{0,400}receipt-check/.test(wf), 'see devbaseline-callable.yml');
 
   const failed = results.filter(r => !r.ok);
   console.log(`\nR3 gate reproduction — ${results.length - failed.length}/${results.length} checks pass`);
