@@ -290,11 +290,14 @@ function writeStats(category, extra = {}) {
   const violations = extra.gate_violations || [];
   const firstRule = extra.rule_id || violations[0]?.rule_id || null;
   const toolRef = (process.env.AUTOFIX_WORKFLOW_REF || '').split('@').pop() || 'unpinned:local';
-  // A "commit" that is not a 40-hex SHA is not a commit. AUTOFIX_WORKFLOW_SHA was recorded
-  // verbatim, so an absent or non-SHA env value landed in the receipt as a plausible-looking
-  // commit field (R6). The shape is checked; an invalid value degrades to `unpinned:local` and
-  // says so, instead of asserting a provenance that does not exist.
-  const declaredCommit = extra.tool_commit || process.env.AUTOFIX_WORKFLOW_SHA || process.env.AUTOFIX_TOOL_COMMIT || '';
+  // R3 — WHICH BUILD RAN, answered only by the env that pins the build. `extra.tool_commit` used
+  // to win here, and the fix call site passed the CONSUMER's patch commit through it: the receipt
+  // read "pr-autofix built this" while naming the commit of the repository it fixed. An `extra.*`
+  // slot is writable by any call site, so one field could hold two entities depending on who
+  // wrote it — and the test that checked it had been rewritten under the new meaning. The patch
+  // has its own slot (`patch.commit`), below. A "commit" that is not a 40-hex SHA is not a commit:
+  // an absent or malformed env value degrades to `unpinned:local` and says so.
+  const declaredCommit = process.env.AUTOFIX_WORKFLOW_SHA || process.env.AUTOFIX_TOOL_COMMIT || '';
   const commitIsSha = /^[0-9a-f]{40}$/.test(String(declaredCommit));
   const toolCommit = commitIsSha ? declaredCommit : 'unpinned:local';
   const patchRefs = extra.patch_refs ?? [];
