@@ -19,12 +19,8 @@ name: CI fix cleanup (callable)
 #       pull-requests: write
 #     uses: trained-assist/pr-autofix/.github/workflows/ci-fix-cleanup.yml@v1
 #     with:
-#       dry_run:
-        description: 'Print the plan (delete / keep / refused) and delete nothing.'
-        required: false
-        type: boolean
-        default: true
-      keep_branches: '[]'
+#       dry_run: true
+#       keep_branches: '[]'
 #     secrets:
 #       gh_token: ${{ secrets.AUTOFIX_PAT || github.token }}
 
@@ -85,4 +81,3 @@ jobs:
             --pr "${PR_NUMBER:-}" \
             --keep "${KEEP_BRANCHES:-[]}" \
             ${{ inputs.dry_run && '--dry-run' || '--no-dry-run' }}
-"

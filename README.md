@@ -197,7 +197,23 @@ node scripts/devbaseline.mjs verify   --repo <dir> --log f.json   # check → fi
 node scripts/devbaseline.mjs context  --manifest <f>         # fresh | stale | missing
 node scripts/devbaseline.mjs inventory --out <dir>           # the coverage table + construction tasks
 node scripts/devbaseline.mjs check-docs --dir <dir>          # links resolve, JSON parses, H1 present
+node scripts/devbaseline.mjs gate     --repo <dir>          # verify + the declared staging.command
+node scripts/devbaseline.mjs payload-manifest --check       # is the payload we ship what we declared?
+node scripts/devbaseline.mjs payload-verify                 # is this tree the declared payload?
 ```
+
+**`gate` is the only thing a merge gate should call.** `verify`'s exit codes stay what they always
+were (they are a contract), but the question "does this block the merge?" has exactly one owner:
+`gate`, where **only exit 0 is green**. `needs_human` (2) — the profile has no fixer, or `fix.cap`
+is spent — is a real gap that nobody is closing automatically, so it blocks and keeps its own
+`outcome`/`reason_code` in the log record. A `staging.command` declared by the repository is
+actually executed, and its non-zero exit blocks even when `verify` is green.
+
+**The payload is declared, not listed.** `payload.manifest.json` records every file the CLI needs,
+with its hash; the loader lays the tree out by that manifest, checks it in BOTH directions (missing
+*and* undeclared) and then **runs** the payload. Adding a module without regenerating the manifest
+fails the gate instead of shipping a CLI that cannot start — the failure mode this replaces, where
+a flat download plus `node --check` produced a green check and a broken tool.
 
 Exit codes are the contract: `validate` 0/3 · `verify` 0 pass-or-no_change, 1 controlled failure,
 2 needs_human, 3 invalid config · `context` 0 fresh, 2 stale, 3 missing · `inventory` 0, or 4 with
@@ -241,13 +257,26 @@ token, writes nothing back into the caller, and takes its code from the ref you 
 
 ### pr-autofix's own staging gate
 
-`ci.yml` runs two jobs: `selftest` (the existing contract test) and `staging-gate`, whose body is
+The required check name is **`staging-gate`** and it is part of this repository's contract:
+`software-engineering-playbooks` must require that exact name as a merge condition. Renaming it is
+a breaking cross-repository change, so fix the consumer instead.
+
+`ci.yml` runs three jobs: `selftest` (the existing contract test) and `staging-gate`, whose body is
 `node scripts/sandbox/z01-devbaseline.mjs` — the same scenario rehearsal used during development.
 pr-autofix has no production service, so **staging here is a rehearsal of the battle path on
 fixtures, not a cloud check**, and it is never described as one: `node --check` on every script,
 every profile against its contract, an end-to-end `verify` (expected controlled failure), and a
 check that every `*-callable.yml` really declares `on: workflow_call` — the last one is the
-regression guard for the cleanup installer that used to point at a non-callable file.
+regression guard for the cleanup installer that used to point at a non-callable file. It also
+rehearses the delivery boundary and the gate through the consumer's path
+(`consumer-boundary.mjs`, `repro-r3-gate.mjs`, `repro-r5-resolver.mjs`, `repro-r4-cleanup.mjs`) and
+asserts the payload manifest is current.
+
+`repository-context` runs with `if: always()` — the report about the repository's state has to
+appear *after* a failed check, which is exactly when it is worth reading. It consumes the
+**delivered** payload (`payload-verify`) rather than the checkout, so it cannot be green while the
+artifact handed to consumers is broken, and it asserts that a manifest from a foreign commit reads
+`stale`, never `fresh`.
 
 ### Rehearsing the whole scenario locally
 

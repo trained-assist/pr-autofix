@@ -33,3 +33,67 @@ jobs:
         run: node scripts/sandbox/z01-devbaseline.mjs
       - name: Reusable workflows declare workflow_call
         run: node scripts/devbaseline.mjs check-workflows --dir .github/workflows
+      # The payload boundary and the gate are rehearsed here as the CONSUMER sees them, not as the
+      # checkout sees them (R2): run through the same declared manifest the shipped loader uses,
+      # then gate — which now blocks on needs_human and executes a declared staging.command.
+      - name: Payload manifest is current (the tree the loader ships)
+        run: node scripts/devbaseline.mjs payload-manifest --check
+      - name: Rehearse the delivery boundary and the gate
+        run: |
+          node scripts/sandbox/consumer-boundary.mjs
+          node scripts/sandbox/repro-r3-gate.mjs
+          node scripts/sandbox/repro-r5-resolver.mjs
+          node scripts/sandbox/repro-r4-cleanup.mjs
+
+  # R7: the repository-context job did not exist, so AC-13 — the only AC written from the
+  # consumer's side — had no job. `if: always()` is the load-bearing word: the report about the
+  # repository's state must still appear AFTER a failed check, which is precisely when it is
+  # worth reading. It consumes the DELIVERED payload (payload-verify) rather than the checkout, so
+  # it cannot be green while the thing we hand consumers is broken.
+  repository-context:
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Is the payload we ship what we declared?
+        run: node scripts/devbaseline.mjs payload-verify
+      - name: Repository context — bound to this commit
+        run: |
+          node -e '
+            const fs = require("fs");
+            const { execFileSync } = require("child_process");
+            const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+            fs.writeFileSync("context.manifest.json", JSON.stringify({
+              source_commit: process.env.FORCED_SOURCE_COMMIT || head,
+              entrypoints: ["scripts/devbaseline.mjs", "payload.manifest.json", "profiles", "contracts"],
+            }, null, 2));
+          '
+          node scripts/devbaseline.mjs context --manifest context.manifest.json
+      - name: Context against a FOREIGN commit must not read fresh
+        env:
+          FORCED_SOURCE_COMMIT: 0000000000000000000000000000000000000000
+        run: |
+          node -e '
+            const fs = require("fs");
+            const { execFileSync } = require("child_process");
+            const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+            fs.writeFileSync("context.foreign.json", JSON.stringify({
+              source_commit: process.env.FORCED_SOURCE_COMMIT || head,
+              entrypoints: ["scripts/devbaseline.mjs", "payload.manifest.json"],
+            }, null, 2));
+          '
+          # `set +e` around the call, not `cmd && exit 1`: under `bash -e` the `&&` form aborts on
+          # the failing command before the status is read, which is the same masking shape R3 was
+          # rejected for. Read the status honestly, then decide.
+          set +e
+          node scripts/devbaseline.mjs context --manifest context.foreign.json
+          code=$?
+          set -e
+          if [ "$code" = "2" ]; then echo "foreign commit correctly reported as stale"; exit 0; fi
+          echo "::error::a manifest from a foreign commit must be stale (exit 2), got exit $code"
+          exit 1
