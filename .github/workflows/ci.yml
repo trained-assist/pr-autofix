@@ -44,6 +44,11 @@ jobs:
           node scripts/sandbox/repro-r3-gate.mjs
           node scripts/sandbox/repro-r5-resolver.mjs
           node scripts/sandbox/repro-r4-cleanup.mjs
+      # R6: the receipt test existed but was wired into no job, so a green CI did not prove R6 —
+      # the defect class this epic exists to kill, in the last place it was still alive. Its own
+      # named step: the log must say WHICH defect regressed, not just that a script exited non-zero.
+      - name: The receipt carries the real run (R6)
+        run: node scripts/sandbox/repro-r6-receipt.mjs
 
   # R7: the repository-context job did not exist, so AC-13 — the only AC written from the
   # consumer's side — had no job. `if: always()` is the load-bearing word: the report about the
