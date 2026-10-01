@@ -52,3 +52,49 @@ export function resolveRepo({ repoDir = '.', profileId = '', typeHint = null, ex
   });
   return { ...prof, adapter: adapterResult.adapter, adapterResult, adapterSource: adapterResult.source };
 }
+
+// Read installation evidence through the same source boundary as profile resolution.
+// Only a job-level uses is a reusable workflow call; comments and run blocks are not.
+export async function resolveFixInstallation(source, callable, desiredRef) {
+  const observed = [];
+  let unknown = Boolean(source.truncated);
+  for (const file of [...source.files].filter(p => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p)).sort()) {
+    const text = await source.readText(file);
+    if (text === null) { unknown = true; continue; }
+    const stack = [];
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim() || /^\s*#/.test(line)) continue;
+      const indent = line.search(/\S/);
+      while (stack.length && stack.at(-1).indent >= indent) stack.pop();
+      // A scalar (especially run: |) cannot contain YAML mapping children.
+      if (stack.some(p => p.scalar)) continue;
+      const m = /^\s*([\w-]+|"[^"\n]+"|'[^'\n]+')\s*:\s*(.*?)\s*$/.exec(line);
+      if (!m) continue;
+      const key = m[1].replace(/^['"]|['"]$/g, '');
+      const value = m[2].replace(/\s+#.*$/, '').trim().replace(/^(['"])(.*)\1$/, '$2');
+      if (key === 'jobs' && value && value !== '{}') unknown = true;
+      if (stack.length === 2 && stack[0].key === 'jobs' && key === 'uses') {
+        const prefix = `trained-assist/pr-autofix/${callable}@`;
+        if (value.startsWith(prefix)) {
+          const ref = value.slice(prefix.length);
+          if (/^[A-Za-z0-9_./-]+$/.test(ref)) observed.push({ workflow: file, job: stack[1].key, ref });
+          else unknown = true;
+        }
+      }
+      if (stack.length === 1 && stack[0].key === 'jobs' && value.startsWith('{')) unknown = true;
+      stack.push({ key, indent, scalar: Boolean(value) });
+    }
+  }
+  const local = Boolean(callable) && source.has(callable);
+  const installation = !callable ? 'unsupported' : observed.length ? 'remote_caller' : local ? 'local_provider' : unknown ? 'unknown' : 'absent';
+  return {
+    installation,
+    fixer_present: !callable ? false : local || observed.length > 0 ? true : unknown ? null : false,
+    observed_refs: [...new Set(observed.map(c => c.ref))].sort(),
+    callers: observed,
+    desired_ref: desiredRef,
+    evidence_complete: !unknown,
+    // Presence cannot establish that a remote workflow ever succeeded.
+    execution_verified: false,
+  };
+}

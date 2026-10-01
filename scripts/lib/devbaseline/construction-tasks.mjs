@@ -5,7 +5,7 @@
 // reverting a commit here. This module only produces the list; who opens the issues is a
 // separate, explicit step.
 
-export const TASK_KINDS = ['no_access', 'staging_missing', 'ci_missing', 'fix_missing', 'check_missing', 'context_missing', 'ci_required_unknown'];
+export const TASK_KINDS = ['no_access', 'staging_missing', 'ci_missing', 'fix_missing', 'fix_upgrade', 'fix_unverified', 'check_missing', 'context_missing', 'ci_required_unknown'];
 
 /** One task per real gap. Ordering is by repository so two runs produce the same list. */
 export function buildConstructionTasks(rows) {
@@ -36,9 +36,19 @@ export function buildConstructionTasks(rows) {
         ['AC-20', 'AC-21']);
     }
     if (r.fix && r.fix.supported && r.fix.fixer_present === false) {
-      add(r.repo, 'fix_missing', `${r.repo}: AutoFix callable is declared but not installed`,
+      add(r.repo, 'fix_missing', 'fix_upgrade', 'fix_unverified', `${r.repo}: AutoFix callable is declared but not installed`,
         `Install ${r.fix.autofix_callable}@${r.autofix_ref || 'the pinned ref'} via the setup procedure (setup → run → evidence → teardown).`,
         ['AC-21', 'AC-44']);
+    }
+    if (r.fix?.supported && r.fix.fixer_present !== false) {
+      const refs = r.fix.observed_refs || [];
+      if (refs.some(ref => ref !== r.fix.desired_ref)) {
+        add(r.repo, 'fix_upgrade', `${r.repo}: review existing AutoFix pins`,
+          `Observed refs: ${refs.join(', ')}; desired ref: ${r.fix.desired_ref}. Compare releases and upgrade through setup; installation is already present.`, ['AC-21', 'AC-44']);
+      } else if (r.fix.installation === 'remote_caller' || r.fix.installation === 'unknown' || r.fix.evidence_complete === false) {
+        add(r.repo, 'fix_unverified', `${r.repo}: verify AutoFix installation evidence`,
+          `Installation: ${r.fix.installation}; observed refs: ${refs.join(', ') || 'unknown'}. Obtain successful run evidence; presence alone is not proof of working integration.`, ['AC-21', 'AC-44']);
+      }
     }
     if (r.profile === 'minimal') {
       add(r.repo, 'check_missing', `${r.repo}: no check entrypoint — check is a no-op marked missing`,
