@@ -143,6 +143,22 @@ process.stdout.write('fixed src/sum.js: removed the off-by-one\\n');
     check('budget.diff_tokens_used > 0', Number(stats.budget?.diff_tokens_used) > 0, String(stats.budget?.diff_tokens_used));
     check('tool.commit is the real fix SHA', stats.tool?.commit === fixSha, `tool.commit=${stats.tool?.commit} fixSha=${fixSha}`);
     check('attempt_count reflects attempts', Number.isInteger(stats.attempt_count) && stats.attempt_count >= 1, String(stats.attempt_count));
+
+    // The receipt must say WHY patch_refs is what it is. Acceptance asks for a no-change repeat to
+    // carry no patch — but an empty array is ambiguous between "nothing needed changing" and
+    // "the writer never filled this in". patch_refs_source is the disambiguation.
+    check('patch_refs_source is declared (applied for a committed fix)', stats.patch_refs_source === 'applied', String(stats.patch_refs_source));
+    check('tool.commit is a 40-hex SHA', /^[0-9a-f]{40}$/.test(String(stats.tool?.commit)), String(stats.tool?.commit));
+    check('included_paths are files the fix actually touched', Array.isArray(stats.included_paths) && stats.included_paths.includes('src/sum.js'), JSON.stringify(stats.included_paths));
+    check('prompt_included_paths records what entered the prompt', Array.isArray(stats.prompt_included_paths), JSON.stringify(stats.prompt_included_paths));
+
+    // Redaction and retention are asserted ON THE ARTIFACT, not by the presence of a field: a
+    // field that exists but is empty proves nothing (AC-07: no credential values anywhere).
+    const raw = JSON.stringify(stats);
+    check('no secret-shaped value in the receipt', !/(ghp_|github_pat_|gh[osu]_|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY)/.test(raw),
+      (raw.match(/.{0,20}(ghp_|github_pat_|AKIA|PRIVATE KEY).{0,20}/) || ['—'])[0]);
+    check('retention is present with a ttl', Number(stats.retention?.ttl_days) > 0 && !!stats.retention?.artifact, JSON.stringify(stats.retention));
+    check('llm_usage is recorded from the actual run', typeof stats.llm_usage?.calls === 'number', JSON.stringify(stats.llm_usage));
   }
 
   const failed = results.filter(r => !r.ok);

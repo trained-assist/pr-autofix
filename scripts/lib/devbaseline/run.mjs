@@ -4,9 +4,13 @@
 // through the CLI, never by calling this module (AC-19):
 //   0 pass / no_change      1 controlled failure      2 needs_human      3 invalid config
 //
-// `needs_human` (2) is deliberately NOT a pipeline failure: either the profile has no fixer,
-// or `fix.cap` attempts are spent. It is reported with its own outcome and reason_code so the
-// number of unresolved cases is countable rather than anecdotal.
+// `needs_human` (2) means either the profile has no fixer, or `fix.cap` attempts are spent. It
+// keeps its own outcome and reason_code so the number of unresolved cases is countable rather
+// than anecdotal — and it BLOCKS the merge: the caller decides the colour through
+// gate.mjs, which treats only exit 0 as green. An earlier version of this comment claimed
+// needs_human was "deliberately NOT a pipeline failure", and a workflow branched on that claim to
+// turn exit 2 into a green required check. The classification was always worth keeping; the
+// exemption was not.
 
 import fs from 'node:fs';
 import path from 'node:path';

@@ -97,8 +97,8 @@
     },
     {
       "path": "scripts/lib/devbaseline/run.mjs",
-      "sha256": "7e83e3cb8b0aafed6909eb3ee1d2b2d69654d70e191bb6a8bbfba31c6d4559d4",
-      "bytes": 12735
+      "sha256": "930376ca0b053193cf36fd18606937376928dff1c4f99f35d0c19fe0ef75dca6",
+      "bytes": 13061
     },
     {
       "path": "scripts/lib/devbaseline/schema.mjs",
