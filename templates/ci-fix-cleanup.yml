@@ -29,7 +29,13 @@ jobs:
             echo "No ci-fixer-original-pr marker found — nothing to close"
             exit 0
           fi
-          STATE=$(gh pr view "$ORIG_PR" -R "${{ github.repository }}" --json state -q '.state' 2>/dev/null || echo "NOT_FOUND")
+          # An unreachable API is NOT the same fact as a closed PR. The previous line folded both
+          # into "NOT_FOUND" via `|| echo`, so a network failure read as "nothing to do" and the
+          # step went green — the R4 class, fail-open around a network call (§5.4).
+          if ! STATE=$(gh pr view "$ORIG_PR" -R "${{ github.repository }}" --json state -q '.state'); then
+            echo "::error::could not read PR #$ORIG_PR from the API — refusing to report it as closed"
+            exit 1
+          fi
           if [ "$STATE" != "OPEN" ]; then
             echo "Original PR #$ORIG_PR is $STATE — nothing to do"
             exit 0

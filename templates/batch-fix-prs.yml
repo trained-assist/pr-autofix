@@ -78,12 +78,22 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AUTOFIX_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Download autofix script
+      # Pinned by the COMMIT this workflow ran from, never by `main` (R2/§5.1). The template
+      # violated exactly the invariant autofix-callable.yml enforces: a caller invoking it by a
+      # moving branch would execute whatever main happened to hold. The refusal to fall back is
+      # deliberate — a silent fallback to `main` is how a gate stops being a gate.
+      - name: Download the autofix script pinned to this run
+        env:
+          TOOL_SHA: ${{ github.workflow_sha }}
         run: |
+          if [ -z "$TOOL_SHA" ]; then
+            echo "Could not resolve the workflow commit — refusing to fall back to main" >&2
+            exit 1
+          fi
           curl -fsSL \
-            https://raw.githubusercontent.com/trained-assist/pr-autofix/main/scripts/autofix.mjs \
-            -o /tmp/autofix.mjs
-          node --check /tmp/autofix.mjs
+            "https://raw.githubusercontent.com/trained-assist/pr-autofix/${TOOL_SHA}/scripts/autofix.mjs" \
+            -o "$RUNNER_TEMP/autofix.mjs"
+          node --check "$RUNNER_TEMP/autofix.mjs"
 
       - uses: actions/setup-node@v4
         with:

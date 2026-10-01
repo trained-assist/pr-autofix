@@ -193,6 +193,21 @@ function cmdCheckWorkflows(flags) {
     // A file named *-callable.yml that cannot be called is the exact regression R26 describes:
     // an installer points at it, the consumer's `uses:` silently fails to compose.
     if (!/workflow_call\s*:/.test(text)) violations.push(`${f}: named as callable but does not declare \`on: workflow_call\``);
+    // A delivery boundary that can drift is not a boundary. R2: templates/batch-fix-prs.yml
+    // fetched the tool from `main` — the exact invariant autofix-callable.yml refuses to break —
+    // so a caller pinned a commit and executed whatever the branch held. Rule, not a one-off fix:
+    // the same mistake in the next template must fail here too.
+    if (/raw\.githubusercontent\.com\/[^\s"']+\/(main|master)\//.test(text)) {
+      violations.push(`${f}: downloads the tool from a moving branch (main/master) — pin a commit SHA`);
+    }
+    // Fail-open around a NETWORK or DESTRUCTIVE call (R4 class, §5.4). `gh … 2>/dev/null || echo
+    // NOT_FOUND` and `… || true` make "I could not ask GitHub" indistinguishable from "the thing
+    // does not exist" — and the step then reports success having done nothing. Scoped to `gh` and
+    // `curl` deliberately: a `grep` that finds no marker IS "no marker", and flagging that would
+    // be a rule nobody could satisfy.
+    for (const m of text.matchAll(/^.*\b(?:gh|curl)\b[^\n]*\|\|\s*(?:true|echo\b[^\n]*).*$/gm)) {
+      violations.push(`${f}: swallows a gh/curl failure with \`||\` — an unreachable API must not read as "nothing to do": ${m[0].trim().slice(0, 120)}`);
+    }
   }
   out(`check-workflows: ${files.length} workflow file(s) in ${path.relative(process.cwd(), dir) || '.'} · ${violations.length} violation(s)`);
   if (violations.length) violations.forEach(v => out(`  · ${v}`));

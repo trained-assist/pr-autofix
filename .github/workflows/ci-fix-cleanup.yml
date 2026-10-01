@@ -19,7 +19,12 @@ name: CI fix cleanup (callable)
 #       pull-requests: write
 #     uses: trained-assist/pr-autofix/.github/workflows/ci-fix-cleanup.yml@v1
 #     with:
-#       keep_branches: '[]'
+#       dry_run:
+        description: 'Print the plan (delete / keep / refused) and delete nothing.'
+        required: false
+        type: boolean
+        default: true
+      keep_branches: '[]'
 #     secrets:
 #       gh_token: ${{ secrets.AUTOFIX_PAT || github.token }}
 
@@ -27,10 +32,19 @@ on:
   workflow_call:
     inputs:
       pr_number:
-        description: 'PR whose fix branches are cleaned up (0 = every pr-autofix-fix/* branch)'
+        # CHANGED (R4): an empty or 0 scope used to mean "every pr-autofix-fix/* branch", which is
+        # how a cleanup for PR 11 deleted PR 22's branch. An unusable scope now refuses EVERY
+        # branch and fails the job with an explicit error: a missing scope must never widen to all.
+        # A branch is deleted only when the prefix, its own PR number and this scope agree.
+        description: 'PR whose OWN fix branches are cleaned up. Required: empty/0 refuses everything.'
         required: false
         type: string
         default: ''
+      dry_run:
+        description: 'Print the plan (delete / keep / refused) and delete nothing.'
+        required: false
+        type: boolean
+        default: true
       keep_branches:
         description: 'JSON array of branch names to KEEP (e.g. the branch of an open fix PR)'
         required: false
@@ -48,56 +62,27 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Delete pr-autofix-fix/* branches
+      # Branch deletion is destructive and irreversible, so the OWNERSHIP decision lives in
+      # scripts/lib/devbaseline/cleanup.mjs as a pure predicate (false by default) and this step is
+      # only the executor. R4: the previous loop filtered by the `pr-autofix-fix/` prefix alone, so
+      # pr_number=11 deleted PR 22's branch — the input was documented as the scope of action and
+      # used only in the summary line. It also read the branch list with `2>/dev/null || true`
+      # under `set -uo pipefail`, so an unavailable API produced an empty list, "nothing to do",
+      # exit 0 — "no such branch" and "I could not ask" were the same event.
+      - name: Delete this PR's own pr-autofix-fix/* branches
         env:
           GH_TOKEN: ${{ secrets.gh_token || github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           KEEP_BRANCHES: ${{ inputs.keep_branches }}
         run: |
-          set -uo pipefail
-
-          # Branch deletion is destructive and irreversible on GitHub, so the pattern is scoped
-          # to this tool's own prefix and every candidate is printed before anything is deleted.
-          PATTERN='pr-autofix-fix/'
+          set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::no gh_token provided — nothing to clean up"
-            exit 0
+            echo "::error::no gh_token provided — refusing to guess a branch list; nothing deleted"
+            exit 1
           fi
-
-          echo "keep list: ${KEEP_BRANCHES:-[]}"
-          KEEP_OK=$(node -e '
-            const raw = process.argv[1] || "[]";
-            try {
-              const v = JSON.parse(raw);
-              if (!Array.isArray(v)) throw new Error("keep_branches must be a JSON array");
-              process.stdout.write("ok");
-            } catch (e) { process.stdout.write(`bad:${e.message}`); }
-          ' "${KEEP_BRANCHES:-[]}")
-          case "$KEEP_OK" in
-            ok) ;;
-            *) echo "::error::keep_branches is not valid JSON ($KEEP_OK) — refusing to delete anything"; exit 1 ;;
-          esac
-
-          REPO="${GITHUB_REPOSITORY}"
-          mapfile -t BRANCHES < <(gh api "repos/$REPO/git/matching-refs/heads/$PATTERN" --jq '.[].ref' 2>/dev/null \
-            | sed 's|^refs/heads/||' || true)
-
-          if [ "${#BRANCHES[@]}" -eq 0 ]; then
-            echo "no branches match ${PATTERN} — nothing to do"
-            exit 0
-          fi
-
-          DELETED=0; KEPT=0
-          for b in "${BRANCHES[@]}"; do
-            [ -n "$b" ] || continue
-            if node -e 'const k=JSON.parse(process.argv[1]);process.exit(k.includes(process.argv[2])?0:1)' "${KEEP_BRANCHES:-[]}" "$b"; then
-              echo "keep    $b (listed in keep_branches)"; KEPT=$((KEPT+1)); continue
-            fi
-            echo "delete  $b"
-            if gh api -X DELETE "repos/$REPO/git/refs/heads/$b" >/dev/null 2>&1; then
-              DELETED=$((DELETED+1))
-            else
-              echo "::warning::could not delete $b (may already be gone)"
-            fi
-          done
-          echo "cleanup summary: deleted=$DELETED kept=$KEPT scanned=${#BRANCHES[@]} pr=${PR_NUMBER:-n/a}"
+          node "$GITHUB_ACTION_PATH/scripts/cleanup-branches.mjs" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pr "${PR_NUMBER:-}" \
+            --keep "${KEEP_BRANCHES:-[]}" \
+            ${{ inputs.dry_run && '--dry-run' || '--no-dry-run' }}
+"
