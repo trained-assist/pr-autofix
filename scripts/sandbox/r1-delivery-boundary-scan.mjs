@@ -108,6 +108,38 @@ for (const wf of workflows) {
     const jobText = steps.map(s => String(s.run || '')).join('\n');
     const fetchIntoJob = /fetch-payload\.mjs|curl -|wget |git clone|tar |unzip /.test(jobText);
 
+    // ── the delivery FORM (R1 collision class, pr-autofix#61) ─────────────────────
+    // A different question from "is the import tree delivered": a checkout can bring the whole
+    // tree and STILL destroy the consumer. actions/checkout resolves `path` against
+    // GITHUB_WORKSPACE and refuses anything outside it (input-helper.ts:42-52), so keeping the
+    // consumer's own paths unclaimed is a CONTRACT of the class, and it is asserted here in every
+    // delivery point: an absolute path under `${{ runner.temp }}`, the step-scoped containment
+    // root that makes such a path legal for the real action, a collision preflight BEFORE any
+    // write, and no relocation step left over from the form that lost consumer content.
+    const toolCheckout = steps.find(st => /^actions\/checkout@/.test(String(st.uses || ''))
+      && String((st.with && st.with.repository) || '')
+        .replace(/\$\{\{\s*job\.workflow_repository\s*\}\}$/, TOOL_REPO).trim() === TOOL_REPO);
+    if (toolCheckout) {
+      const ci = steps.indexOf(toolCheckout);
+      const toolPath = String((toolCheckout.with && toolCheckout.with.path) || '').trim();
+      const stepWs = String((toolCheckout.env && toolCheckout.env.GITHUB_WORKSPACE) || '').trim();
+      if (!/^\$\{\{\s*runner\.temp\s*\}\}\//.test(toolPath)) {
+        note(wf, `job "${jobName}" materializes the tool tree at ${toolPath || '(no path)'} — a path inside the consumer`,
+          `path: ${toolPath}; the consumer may own that directory and checkout would clear it`);
+      }
+      if (stepWs !== '${{ runner.temp }}') {
+        note(wf, `job "${jobName}" does not scope the tool checkout's GITHUB_WORKSPACE to the runner temp`,
+          `env.GITHUB_WORKSPACE: ${stepWs || '(none)'}; the absolute path is then refused by the action`);
+      }
+      const pre = steps.findIndex(st => /RUNNER_TEMP\/pr-autofix/.test(String(st.run || '')) && /refusing/.test(String(st.run || '')));
+      if (pre === -1 || pre > ci) {
+        note(wf, `job "${jobName}" has no collision preflight before the materialization`,
+          `preflight@${pre}, checkout@${ci}`);
+      }
+      const mv = steps.find(st => /\bmv\b[\s\S]*pr-autofix/.test(String(st.run || '')));
+      if (mv) note(wf, `job "${jobName}" still relocates the tool tree out of the consumer root`, `step: ${mv.name || '(unnamed)'}`);
+    }
+
     // Delivery ORDER matters. A tree fetched through payload.manifest.json only exists AFTER that
     // fetch step runs; anything executed BEFORE it is a bootstrap that must bring its own imports
     // (fetch-payload.mjs is exactly this: it imports the very module the manifest declares, so it

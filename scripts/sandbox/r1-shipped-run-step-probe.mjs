@@ -250,14 +250,24 @@ async function runJob({ inputs, secrets, ghMode, cwd }) {
   for (const step of steps) {
     if (!step.run) {
       // Emulate `uses:` steps the way the runner really does them. actions/checkout materialises
-      // the FULL tool tree at the requested ref into the workspace — that is the one delivery
-      // shape that cannot half-work, because it brings every import with it. Any other action is
-      // recorded as not emulated rather than silently ignored.
+      // the FULL tool tree at the requested ref — that is the one delivery shape that cannot
+      // half-work, because it brings every import with it. It also resolves `path` against
+      // GITHUB_WORKSPACE (the STEP's, which the shipped Materialize step scopes to the runner
+      // temp) and refuses anything outside it (input-helper.ts:42-52) — and it CLEARS a target
+      // that exists without `.git` (prepareExistingDirectory → rmRF), which is exactly what
+      // destroyed a consumer-owned directory in R1. Emulating the copy alone hid all three.
       if (/^actions\/checkout@/.test(String(step.uses || ''))) {
-        const sub = (step.with && String(step.with.path || '').trim()) || '';
-        const dest = sub ? path.join(workspace, sub) : workspace;
+        const stepRoot = stepEnv(step, inputs, secrets).GITHUB_WORKSPACE || workspace;
+        const sub = render(String((step.with && step.with.path) || '').trim(), { inputs, secrets });
+        const dest = sub ? path.resolve(stepRoot, sub) : stepRoot;
+        if (dest !== stepRoot && !dest.startsWith(stepRoot + path.sep)) {
+          out.push({ name: step.name || step.uses, code: 1, emulated: 'refused',
+            stderr: `::error::Repository path '${dest}' is not under '${stepRoot}'` });
+          return { steps: out, calls, code: 1, stdout: '', stderr: `::error::checkout refused '${dest}'` };
+        }
+        if (existsSync(dest) && !existsSync(path.join(dest, '.git'))) rmSync(dest, { recursive: true, force: true });
         mkdirSync(path.dirname(dest), { recursive: true });
-        out.push({ name: step.name || step.uses, emulated: `checkout -> ${path.relative(workspace, dest) || '.'}` });
+        out.push({ name: step.name || step.uses, emulated: `checkout -> ${dest} (GITHUB_WORKSPACE=${stepRoot})` });
         cpSync(CODE, dest, { recursive: true, dereference: true, filter: p => !p.includes('/.git/') });
         continue;
       }
