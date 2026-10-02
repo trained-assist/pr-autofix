@@ -12,12 +12,23 @@
 // contains `${...}`-free text today, but shell interpolation of a URL is how a caller ends up
 // fetching from a moving branch. The caller writes the identity it resolved; this script never
 // guesses one.
+//
+// R1 — ZERO RELATIVE IMPORTS, ON PURPOSE. This file is a BOOTSTRAP: it is the one file that must
+// exist before the manifest it honours is laid out, so it cannot be delivered by that manifest.
+// It used to `import { verifyManifest } from './lib/devbaseline/payload.mjs'` — a dependency it
+// could only satisfy when someone remembered to place the module next to it. That is the #38 shape
+// (a hand-kept file list) rebuilt one level up, and the workflow's curl of this single file is
+// exactly how it half-worked in production: the step died with ERR_MODULE_NOT_FOUND while the
+// manifest it was about to verify looked fine. Verification is therefore NOT done here — it is done
+// by the payload CLI, run FROM the tree this file just laid out (that is what `payload-verify`
+// does, in both directions). Nothing is duplicated, and a bootstrap that runs alone in an empty
+// scratch dir cannot be quietly dependent on a neighbour. The offline sandbox
+// (scripts/sandbox/consumer-boundary.mjs) now runs this file from such an empty dir on purpose.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { verifyManifest } from './lib/devbaseline/payload.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -66,20 +77,18 @@ for (const e of manifest.entries || []) {
   fetched++;
 }
 
-// Both directions: missing, hash mismatch, and files present but undeclared.
-const v = verifyManifest(manifest, dest);
-if (!v.ok) {
-  for (const p of v.missing) process.stderr.write(`fetch-payload: missing ${p}\n`);
-  for (const p of v.hash_mismatch) process.stderr.write(`fetch-payload: hash mismatch ${p}\n`);
-  for (const p of v.undeclared) process.stderr.write(`fetch-payload: undeclared in tree ${p}\n`);
-  if (v.reason) process.stderr.write(`fetch-payload: ${v.reason}\n`);
-  process.exit(1);
+// Both directions — missing, hash mismatch, and files present but undeclared — are verified by the
+// payload CLI run below, FROM this tree. Verifying here would mean importing the very module the
+// manifest declares, which is the bootstrap dependency this file must not have.
+process.stdout.write(`fetch-payload: ${fetched} file(s) laid out under the tree\n`);
+if (has('dry-run')) {
+  process.stdout.write('fetch-payload: --dry-run — the tree is NOT verified and NOT executed (verification happens in the run step)\n');
+  process.exit(0);
 }
-process.stdout.write(`fetch-payload: ${fetched} file(s) laid out under the tree, hashes verified\n`);
-if (has('dry-run')) process.exit(0);
 
 // RUN the payload. `node --check` was proven blind to unresolved imports — the original loader
-// used it and shipped a CLI that could not start. The subcommand is the only honest smoke test.
+// used it and shipped a CLI that could not start. The subcommand is the only honest smoke test:
+// it starts the CLI from the tree AND proves the tree matches the manifest at that commit.
 const cli = path.join(dest, 'scripts', 'devbaseline.mjs');
 const runIdx = argv.indexOf('--run');
 const sub = runIdx === -1 ? 'payload-verify' : (argv[runIdx + 1] || 'payload-verify');

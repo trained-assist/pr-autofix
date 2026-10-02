@@ -79,7 +79,13 @@ for (const b of plan.delete) {
 
 out(`cleanup summary: deleted=${deleted} failed=${failed} kept=${plan.keep.length} refused=${plan.refused.length} scanned=${branches.length} pr=${flag('pr', process.env.PR_NUMBER || '') || 'n/a'}${dryRun ? ' (dry run — nothing deleted)' : ''}`);
 
+// R1b: refusing to widen the scope and then reporting SUCCESS are different claims. This used to
+// print `::error::…` and exit 0, so "we refused to act" was a green required check — the same
+// shape R3 was rejected for (needs_human reported as a pass). A refusal that cannot be told apart
+// from a completed cleanup is not a refusal. Nothing is deleted either way; now it also says so
+// with an exit code the caller cannot misread.
 if (plan.refused.some(r => r.reason.startsWith('no usable pr_number'))) {
   err('::error::the pr_number scope was not usable — every branch was refused. Fix the input rather than widening the scope.');
+  process.exit(1);
 }
 process.exit(failed > 0 ? 1 : 0);

@@ -45,49 +45,46 @@ jobs:
         with:
           node-version: '22'
 
-      # Everything below runs against the PINNED payload, downloaded as a tree from the commit
-      # this workflow was called at — never from main, never as a flat copy.
-      #
-      # Why it is shaped this way (R2): the previous loader kept a hand-written list of ~20 files,
-      # wrote them FLAT via `$(basename "$f")`, and proved them with `node --check`. The CLI
-      # imports ./lib/devbaseline/*.mjs, so the first real run failed with ERR_MODULE_NOT_FOUND
-      # while the check stayed GREEN — `node --check` parses one file and never resolves imports.
-      # Now the composition of the payload is declared in payload.manifest.json, the layout
-      # preserves the tree, both directions are verified (missing AND undeclared), and the payload
-      # is then RUN — `payload-verify` needs the CLI, so a broken payload cannot pass silently.
-      - name: Fetch the pinned devbaseline payload
-        env:
-          WORKFLOW_REPO: ${{ job.workflow_repository }}
-          WORKFLOW_SHA: ${{ job.workflow_sha }}
+      # R1 — the delivery boundary, now the same mechanism as ci-fix-cleanup.yml: check out the
+      # TREE of the commit this workflow was called at. It replaces a hand-written list of ~20
+      # files written FLAT via `$(basename "$f")` and then "proven" with `node --check` — a check
+      # that parses one file and never resolves imports, so the CLI's first real run failed with
+      # ERR_MODULE_NOT_FOUND while the loader reported success (R2). A full tree cannot half-work:
+      # every `./lib/devbaseline/*.mjs` import comes with it, and the first new import is no longer
+      # a chance to break. `payload-verify` below then proves both directions (missing AND
+      # undeclared) against the manifest committed at that same SHA — and it runs the CLI FROM the
+      # tree, because only running it can prove it starts.
+      - name: Materialize the pinned tool tree
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: pr-autofix
+          persist-credentials: false
+
+      - name: The tree we are about to run is the tree the manifest declares
         run: |
-          if [ -z "$WORKFLOW_REPO" ] || [ -z "$WORKFLOW_SHA" ]; then
-            echo "Could not resolve the reusable-workflow identity — refusing to fall back to main" >&2
+          set -euo pipefail
+          if [ ! -f pr-autofix/scripts/devbaseline.mjs ]; then
+            echo "::error::the pinned tool tree is not in the workspace — refusing to run anything"
             exit 1
           fi
-          base="https://raw.githubusercontent.com/${WORKFLOW_REPO}/${WORKFLOW_SHA}"
-          printf '%s' "$base" > "$RUNNER_TEMP/payload-base.txt"
-          curl -fsSL "$base/payload.manifest.json" -o "$RUNNER_TEMP/payload.manifest.json"
-          # fetch-payload.mjs is the one file that must exist before the manifest can be honoured.
-          curl -fsSL "$base/scripts/fetch-payload.mjs" -o "$RUNNER_TEMP/fetch-payload.mjs"
-          # --run payload-verify: proves completeness AND executes the CLI from the tree.
-          node "$RUNNER_TEMP/fetch-payload.mjs" \
-            --manifest "$RUNNER_TEMP/payload.manifest.json" \
-            --from-file "$RUNNER_TEMP/payload-base.txt" \
-            --dest "$RUNNER_TEMP/devbaseline" \
-            --run payload-verify --manifest "$RUNNER_TEMP/payload.manifest.json" --dir "$RUNNER_TEMP/devbaseline"
+          node pr-autofix/scripts/devbaseline.mjs payload-verify \
+            --manifest pr-autofix/payload.manifest.json \
+            --dir pr-autofix
 
       - name: Which baseline does this repository have?
         id: shape
         run: |
-          node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" validate --repo . --all-profiles | tee "$RUNNER_TEMP/shape.txt"
+          node pr-autofix/scripts/devbaseline.mjs validate --repo . --all-profiles | tee "$RUNNER_TEMP/shape.txt"
           echo "profile_line=$(grep -m1 'profile ' "$RUNNER_TEMP/shape.txt" || echo unknown)" >> "$GITHUB_OUTPUT"
 
       - name: Adapter is valid
         if: inputs.profile == ''
-        run: node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" validate --repo .
+        run: node pr-autofix/scripts/devbaseline.mjs validate --repo .
 
       - name: Documentation check
-        run: node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" check-docs --dir .
+        run: node pr-autofix/scripts/devbaseline.mjs check-docs --dir .
 
       # The gate, as ONE line and ONE owner (R3). The previous version branched on exit code 2 in
       # shell and exited 0 — `needs_human` reported as a green required check, so a repository with
@@ -100,7 +97,50 @@ jobs:
         run: |
           args=(gate --repo . --log devbaseline-verify.json)
           [ -n "${{ inputs.profile }}" ] && args+=(--profile "${{ inputs.profile }}")
-          node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" "${args[@]}"
+          node pr-autofix/scripts/devbaseline.mjs "${args[@]}"
+
+      # R2 — the INDEPENDENT reader of the record the gate just wrote. `if: always()`: the receipt of a
+      # failed gate is exactly the one worth checking. It does NOT re-judge the gate — that colour
+      # is the gate step's own job and is unchanged — it opens the persisted JSON and asks whether
+      # the verdict stored in it agrees with the verify_exit and staging stored next to it. Until
+      # this step nothing ever opened that file (the scan showed zero production readers), so a
+      # blocked merge could sit on disk as `outcome: no_change` with `gate_violations: []` and only
+      # stdout would say otherwise. Fails only on a SELF-CONTRADICTORY record; a legitimately red
+      # repository is not red twice for the same reason, and a missing record is left to the gate.
+      - name: The record agrees with itself (receipt-check)
+        if: always()
+        run: |
+          set +e
+          if [ ! -f devbaseline-verify.json ]; then
+            echo "no receipt was written — the gate step's own colour decides this job"
+            exit 0
+          fi
+          node pr-autofix/scripts/devbaseline.mjs receipt-check --log devbaseline-verify.json
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::error::the gate wrote a receipt that cannot be read"
+            exit 1
+          fi
+          exit "$code"
+
+      # R4 — retention has an EXECUTOR, not just a number. The `retention-days` below configures
+      # GitHub's server-side artifact expiry (a mirror, asserted as configuration); this step is
+      # the local half: every receipt this job wrote carries `retention.written_at + ttl_days`,
+      # and the sweep deletes exactly the ones past their deadline. `if: always()` because the
+      # records of a FAILED run are just as much subject to the TTL. Active records (no
+      # written_at) and unreadable files are kept and reported — never silently deleted.
+      - name: Retention is executed, not declared (retention-sweep)
+        if: always()
+        run: |
+          set -euo pipefail
+          store="$RUNNER_TEMP/receipts"
+          mkdir -p "$store"
+          # Collect every receipt this job produced into the store the sweeper owns.
+          for f in devbaseline-verify.json; do
+            [ -f "$f" ] && cp "$f" "$store/" || true
+          done
+          node pr-autofix/scripts/devbaseline.mjs retention-sweep --dir "$store"
 
       - name: Upload the verify record
         if: always()
@@ -109,12 +149,14 @@ jobs:
           name: devbaseline-verify-${{ github.run_id }}
           path: devbaseline-verify.json
           if-no-files-found: ignore
+          # A MIRROR of the local TTL, not its executor: GitHub expires this copy server-side
+          # after 90 days. The deletion that is actually testable is retention-sweep above (R4).
           retention-days: 90
 
       - name: Inventory row for this repository
         if: inputs.mode == 'staging-gate'
         run: |
-          node "$RUNNER_TEMP/devbaseline/scripts/devbaseline.mjs" inventory \
+          node pr-autofix/scripts/devbaseline.mjs inventory \
             --out devbaseline-inventory \
             --repos <(printf '[{"repo":"%s","type_hint":null,"ci_required":null,"path":"."}]\n' "$GITHUB_REPOSITORY")
           cat devbaseline-inventory/repo-coverage.md >> "$GITHUB_STEP_SUMMARY"

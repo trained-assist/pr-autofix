@@ -58,6 +58,24 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      # R1 — THE DELIVERY BOUNDARY. A reusable workflow runs in the CALLER's repository, so this
+      # job used to reach for `$GITHUB_ACTION_PATH` (a variable only a COMPOSITE action sets) and
+      # never brought the tool with it: the step died at `line 6: GITHUB_ACTION_PATH: unbound
+      # variable` before any GitHub call, in every consumer. One mechanism now delivers the tool
+      # for all three reusable workflows: check out the pinned tree of THIS workflow's own commit.
+      # It is a full tree, not a file list, so every relative import comes with it — the first
+      # import is no longer a chance to break. `persist-credentials: false` leaves no token in the
+      # clone. The invariant is enforced by scripts/sandbox/r1-delivery-boundary-scan.mjs, and the
+      # step that runs is rehearsed by scripts/sandbox/r1-shipped-run-step-probe.mjs in an EMPTY
+      # consumer runner — not by grepping this file for a script name.
+      - name: Materialize the pinned tool tree
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: pr-autofix
+          persist-credentials: false
+
       # Branch deletion is destructive and irreversible, so the OWNERSHIP decision lives in
       # scripts/lib/devbaseline/cleanup.mjs as a pure predicate (false by default) and this step is
       # only the executor. R4: the previous loop filtered by the `pr-autofix-fix/` prefix alone, so
@@ -76,7 +94,11 @@ jobs:
             echo "::error::no gh_token provided — refusing to guess a branch list; nothing deleted"
             exit 1
           fi
-          node "$GITHUB_ACTION_PATH/scripts/cleanup-branches.mjs" \
+          if [ ! -f pr-autofix/scripts/cleanup-branches.mjs ]; then
+            echo "::error::the pinned tool tree is not in the workspace — refusing to run anything"
+            exit 1
+          fi
+          node pr-autofix/scripts/cleanup-branches.mjs \
             --repo "${GITHUB_REPOSITORY}" \
             --pr "${PR_NUMBER:-}" \
             --keep "${KEEP_BRANCHES:-[]}" \

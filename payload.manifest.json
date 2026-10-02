@@ -42,8 +42,8 @@
     },
     {
       "path": "scripts/devbaseline.mjs",
-      "sha256": "00ae737439125af9483a5b1c9273cdaf1526760bc6d29711ee30b53cd7fa3b44",
-      "bytes": 20085
+      "sha256": "7193c30e340dd87d97a6f30790c227bad2f84daf275a87c1ce2a7eef23870c6d",
+      "bytes": 24434
     },
     {
       "path": "scripts/lib/devbaseline/adapter.mjs",
@@ -72,8 +72,8 @@
     },
     {
       "path": "scripts/lib/devbaseline/gate.mjs",
-      "sha256": "a9f0709856af3a7beae82c3d996cf6b8f41be7f6c67c0bd35d892d04d42ae0ba",
-      "bytes": 5930
+      "sha256": "912932faeb4debd4cc615a790af5336ab954497ebfa962f37f604a5c4b960cf8",
+      "bytes": 6629
     },
     {
       "path": "scripts/lib/devbaseline/inventory.mjs",
@@ -82,8 +82,8 @@
     },
     {
       "path": "scripts/lib/devbaseline/log.mjs",
-      "sha256": "b3b0c42834d19aff2604a846f33a793a03118e84c98060420a7728f10009e420",
-      "bytes": 6734
+      "sha256": "883b952b88511df2cd111659610d3929f9d222dd59fb69691c04c930186e8fcc",
+      "bytes": 9179
     },
     {
       "path": "scripts/lib/devbaseline/payload.mjs",
@@ -96,9 +96,19 @@
       "bytes": 7333
     },
     {
+      "path": "scripts/lib/devbaseline/receipt.mjs",
+      "sha256": "ba07dd406e5c2cb25adaca446d2c08cd2f54f680d412cec94341b6c433278c05",
+      "bytes": 6112
+    },
+    {
       "path": "scripts/lib/devbaseline/resolve.mjs",
       "sha256": "37a31685c1e8b2eedb1950d94039c55f7a6f9e440ebc34f48beda4135917f868",
       "bytes": 5489
+    },
+    {
+      "path": "scripts/lib/devbaseline/retention.mjs",
+      "sha256": "d93b6db81b32053d7abc8ad519821cb9ddf7fd1e95323a2c7b08b4f87a0794ee",
+      "bytes": 5646
     },
     {
       "path": "scripts/lib/devbaseline/run.mjs",

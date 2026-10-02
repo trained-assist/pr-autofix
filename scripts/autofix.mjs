@@ -290,16 +290,25 @@ function writeStats(category, extra = {}) {
   const violations = extra.gate_violations || [];
   const firstRule = extra.rule_id || violations[0]?.rule_id || null;
   const toolRef = (process.env.AUTOFIX_WORKFLOW_REF || '').split('@').pop() || 'unpinned:local';
-  // A "commit" that is not a 40-hex SHA is not a commit. AUTOFIX_WORKFLOW_SHA was recorded
-  // verbatim, so an absent or non-SHA env value landed in the receipt as a plausible-looking
-  // commit field (R6). The shape is checked; an invalid value degrades to `unpinned:local` and
-  // says so, instead of asserting a provenance that does not exist.
-  const declaredCommit = extra.tool_commit || process.env.AUTOFIX_WORKFLOW_SHA || process.env.AUTOFIX_TOOL_COMMIT || '';
+  // R3 — WHICH BUILD RAN, answered only by the env that pins the build. `extra.tool_commit` used
+  // to win here, and the fix call site passed the CONSUMER's patch commit through it: the receipt
+  // read "pr-autofix built this" while naming the commit of the repository it fixed. An `extra.*`
+  // slot is writable by any call site, so one field could hold two entities depending on who
+  // wrote it — and the test that checked it had been rewritten under the new meaning. The patch
+  // has its own slot (`patch.commit`), below. A "commit" that is not a 40-hex SHA is not a commit:
+  // an absent or malformed env value degrades to `unpinned:local` and says so.
+  const declaredCommit = process.env.AUTOFIX_WORKFLOW_SHA || process.env.AUTOFIX_TOOL_COMMIT || '';
   const commitIsSha = /^[0-9a-f]{40}$/.test(String(declaredCommit));
   const toolCommit = commitIsSha ? declaredCommit : 'unpinned:local';
   const patchRefs = extra.patch_refs ?? [];
+  // R3 — three distinct provenance entities. `tool.commit` is the tool build (above); the
+  // consumer's fix commit lives in `patch.commit`, never in the tool slot. A patch commit that
+  // is not a 40-hex SHA is not a commit either: it is recorded as null, not asserted.
+  const { patch_commit: rawPatchCommit, patch_source: rawPatchSource, ...extraRest } = extra;
+  const patchCommit = /^[0-9a-f]{40}$/.test(String(rawPatchCommit ?? '')) ? String(rawPatchCommit) : null;
+  const recordTs = new Date().toISOString();
   const stats = {
-    ts: new Date().toISOString(),
+    ts: recordTs,
     repo: REPO || '',
     pr: PR_NUMBER || '',
     branch: ORIGINAL_BRANCH || '',
@@ -314,6 +323,11 @@ function writeStats(category, extra = {}) {
       commit: toolCommit,
     },
     attempt_count: extra.attempt_count ?? 1,
+    // The consumer's patch — its OWN entity, never the tool build (R3/AC-04).
+    patch: {
+      commit: patchCommit,
+      source: rawPatchSource || (patchRefs.length ? 'applied' : 'none_required'),
+    },
     patch_refs: patchRefs,
     // Why patch_refs is what it is. Acceptance asks for a no-change repeat to carry NO patch —
     // but "nothing needed changing" and "the writer never filled this in" are different facts,
@@ -326,9 +340,11 @@ function writeStats(category, extra = {}) {
       log_tokens: LOG_TOKEN_BUDGET, log_tokens_used: 0,
       max_files: GATE_MAX_FILES, max_lines: GATE_MAX_LINES,
     },
-    retention: extra.retention || { ttl_days: 90, artifact: `ci-fixer-stats-pr${PR_NUMBER || 'local'}-run${RUN_ID || '0'}` },
+    // R4 — `written_at` is what makes the TTL a DATE. Without it no sweeper can decide whether
+    // this record is expired, and `ttl_days` stays a number nobody executes.
+    retention: extra.retention || { ttl_days: 90, written_at: recordTs, artifact: `ci-fixer-stats-pr${PR_NUMBER || 'local'}-run${RUN_ID || '0'}` },
     credentials: extra.credentials ?? [],
-    ...extra,
+    ...extraRest,
     ...(typeof agentFellBack === 'string' ? { agent_fallback: agentFellBack } : {}),
     llm_usage: { ..._usage, cost_usd: Number(_usage.cost_usd.toFixed(6)) },
   };
@@ -2017,11 +2033,13 @@ writeStats(preStageDiagnosis ? preStageDiagnosis.category : diagnosis.agent ? 's
   fix_branch: fixBranch,
   fix_pr: newPRNumber,
   strategy: fixStrategy,
-  // ── AC-44, filled from the run itself (R6) ──
-  // tool.commit is the FIX commit, not AUTOFIX_WORKFLOW_SHA: the former is what this run
-  // produced, the latter is which build of the tool ran — and an env value that happens to be
-  // absent was being recorded as a commit. writeStats validates the 40-hex shape below.
-  tool_commit: fixCommitSha,
+  // ── AC-44, filled from the run itself (R6/R3) ──
+  // The patch gets ITS OWN slot: `tool.commit` answers "which build of pr-autofix ran" and is
+  // derived from the pinned env inside writeStats — this call site must not (and can no longer)
+  // put the CONSUMER's fix commit there. patch.commit names what THIS run produced in the
+  // repository it fixed; patch_source says why patch_refs is what it is.
+  patch_commit: fixCommitSha,
+  patch_source: fixStagedSomething ? 'applied' : 'none_required',
   attempt_count: Number(process.env.AUTOFIX_ATTEMPT) || fixAttempts,
   // A run that committed nothing gets NO patch ref — and says why (`none_required`), so a repeat
   // that changed nothing is distinguishable from a writer that filled nothing in. Recording the

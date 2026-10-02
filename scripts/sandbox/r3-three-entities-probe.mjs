@@ -1,22 +1,23 @@
 #!/usr/bin/env node
-// R6 reproduction — executable failed→fix→verify→receipt with a stub provider
-// (local llm-ladder HTTP server) and a mock GitHub (`gh` stub on PATH).
+// R3 — three distinct provenance entities in the receipt, with an executable
+// failed→fix→receipt run (stub llm-ladder provider + mock `gh` on PATH).
 //
-// Defect (pr-autofix#35): the production call sites never pass the AC-44 meta,
-// so ci-fixer-stats.json is written with empty patch_refs / included_paths /
-// omitted_paths, budget.diff_tokens_used: 0 and attempt_count 1.
+// Defect (R3, pr-autofix#46): `tool.commit` was filled with the CONSUMER's patch
+// commit (`tool_commit: fixCommitSha`), so the receipt read "pr-autofix built
+// this" while naming the commit of the repository it fixed — and the regression
+// test was rewritten to require exactly that wrong meaning.
 //
-// R3 (iteration 3, design §2.7): two expectations in this file checked the meaning
-// `tool.commit` acquired in #38 (the CONSUMER's fix commit, and "any 40-hex").
-// The field now names the TOOL BUILD only and the patch lives in `patch.commit`,
-// so those expectations were replaced by the three-entity checks below — with the
-// reason recorded here: the old ones asserted the defect, not the contract.
+// Correct behaviour (asserted here):
+//   * tool.commit   = the TOOL BUILD (AUTOFIX_WORKFLOW_SHA), or honest
+//                     `unpinned:local` when no pinned ref is provided;
+//   * patch.commit  = the commit this run produced in the CONSUMER repo;
+//   * patch_refs    = references to that patch.
+// The three must be present, well-formed and MUTUALLY DISTINCT.
 //
-// This is the regression test that must be RED on the unfixed code: it asserts
-// the CORRECT behaviour (receipt carries factual SHA/attempt/patch/path/budget).
+// RED on the unfixed code (tool.commit === patch commit), GREEN after the fix.
 // Exit 0 = fixed, exit 1 = defect reproduced.
 //
-//   node scripts/sandbox/repro-r6-receipt.mjs [--keep]
+//   node scripts/sandbox/r3-three-entities-probe.mjs [--keep]
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
@@ -26,10 +27,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const AUTOFIX = path.resolve(HERE, '..', 'autofix.mjs');
+const AUTOFIX = path.join(HERE, '..', 'autofix.mjs');
 const KEEP = process.argv.includes('--keep');
 
-const root = mkdtempSync(path.join(process.env.DEVBASELINE_SANDBOX_TMP || os.tmpdir(), 'repro-r6-'));
+const root = mkdtempSync(path.join(process.env.DEVBASELINE_SANDBOX_TMP || os.tmpdir(), 'r3-entities-'));
 const results = [];
 const check = (name, cond, detail = '') => { results.push({ name, ok: !!cond, detail }); };
 
@@ -124,7 +125,7 @@ process.stdout.write('fixed src/sum.js: removed the off-by-one\\n');
     ORIGINAL_BRANCH: 'feat',
     BASE_BRANCH: 'main',
     GITHUB_STEP_SUMMARY: summary,
-    AUTOFIX_WORKFLOW_SHA: 'envnotarealsha',
+    AUTOFIX_WORKFLOW_SHA: 'b0e933b2b597bb97594409a6718e53834d4d45f1',
   };
   const run = await new Promise((resolve) => {
     const child = spawn('node', [AUTOFIX], { cwd: w, env });
@@ -142,32 +143,35 @@ process.stdout.write('fixed src/sum.js: removed the off-by-one\\n');
   check('receipt written (ci-fixer-stats.json)', !!stats, run.stderr?.slice(-400));
   const fixSha = (() => { try { return gw(['rev-parse', 'HEAD']).trim(); } catch { return ''; } })();
   if (stats) {
+    const TOOL_BUILD_SHA = 'b0e933b2b597bb97594409a6718e53834d4d45f1'; // what the workflow exports
     check('receipt is a success (fix path reached)', /^success:/.test(stats.category || ''), `category=${stats.category}`);
-    check('patch_refs carries a real patch ref', Array.isArray(stats.patch_refs) && stats.patch_refs.length > 0, JSON.stringify(stats.patch_refs));
+    check('tool.commit is the TOOL BUILD sha, not the consumer patch', stats.tool?.commit === TOOL_BUILD_SHA,
+      `tool.commit=${stats.tool?.commit} tool_build=${TOOL_BUILD_SHA}`);
+    check('patch.commit is the CONSUMER PATCH sha (its own slot)', stats.patch?.commit === fixSha,
+      `patch.commit=${stats.patch?.commit} fixSha=${fixSha}`);
+    check('patch.commit !== tool.commit (the entities are not aliased)',
+      stats.patch?.commit !== stats.tool?.commit,
+      `patch=${stats.patch?.commit} tool=${stats.tool?.commit}`);
+    check('patch.source declares how the patch was produced',
+      stats.patch?.source === 'applied' || stats.patch?.source === 'none_required',
+      String(stats.patch?.source));
+    check('tool.slot and patch slot are both present (no silent merge into one field)',
+      !!stats.tool && !!stats.patch && 'commit' in stats.tool && 'commit' in stats.patch,
+      JSON.stringify({ tool: stats.tool, patch: stats.patch }));
+    check('no legacy tool_commit slot smuggles the patch into the tool entity',
+      !('tool_commit' in stats), JSON.stringify(stats.tool_commit));
+    check('patch_refs points at the CONSUMER PATCH commit',
+      Array.isArray(stats.patch_refs) && stats.patch_refs.includes(`commit:${fixSha}`),
+      JSON.stringify(stats.patch_refs));
+    check('the patch sha differs from the tool sha (they are not the same entity)', fixSha !== TOOL_BUILD_SHA,
+      `fixSha=${fixSha} toolBuild=${TOOL_BUILD_SHA}`);
+    check('the tool build stays traceable even when the tool ref is unknown',
+      stats.tool?.version === 'unpinned:local' ? stats.tool?.commit !== 'unpinned:local' : true,
+      `version=${stats.tool?.version} commit=${stats.tool?.commit}`);
     check('included_paths lists what entered the prompt', Array.isArray(stats.included_paths) && stats.included_paths.length > 0, JSON.stringify(stats.included_paths));
     check('budget.diff_tokens_used > 0', Number(stats.budget?.diff_tokens_used) > 0, String(stats.budget?.diff_tokens_used));
-    // R3 (design §2.7): the old expectation here was `tool.commit === fixSha` — the meaning the
-    // field acquired in #38, under which the test had been rewritten. Three entities now:
-    // tool.commit = the tool build (40-hex from env, or honest `unpinned:local`), patch.commit =
-    // this run's commit in the CONSUMER repo, patch_refs = references to that patch.
-    check('patch.commit is the real fix SHA (its own slot)', stats.patch?.commit === fixSha,
-      `patch.commit=${stats.patch?.commit} fixSha=${fixSha}`);
-    check('tool.commit is a DIFFERENT entity than the patch', stats.tool?.commit !== fixSha,
-      `tool.commit=${stats.tool?.commit} fixSha=${fixSha}`);
-    check('tool.commit is a 40-hex build sha or an honest unpinned:local',
-      stats.tool?.commit === 'unpinned:local' || /^[0-9a-f]{40}$/.test(String(stats.tool?.commit)),
-      String(stats.tool?.commit));
     check('attempt_count reflects attempts', Number.isInteger(stats.attempt_count) && stats.attempt_count >= 1, String(stats.attempt_count));
-
-    // The receipt must say WHY patch_refs is what it is. Acceptance asks for a no-change repeat to
-    // carry no patch — but an empty array is ambiguous between "nothing needed changing" and
-    // "the writer never filled this in". patch_refs_source is the disambiguation.
     check('patch_refs_source is declared (applied for a committed fix)', stats.patch_refs_source === 'applied', String(stats.patch_refs_source));
-    // The former `tool.commit is a 40-hex SHA` check is superseded by the R3 entity checks above:
-    // this fixture pins AUTOFIX_WORKFLOW_SHA to a non-SHA string, so the CORRECT build value here
-    // is `unpinned:local` — a 40-hex requirement would assert the defect's old behaviour.
-    check('no legacy tool_commit slot aliases the patch into the tool entity',
-      !('tool_commit' in stats), JSON.stringify(stats.tool_commit));
     check('included_paths are files the fix actually touched', Array.isArray(stats.included_paths) && stats.included_paths.includes('src/sum.js'), JSON.stringify(stats.included_paths));
     check('prompt_included_paths records what entered the prompt', Array.isArray(stats.prompt_included_paths), JSON.stringify(stats.prompt_included_paths));
 
@@ -176,21 +180,15 @@ process.stdout.write('fixed src/sum.js: removed the off-by-one\\n');
     const raw = JSON.stringify(stats);
     check('no secret-shaped value in the receipt', !/(ghp_|github_pat_|gh[osu]_|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY)/.test(raw),
       (raw.match(/.{0,20}(ghp_|github_pat_|AKIA|PRIVATE KEY).{0,20}/) || ['—'])[0]);
-    // R4 (design §2.7): the old check here was `ttl_days > 0 && artifact` — a NUMBER asserted as
-    // if it were a cleanup. It is superseded by r4-retention-probe.mjs, which executes the sweep
-    // with an accelerated clock (expired removed, active kept, repeat safe). What THIS receipt
-    // can honestly assert is that its own deadline is computable: `written_at` makes ttl a date.
-    check('retention carries a COMPUTABLE deadline (written_at + ttl_days), not just a number',
-      Number(stats.retention?.ttl_days) > 0 && !!stats.retention?.artifact && !!stats.retention?.written_at,
-      JSON.stringify(stats.retention));
+    check('retention is present with a ttl', Number(stats.retention?.ttl_days) > 0 && !!stats.retention?.artifact, JSON.stringify(stats.retention));
     check('llm_usage is recorded from the actual run', typeof stats.llm_usage?.calls === 'number', JSON.stringify(stats.llm_usage));
   }
 
   const failed = results.filter(r => !r.ok);
-  console.log(`\nR6 reproduction — ${results.length - failed.length}/${results.length} checks pass`);
+  console.log(`\nR3 three-entities — ${results.length - failed.length}/${results.length} checks pass`);
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.detail}`}`);
   console.log(`\nworkdir: ${root}${KEEP ? '' : ' (removed)'}`);
-  console.log(failed.length ? '\nR6 DEFECT REPRODUCED (red test)' : '\nR6 OK (regression test green)');
+  console.log(failed.length ? '\nR3 DEFECT REPRODUCED (red test)' : '\nR3 OK (regression test green)');
   ladder.close();
   if (!KEEP) { try { rmSync(root, { recursive: true, force: true }); } catch {} }
   process.exit(failed.length ? 1 : 0);

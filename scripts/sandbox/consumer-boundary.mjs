@@ -110,19 +110,29 @@ try {
   const baseUrl = `http://127.0.0.1:${PORT}`;
 
   // Lay the tree out exactly the way the workflow does: one fetch-payload call per destination.
+  // R1: the bootstrap is copied into an EMPTY scratch dir and run from there, the way a runner
+  // executes a single downloaded file. It used to run with cwd = <repo>/scripts, so its own
+  // relative imports resolved against the repository — the break the loader existed to prevent was
+  // structurally invisible in the test that claimed to cover it (the same false-green shape as
+  // repro-r4-cleanup.mjs checking a YAML for a file name). A bootstrap with a single relative
+  // import is now RED here, which is the point: it cannot be delivered by the manifest it lays out.
+  const bootstrapDir = path.join(root, 'bootstrap');
+  mkdirSync(bootstrapDir, { recursive: true });
+  writeFileSync(path.join(bootstrapDir, 'fetch-payload.mjs'), readFileSync(path.join(ROOT, 'scripts', 'fetch-payload.mjs')));
   const fetchPayload = (dest) => run([
-    path.join(ROOT, 'scripts', 'fetch-payload.mjs'),
+    path.join(bootstrapDir, 'fetch-payload.mjs'),
     '--manifest', path.join(ROOT, 'payload.manifest.json'),
     '--from-file', path.join(root, 'base.txt'),
     '--dest', dest,
     '--run', 'payload-verify',
     '--manifest', path.join(ROOT, 'payload.manifest.json'),
     '--dir', dest,
-  ], path.join(ROOT, 'scripts'));
+  ], bootstrapDir);
   const outDir = path.join(root, 'out');
   writeFileSync(path.join(root, 'base.txt'), `${baseUrl}/${owner}/${repo}/${sha}`);
   const fetch = fetchPayload(outDir);
-  check('fetch-payload laid out tree and verified manifest', fetch.code === 0 && /laid out/.test(fetch.out),
+  check('fetch-payload laid out tree and verified manifest (from an empty dir, no neighbour modules)',
+    fetch.code === 0 && /laid out/.test(fetch.out) && !/Cannot find module|ERR_MODULE/.test(fetch.out),
     fetch.out.trim().slice(0, 200));
 
   // Now exercise the CLI from the laid-out tree — run its checks against the fixture.
