@@ -96,6 +96,21 @@ jobs:
           path: pr-autofix
           persist-credentials: false
 
+      # R1 (pr-autofix#54) — the same separation of roots as the callable workflows: actions/checkout
+      # can only materialize inside GITHUB_WORKSPACE, so the pinned tree is moved straight into
+      # $RUNNER_TEMP and the consumer root keeps exactly what the consumer owns. Autofix stages
+      # with `git add -A` here too — a tool tree left in the root becomes an unsolicited gitlink
+      # in the fix commit.
+      - name: Relocate the tool tree out of the consumer root
+        run: |
+          set -euo pipefail
+          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
+            echo "::error::the pinned tool tree was not materialized — refusing to run autofix"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/pr-autofix"
+          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -115,11 +130,11 @@ jobs:
           ORIGINAL_BRANCH: ${{ steps.pr-info.outputs.branch }}
         run: |
           set -euo pipefail
-          if [ ! -f pr-autofix/scripts/autofix.mjs ]; then
-            echo "::error::the pinned tool tree is not in the workspace — refusing to run autofix"
+          if [ ! -f "$RUNNER_TEMP/pr-autofix/scripts/autofix.mjs" ]; then
+            echo "::error::the pinned tool tree is not in the runner temp — refusing to run autofix"
             exit 1
           fi
-          node pr-autofix/scripts/autofix.mjs
+          node "$RUNNER_TEMP/pr-autofix/scripts/autofix.mjs"
 
       - name: Upload stats
         if: always()

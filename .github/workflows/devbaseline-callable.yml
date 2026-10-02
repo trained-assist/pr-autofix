@@ -62,29 +62,46 @@ jobs:
           path: pr-autofix
           persist-credentials: false
 
+      # R1 (pr-autofix#54) — INSTALLING THE TOOL MUST NOT CHANGE THE CONSUMER. actions/checkout
+      # refuses a `path` outside GITHUB_WORKSPACE, so the tree can only be materialized inside
+      # the consumer root — and immediately moved out of it. From here on scan
+      # (`check-docs --dir .`), `git status` and `git add -A` see the consumer and only the
+      # consumer: the tool's fixtures are never its violations, and the nested git repo can never
+      # be staged as an unsolicited `160000` gitlink. Every tool path below is
+      # $RUNNER_TEMP/pr-autofix/… — the same directory the runner already owns for scratch.
+      - name: Relocate the tool tree out of the consumer root
+        run: |
+          set -euo pipefail
+          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
+            echo "::error::the pinned tool tree was not materialized — refusing to run"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/pr-autofix"
+          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
+
       - name: The tree we are about to run is the tree the manifest declares
         run: |
           set -euo pipefail
-          if [ ! -f pr-autofix/scripts/devbaseline.mjs ]; then
-            echo "::error::the pinned tool tree is not in the workspace — refusing to run anything"
+          if [ ! -f "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" ]; then
+            echo "::error::the pinned tool tree is not in the runner temp — refusing to run anything"
             exit 1
           fi
-          node pr-autofix/scripts/devbaseline.mjs payload-verify \
-            --manifest pr-autofix/payload.manifest.json \
-            --dir pr-autofix
+          node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" payload-verify \
+            --manifest "$RUNNER_TEMP/pr-autofix/payload.manifest.json" \
+            --dir "$RUNNER_TEMP/pr-autofix"
 
       - name: Which baseline does this repository have?
         id: shape
         run: |
-          node pr-autofix/scripts/devbaseline.mjs validate --repo . --all-profiles | tee "$RUNNER_TEMP/shape.txt"
+          node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" validate --repo . --all-profiles | tee "$RUNNER_TEMP/shape.txt"
           echo "profile_line=$(grep -m1 'profile ' "$RUNNER_TEMP/shape.txt" || echo unknown)" >> "$GITHUB_OUTPUT"
 
       - name: Adapter is valid
         if: inputs.profile == ''
-        run: node pr-autofix/scripts/devbaseline.mjs validate --repo .
+        run: node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" validate --repo .
 
       - name: Documentation check
-        run: node pr-autofix/scripts/devbaseline.mjs check-docs --dir .
+        run: node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" check-docs --dir .
 
       # The gate, as ONE line and ONE owner (R3). The previous version branched on exit code 2 in
       # shell and exited 0 — `needs_human` reported as a green required check, so a repository with
@@ -94,10 +111,18 @@ jobs:
       # nowhere. needs_human still keeps its own outcome/reason_code in the log record.
       - name: Gate — verify, plus the staging command this repository declares
         timeout-minutes: ${{ fromJSON(inputs.check_timeout_minutes) }}
+        env:
+          # R2 — which TOOL build writes this receipt. The `job` context is the identity of the
+          # workflow that DEFINES this job (pr-autofix), while `github.*`/GITHUB_WORKFLOW_* are
+          # the CALLER's workflow — passing the caller's SHA here is exactly the provenance lie
+          # of pr-autofix#55. Same pattern as autofix-callable; step-level, because `job` in
+          # jobs.<id>.env is not guaranteed by GitHub.
+          AUTOFIX_WORKFLOW_REF: ${{ job.workflow_ref }}
+          AUTOFIX_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           args=(gate --repo . --log devbaseline-verify.json)
           [ -n "${{ inputs.profile }}" ] && args+=(--profile "${{ inputs.profile }}")
-          node pr-autofix/scripts/devbaseline.mjs "${args[@]}"
+          node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" "${args[@]}"
 
       # R2 — the INDEPENDENT reader of the record the gate just wrote. `if: always()`: the receipt of a
       # failed gate is exactly the one worth checking. It does NOT re-judge the gate — that colour
@@ -115,7 +140,7 @@ jobs:
             echo "no receipt was written — the gate step's own colour decides this job"
             exit 0
           fi
-          node pr-autofix/scripts/devbaseline.mjs receipt-check --log devbaseline-verify.json
+          node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" receipt-check --log devbaseline-verify.json
           code=$?
           set -e
           if [ "$code" -eq 2 ]; then
@@ -140,7 +165,7 @@ jobs:
           for f in devbaseline-verify.json; do
             [ -f "$f" ] && cp "$f" "$store/" || true
           done
-          node pr-autofix/scripts/devbaseline.mjs retention-sweep --dir "$store"
+          node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" retention-sweep --dir "$store"
 
       - name: Upload the verify record
         if: always()
@@ -155,8 +180,13 @@ jobs:
 
       - name: Inventory row for this repository
         if: inputs.mode == 'staging-gate'
+        env:
+          # R2 — the inventory row carries `profile_ref` from toolVersion(); without the tool's
+          # own pin it must degrade to `unpinned:local`, never to the caller's workflow ref.
+          AUTOFIX_WORKFLOW_REF: ${{ job.workflow_ref }}
+          AUTOFIX_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
-          node pr-autofix/scripts/devbaseline.mjs inventory \
+          node "$RUNNER_TEMP/pr-autofix/scripts/devbaseline.mjs" inventory \
             --out devbaseline-inventory \
             --repos <(printf '[{"repo":"%s","type_hint":null,"ci_required":null,"path":"."}]\n' "$GITHUB_REPOSITORY")
           cat devbaseline-inventory/repo-coverage.md >> "$GITHUB_STEP_SUMMARY"

@@ -167,14 +167,21 @@ for (const b of ['bash', 'cat', 'mkdir', 'ls', 'cp', 'sed', 'grep', 'tar', 'git'
 // directory comes from the interpreter actually running this probe, and its availability is
 // asserted before any step runs (see the guard below). fakebin stays FIRST, so the mock gh and
 // the redirected curl still shadow anything real.
+//
+// The same trap applies to COREUTILS (r1-shipped-run-step-probe @ CI, 2026-10-02): the shipped
+// relocate step runs `rm`/`mv`, and on a GitHub runner node lives under /opt/hostedtoolcache —
+// so `${fakebin}:${TOOLCHAIN}` alone had neither, the step died at `rm: command not found`
+// (exit 127) and the probe reported a DEFECT about a workflow that is fine. A real ubuntu runner
+// has /usr/bin and /bin on PATH by definition (r1-root-separation-probe.mjs:111 already models
+// this), so they go on the end — after fakebin and the interpreter's own directory.
 const TOOLCHAIN = path.dirname(process.execPath);
-const RUNNER_PATH = `${fakebin}:${TOOLCHAIN}`;
+const RUNNER_PATH = `${fakebin}:${TOOLCHAIN}:/usr/bin:/bin`;
 
 function harnessCanRun(bin) {
   const r = spawnSync('/usr/bin/env', ['-i', `PATH=${RUNNER_PATH}`, bin, '--version'], { encoding: 'utf8' });
   return r.status === 0;
 }
-for (const bin of ['node', 'bash']) {
+for (const bin of ['node', 'bash', 'rm', 'mv']) {
   if (!harnessCanRun(bin)) {
     console.error(`::error::empty consumer runner cannot resolve ${bin} (PATH=${RUNNER_PATH}) — harness incomplete, not a verdict`);
     process.exit(2);

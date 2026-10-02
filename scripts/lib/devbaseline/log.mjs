@@ -28,10 +28,19 @@ export const OUTCOMES = ['passed', 'no_change', 'failed', 'needs_human'];
 
 export const TOOL_NAME = 'pr-autofix';
 
-/** Real ref where the workflow provides one; honest `unpinned:local` where it does not. */
+/**
+ * Real ref where the workflow provides one; honest `unpinned:local` where it does not.
+ *
+ * The sources are the TOOL's own pins (`AUTOFIX_TOOL_VERSION`, then the delivered pin
+ * `AUTOFIX_WORKFLOW_REF`). There is deliberately no `GITHUB_WORKFLOW_REF` fallback: inside a
+ * reusable workflow `github.*` (and the GITHUB_* defaults derived from it) identify the CALLER's
+ * workflow — the consumer's ci.yml — per the GitHub context contract, so reading it here wrote
+ * the consumer's ref into `tool.version` with a fully credible shape (pr-autofix#55). Without a
+ * trustworthy pin the only honest answer is `unpinned:local`.
+ */
 export function toolVersion() {
   if (process.env.AUTOFIX_TOOL_VERSION) return process.env.AUTOFIX_TOOL_VERSION;
-  const ref = process.env.AUTOFIX_WORKFLOW_REF || process.env.GITHUB_WORKFLOW_REF || '';
+  const ref = process.env.AUTOFIX_WORKFLOW_REF || '';
   const at = ref.lastIndexOf('@');
   if (at > 0) return ref.slice(at + 1);
   return 'unpinned:local';
@@ -45,7 +54,11 @@ export function toolCommit() {
   // The patch has its own slot (`patch.commit`); the tool build comes from the environment that
   // pins it, and anything that is not a 40-hex commit degrades to an honest `unpinned:local`
   // instead of asserting a provenance that does not exist.
-  const declared = process.env.AUTOFIX_TOOL_COMMIT || process.env.AUTOFIX_WORKFLOW_SHA || process.env.GITHUB_WORKFLOW_SHA || '';
+  //
+  // R2 (pr-autofix#55): no `GITHUB_WORKFLOW_SHA` fallback, for the same reason as toolVersion —
+  // it is the CALLER's workflow identity, not the tool's. A 40-hex shape cannot tell the two
+  // apart, so validation of the form would still launder the caller SHA into tool.commit.
+  const declared = process.env.AUTOFIX_TOOL_COMMIT || process.env.AUTOFIX_WORKFLOW_SHA || '';
   return /^[0-9a-f]{40}$/.test(String(declared)) ? String(declared) : 'unpinned:local';
 }
 
