@@ -163,9 +163,46 @@ function judgeFix({ fixFiles = [], runnerBefore = null, runnerAfter = null, evid
   // be assembled from a consumer whose fixer never executed at all.
   const raw = evidence.shipped_job || {};
   const job = typeof raw === 'string' ? { name: raw.split(' — ')[0], conclusion: raw.split(' — ').slice(1).join(' — ') } : raw;
-  const ran = job.name && job.conclusion && !/^(skipped|cancelled|neutral)$/.test(job.conclusion);
-  add('the shipped autofix job actually ran', Boolean(ran),
+  // R1 FIX: the original check accepted a FAILED shipped job as "ran" — `failure` is not in the
+  // skipped/cancelled/neutral blacklist, so a fixer that crashed mid-run passed the gate. A real
+  // autofix cycle must conclude SUCCESS. Anything else (failure, timed_out, action_required,
+  // stale, startup_failure) is a defect: the fix was never produced.
+  const ran = Boolean(job.name) && job.conclusion === 'success';
+  add('the shipped autofix job ran and succeeded', ran,
     `${job.name || 'no autofix job'} — ${job.conclusion || 'absent'}`);
+
+  // R1 FIX: the original harness read `runnerAfter.index` only for the PRESENCE of the field
+  // (`index !== undefined`), so a line like `100644 a0b1c2…\tscripts/our-fixture.mjs` added to
+  // the index went unnoticed. A staged path outside the allowlist is a leak even when every
+  // test passed. We compare AFTER-index paths against the BEFORE-index: only entries that are
+  // NEW (not present in the before-index) and outside the allowlist are defects. Pre-existing
+  // committed files are the consumer's own — they were already in the index before the fix ran.
+  if (runnerBefore?.index !== undefined && runnerAfter?.index !== undefined && runnerAfter.index !== '') {
+    const beforePaths = new Set(String(runnerBefore.index).split('\n').filter(Boolean)
+      .map((line) => line.split('\t')[1]).filter(Boolean));
+    const indexPaths = String(runnerAfter.index).split('\n').filter(Boolean)
+      .map((line) => line.split('\t')[1])
+      .filter(Boolean);
+    const stagedExtra = indexPaths.filter((f) => !beforePaths.has(f) && !isFixSubject(f));
+    add('runner index contains no new staged path outside the allowlist', stagedExtra.length === 0,
+      stagedExtra.length ? `staged: ${stagedExtra.slice(0, 6).join(', ')}` : `${indexPaths.length} index entries, ${indexPaths.length - beforePaths.size} new`);
+  }
+
+  // R1 FIX: `status_porcelain` on the after side — an untracked `A` or `??` entry for a path
+  // outside the allowlist means the fixer left something behind that would be swept into a
+  // later `git add -A`. The original harness ignored this field entirely. Porcelain v1 format:
+  // `XY<space>PATH` — but `gitOut` trims leading whitespace, so handle both trimmed and raw.
+  // Strip up to two status-code characters (and an optional space) before the path.
+  if (runnerAfter?.status_porcelain) {
+    const statusLines = String(runnerAfter.status_porcelain).split('\n').filter(Boolean);
+    const statusExtra = statusLines
+      .map((l) => l.replace(/^[A-Z?! ]{1,2}\s+/, '').trim())
+      .filter(Boolean)
+      .filter((f) => !isFixSubject(f) && !f.startsWith('.git/'));
+    add('runner git status carries no untracked or modified path outside the allowlist',
+      statusExtra.length === 0,
+      statusExtra.length ? `unexpected: ${statusExtra.slice(0, 6).join(', ')}` : `${statusLines.length} status entries checked`);
+  }
 
   return { checks, ok: checks.every((c) => c.ok) };
 }
@@ -244,6 +281,37 @@ function selfTest() {
       input: { fixFiles: ['.devbaseline/log.json'], runnerBefore: before, runnerAfter: after, evidence: { ...evidenceOk, shipped_job: 'autofix — skipped' } },
       expect: false,
     },
+    // ── R1 red controls: the three ways the original validator said "ok" on a broken run ──
+    {
+      // R1: original `ran = job.name && job.conclusion && !/^(skipped|cancelled|neutral)$/` —
+      // 'failure' passes that blacklist, so a crashed fixer was judged clean. Must now be RED.
+      name: 'a FAILED shipped job is a defect (the original blacklist let `failure` through)',
+      input: { fixFiles: ['.devbaseline/log.json'], runnerBefore: before, runnerAfter: after, evidence: { ...evidenceOk, shipped_job: 'autofix — failure' } },
+      expect: false,
+    },
+    {
+      // R1: original validator checked `index !== undefined` only — a line added to the index
+      // was invisible. A staged path outside the allowlist must now be RED.
+      name: 'an extra staged path in runnerAfter.index is a defect (original checked only field presence)',
+      input: {
+        fixFiles: ['.devbaseline/log.json'],
+        runnerBefore: before,
+        runnerAfter: { ...after, index: `${after.index}\n100644 a0b1c2d3e4f5\tsecret-injected.txt` },
+        evidence: evidenceOk,
+      },
+      expect: false,
+    },
+    {
+      // R1: status_porcelain `A secret.txt` must be RED.
+      name: 'an untracked file in runnerAfter.status_porcelain is a defect (original ignored status_porcelain)',
+      input: {
+        fixFiles: ['.devbaseline/log.json'],
+        runnerBefore: before,
+        runnerAfter: { ...after, status_porcelain: `${after.status_porcelain}\nA  secret.txt` },
+        evidence: evidenceOk,
+      },
+      expect: false,
+    },
   ];
 
   let ok = true;
@@ -258,7 +326,7 @@ function selfTest() {
     for (const c of v.checks) if (!c.ok) say(`       red: ${c.name}${c.detail ? ` — ${c.detail}` : ''}`);
   }
 
-  const report = { harness: 'r2-hosted-harness', mode: 'self-test', ok, scenarios: results, verdict: ok ? 'clean — the harness can detect a gitlink, an extra staged path, a destroyed untracked file and an incomplete bundle' : 'DEFECT — the harness does not detect what it claims to detect' };
+  const report = { harness: 'r2-hosted-harness', mode: 'self-test', ok, scenarios: results, verdict: ok ? 'clean — the harness can detect a gitlink, an extra staged path (commit, index AND git status), a destroyed untracked file, a failed/skipped shipped job and an incomplete bundle' : 'DEFECT — the harness does not detect what it claims to detect' };
   const out = path.join(CODE, '.devbaseline-sandbox', 'r2-harness-selftest.json');
   mkdirSync(path.dirname(out), { recursive: true });
   writeFileSync(out, `${JSON.stringify(report, null, 2)}\n`);
@@ -294,19 +362,38 @@ console.log("ok — the inventory adds up");
 `;
 const CONSUMER_BAD_MD = '# inventory\napple | 3\npear | 4\ntotal | 7\n';
 
-// Runner-state capture, inline in the workflow because a reusable workflow's steps are not
-// injectable: a consumer cannot take a fingerprint "around" a `uses:` job. What it CAN do is
-// fingerprint the SAME head commit with the SAME fixture recipe in a job before the fixer and in
-// a job after it — two real runners, byte-comparable, plus status/index/untracked/gitlinks that a
-// remote tree of a deleted repository can never produce.
-const CAPTURE_STEP = (when, toolSha) => `      - uses: actions/checkout@v4
-        with:
-          ref: \${{ github.event.pull_request.head.sha }}
-      - name: Runner state ${when} the fixer
+// R1 FIX — CAPTURE_STEP. The original created sentinels in SEPARATE jobs
+// (`runner-state-before` and `runner-state-after`), each on its own runner. The shipped autofix
+// runs in a THIRD runner, so the after-snapshot was a fresh checkout with sentinels RE-CREATED
+// from scratch — it could never prove that the fixer's working directory preserved anything.
+// The review (it.7) caught exactly this: "равенство fingerprints не доказывает сохранность ни
+// одного untracked файла у исправителя."
+//
+// The fix: sentinels are created ONCE in the `before` job and COMMITTED to the consumer's
+// default branch. The `after` job checks out that same branch (which now contains the sentinels)
+// and captures the state WITHOUT recreating them. The only thing that differs between the two
+// captures is the fixer's effect on the working directory — which is what we want to measure.
+// The `ref` for the after job is the consumer's base branch (main), not the PR head: the fixer
+// pushed its fix branch, and the base branch carries the committed sentinels.
+const CAPTURE_SENTINELS = `      - name: Create sentinels (untracked work, symlink, outside file)
         run: |
           mkdir -p outside && echo precious > outside/precious.txt
           echo 'uncommitted work that belongs to the user' > uncommitted-user-work.txt
           ln -sfn ../outside link-to-outside
+      - name: Commit sentinels to the consumer branch
+        run: |
+          git -c user.email=harness@x.invalid -c user.name=harness add -A
+          git -c user.email=harness@x.invalid -c user.name=harness commit -q -m "harness sentinels"
+`;
+
+const CAPTURE_STEP = (when, toolSha, { withSentinels = false } = {}) => `      - uses: actions/checkout@v4
+        with:
+          ref: main
+${withSentinels ? CAPTURE_SENTINELS : `      # Sentinels are NOT recreated here — they were committed in the before job.
+      # Recreating them here is exactly the defect it.7 caught: the after snapshot would
+      # look identical regardless of what the fixer did.
+`}      - name: Runner state ${when} the fixer
+        run: |
           node -e '
             const { execFileSync } = require("child_process");
             const fs = require("fs"); const crypto = require("crypto");
@@ -328,7 +415,6 @@ const CAPTURE_STEP = (when, toolSha) => `      - uses: actions/checkout@v4
               untracked: sh(["-C", ".", "ls-files", "--others", "--exclude-standard"]).split("\\n").filter(Boolean),
               gitlinks: sh(["-C", ".", "ls-files", "-s"]).split("\\n").filter((l) => l.startsWith("160000")),
               head_sha: process.env.GITHUB_SHA,
-              pr_head_sha: "${'$'}{{github.event.pull_request.head.sha}}",
               tool_sha: "${toolSha}",
               run_id: process.env.GITHUB_RUN_ID,
               run_url: process.env.GITHUB_SERVER_URL + "/" + process.env.GITHUB_REPOSITORY + "/actions/runs/" + process.env.GITHUB_RUN_ID,
@@ -348,6 +434,9 @@ const CAPTURE_STEP = (when, toolSha) => `      - uses: actions/checkout@v4
 // SHIPPED reusable workflow. The trigger shape is not decoration: the shipped fixer reads the failing
 // CI run id and the PR from the `workflow_run` payload, so a bare `pull_request` call is a different
 // product.
+// R1 FIX: the `before` job creates sentinels AND commits them; the `after` job does NOT recreate
+// them — it checks out `main` which now carries the committed sentinels. Both jobs use the same
+// fixture recipe, so the fingerprints are byte-comparable and any difference is the fixer's doing.
 const CONSUMER_CI = (toolSha) => `name: CI
 on:
   pull_request:
@@ -358,7 +447,8 @@ jobs:
   runner-state-before:
     runs-on: ubuntu-latest
     steps:
-${CAPTURE_STEP('before', toolSha)}  broken-gate:
+${CAPTURE_STEP('before', toolSha, { withSentinels: true })}
+  broken-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -616,9 +706,28 @@ function liveRun() {
       shipped_job: shippedJob.name ? { name: shippedJob.name, conclusion: shippedJob.conclusion, startedAt: shippedJob.startedAt, completedAt: shippedJob.completedAt } : null,
       patch: patch ? `${slug}-patch.diff` : '' };
     writeFileSync(path.join(outDir, `${slug}-run.json`), `${JSON.stringify(meta, null, 2)}\n`);
-    const checksums = Object.entries(readdirSync(outDir)).filter(([f]) => f.startsWith(slug))
-      .map(([f]) => `${sha256(readFileSync(path.join(outDir, f)))}  ${f}`);
+    // R2 FIX: `Object.entries(readdirSync(outDir))` yields `[index, value]` pairs — `f` is always
+    // a NUMBER, so `f.startsWith(slug)` is always false and the manifest was always empty (1 byte:
+    // just the trailing newline). The fix: read the directory as filenames directly.
+    // R2 FIX (completeness): the manifest must cover the ENTIRE final bundle — run.json, jobs,
+    // sanitized logs, patch, runner snapshots, receipt, verdict — not just what existed at write
+    // time. `sha256sum -c` is the only way to prove the archive is intact after teardown.
+    const bundleFiles = readdirSync(outDir)
+      .filter((f) => f.startsWith(slug) && !f.endsWith('-SHA256SUMS'))
+      .sort();
+    const checksums = bundleFiles.map((f) => `${sha256(readFileSync(path.join(outDir, f)))}  ${f}`);
     writeFileSync(path.join(outDir, `${slug}-SHA256SUMS`), `${checksums.join('\n')}\n`);
+    // Self-verify: `sha256sum -c` semantics without the external tool — every entry must rehash
+    // to the same digest and the file count must be non-empty. An empty manifest is a DEFECT.
+    const manifestContent = readFileSync(path.join(outDir, `${slug}-SHA256SUMS`), 'utf8').trim();
+    const manifestLines = manifestContent ? manifestContent.split('\n') : [];
+    const manifestOk = manifestLines.length > 0
+      && manifestLines.every((line) => {
+        const [digest, fname] = line.split('  ');
+        return fname && existsSync(path.join(outDir, fname))
+          && sha256(readFileSync(path.join(outDir, fname))) === digest;
+      });
+    if (!manifestOk) say(`::error::SHA256SUMS manifest is empty or does not verify — bundle integrity is NOT proven`);
     const evidence = { caller_sha: callerSha, tool_sha: TOOL_SHA, run_id: String(run.databaseId), run_url: run.url,
       logs, patch: meta.patch, changed_files: fixFiles.join(','), receipt: 'runner-state.json',
       shipped_job: shippedJob.name ? `${shippedJob.name} — ${shippedJob.conclusion}` : '' };
