@@ -396,7 +396,7 @@ for (const [wf, variant] of SCENARIOS) {
 
   // a. the shipped delivery ran to completion
   const failed = delivery.executed.filter((s) => s.code);
-  check(scenario, 'a. delivery steps exit 0 (materialize + relocate)',
+  check(scenario, 'a. delivery steps exit 0 (preflight + materialize)',
     delivery.code === 0,
     failed.length ? failed.map((s) => `${s.name} exit ${s.code}: ${(s.tail || '').split('\n').slice(-1)[0]}`).join('; ') : '');
 
