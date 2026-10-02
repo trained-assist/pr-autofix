@@ -317,10 +317,13 @@ const CAPTURE_STEP = (when, toolSha) => `      - uses: actions/checkout@v4
           path: runner-state.json
 `;
 
-// The consumer's own CI: a check that goes red on the harness PR, the SHIPPED autofix callable at
-// the pinned tool SHA, and a post-fix state capture. `pull_request` + `pr_number`/`original_branch`
-// is the shipped contract of `autofix-callable` — it is what a real consumer's ci.yml calls.
-const CONSUMER_CI = (toolSha) => `name: consumer-ci
+// The consumer's own CI, in the shape a real consumer has it — and the shape that was proven to
+// work hosted (iteration 6's consumer, run 36981201200): a `CI` workflow whose check goes red on the
+// pull request, and a separate `PR Autofix` workflow triggered by `workflow_run` of CI, calling the
+// SHIPPED reusable workflow. The trigger shape is not decoration: the shipped fixer reads the failing
+// CI run id and the PR from the `workflow_run` payload, so a bare `pull_request` call is a different
+// product.
+const CONSUMER_CI = (toolSha) => `name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -336,17 +339,31 @@ ${CAPTURE_STEP('before', toolSha)}  broken-gate:
       - uses: actions/checkout@v4
       - name: The consumer's own check — red on the harness PR, on purpose
         run: node check.js
+`;
+
+const CONSUMER_AUTOFIX = (toolSha) => `name: PR Autofix
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
   autofix:
-    needs: [broken-gate]
-    if: always() && !startsWith(github.head_ref, 'fix/ci-')
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0] != null &&
+      !startsWith(github.event.workflow_run.head_branch, 'fix/ci-')
     permissions:
       contents: write
       pull-requests: write
     uses: trained-assist/pr-autofix/.github/workflows/autofix-callable.yml@${toolSha}
     with:
-      pr_number: \${{ github.event.pull_request.number }}
-      original_branch: \${{ github.head_ref }}
-      run_id: '0'
+      pr_number: \${{ github.event.workflow_run.pull_requests[0].number }}
+      original_branch: \${{ github.event.workflow_run.head_branch }}
+      run_id: \${{ github.event.workflow_run.id }}
     secrets:
       llm_ladder_token: \${{ secrets.LLM_LADDER_TOKEN }}
       gh_token: \${{ secrets.AUTOFIX_PAT || github.token }}
@@ -376,7 +393,8 @@ function liveRun() {
     mkdirSync(path.join(work, 'broken'), { recursive: true });
     writeFileSync(path.join(work, 'broken', 'bad.md'), CONSUMER_BAD_MD);
     writeFileSync(path.join(work, 'check.js'), CONSUMER_CHECK);
-    writeFileSync(path.join(work, '.github', 'workflows', 'consumer-ci.yml'), CONSUMER_CI(TOOL_SHA));
+    writeFileSync(path.join(work, '.github', 'workflows', 'ci.yml'), CONSUMER_CI(TOOL_SHA));
+    writeFileSync(path.join(work, '.github', 'workflows', 'pr-autofix.yml'), CONSUMER_AUTOFIX(TOOL_SHA));
     gitOut(['init', '-q', '-b', 'main'], work);
     gitOut(['-C', work, 'add', '-A']);
     spawnSync('git', ['-C', work, '-c', 'user.email=h@x.invalid', '-c', 'user.name=harness', 'commit', '-q', '-m', 'fixture consumer']);
@@ -399,36 +417,44 @@ function liveRun() {
 
     phase('run — the shipped autofix workflow on a real runner (failed → fix → verify)');
     const started = Date.now();
-    let run = null;
-    for (;;) {
-      const list = JSON.parse(gh(['run', 'list', '--repo', full, '--workflow', 'consumer-ci.yml', '--limit', '5', '--json', 'databaseId,status,conclusion,url,headSha,event'], { check: false }) || '[]');
-      run = list.find((r) => r.event === 'pull_request') || list[0];
-      if (run && run.status === 'completed') break;
-      if (Date.now() - started > 30 * 60_000) die(`the run did not finish in 30 min (last: ${run ? `${run.status} ${run.conclusion}` : 'none'})`);
-      spawnSync('sleep', ['15']);
-    }
-    say(`run ${run.databaseId}: ${run.conclusion} — ${run.url}`);
+    const waitFor = (workflow) => {
+      for (;;) {
+        const list = JSON.parse(gh(['run', 'list', '--repo', full, '--workflow', workflow, '--limit', '5', '--json', 'databaseId,status,conclusion,url,headSha,event'], { check: false }) || '[]');
+        const r = list[0];
+        if (r && r.status === 'completed') return r;
+        if (Date.now() - started > 30 * 60_000) die(`${workflow} did not finish in 30 min (last: ${r ? `${r.status} ${r.conclusion}` : 'none'})`);
+        spawnSync('sleep', ['15']);
+      }
+    };
+    const ciRun = waitFor('ci.yml');
+    say(`CI run ${ciRun.databaseId}: ${ciRun.conclusion} — ${ciRun.url}`);
+    const run = waitFor('pr-autofix.yml');
+    say(`PR Autofix run ${run.databaseId}: ${run.conclusion} — ${run.url}`);
 
     phase('evidence — collected from the run, written before teardown');
     mkdirSync(outDir, { recursive: true });
     const logs = `${slug}-logs.txt`;
-    const log = spawnSync('gh', ['run', 'view', String(run.databaseId), '--repo', full, '--log'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
-    writeFileSync(path.join(outDir, logs), sanitize(log.stdout || ''));
+    const raw = [ciRun, run].map((r) => {
+      const l = spawnSync('gh', ['run', 'view', String(r.databaseId), '--repo', full, '--log'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
+      return `===== run ${r.databaseId} (${r.workflowName || 'workflow'}) — ${r.conclusion} — ${r.url}\n${l.stdout || ''}`;
+    }).join('\n');
+    writeFileSync(path.join(outDir, logs), sanitize(raw));
     // Job-level evidence: which jobs the run actually had and how each concluded. A workflow that
     // never started leaves a `skipped` job and no error line anywhere, so the log alone cannot tell
     // "the fixer ran and did nothing" from "the fixer never ran".
     const jobsFile = `${slug}-jobs.json`;
-    const runView = JSON.parse(gh(['run', 'view', String(run.databaseId), '--repo', full,
+    const view = (r) => JSON.parse(gh(['run', 'view', String(r.databaseId), '--repo', full,
       '--json', 'conclusion,event,headSha,workflowName,createdAt,updatedAt,jobs'], { check: false }) || '{}');
-    writeFileSync(path.join(outDir, jobsFile), `${JSON.stringify(runView, null, 2)}\n`);
-    const shippedJob = (runView.jobs || []).find((j) => j.name === 'autofix') || {};
+    const ciView = view(ciRun), fixView = view(run);
+    writeFileSync(path.join(outDir, jobsFile), `${JSON.stringify({ ci: ciView, autofix: fixView }, null, 2)}\n`);
+    const shippedJob = (fixView.jobs || []).find((j) => /^autofix/.test(j.name)) || {};
     say(`shipped job autofix: ${shippedJob.conclusion || 'absent'}`);
     const state = {};
     for (const when of ['before', 'after']) {
       try {
         const dl = path.join(outDir, '_artifact');
         mkdirSync(dl, { recursive: true });
-        gh(['run', 'download', String(run.databaseId), '--repo', full, '--name', `runner-state-${when}`, '--dir', dl]);
+        gh(['run', 'download', String((when === 'before' ? ciRun : run).databaseId), '--repo', full, '--name', `runner-state-${when}`, '--dir', dl]);
         state[when] = JSON.parse(readFileSync(path.join(dl, 'runner-state.json'), 'utf8'));
         rmSync(dl, { recursive: true, force: true });
       } catch { state[when] = {}; say(`::warning::no runner-state-${when} artifact; the bundle is INCOMPLETE and the verdict will say so`); }
@@ -453,7 +479,8 @@ function liveRun() {
       } else say(`::warning::no fix/ci-* PR based on ${prBranch} (PRs: ${prs.map((p) => p.headRefName).join(', ') || 'none'}) — the bundle is INCOMPLETE`);
     } catch { say('::warning::the fix PR could not be read — the bundle is INCOMPLETE'); }
 
-    const meta = { consumer: full, run_id: String(run.databaseId), run_url: run.url, conclusion: run.conclusion,
+    const meta = { consumer: full, ci_run: { id: String(ciRun.databaseId), url: ciRun.url, conclusion: ciRun.conclusion },
+      run_id: String(run.databaseId), run_url: run.url, conclusion: run.conclusion,
       caller_sha: callerSha, tool_sha: TOOL_SHA, fix_pr: prUrl, changed_files: fixFiles,
       runner_state: { before: runnerBefore, after: runnerAfter }, logs, jobs: jobsFile,
       shipped_job: shippedJob.name ? { name: shippedJob.name, conclusion: shippedJob.conclusion, startedAt: shippedJob.startedAt, completedAt: shippedJob.completedAt } : null,
@@ -505,7 +532,8 @@ let report;
 // `--print-consumer-ci` renders the consumer workflow for inspection: the live recipe is a
 // string in this file, and a string nobody can read is how a wrong input shape ships.
 if (process.argv.includes('--print-consumer-ci')) {
-  console.log(CONSUMER_CI(flag('--tool-sha') || 'PINNED_SHA'));
+  const sha = flag('--tool-sha') || 'PINNED_SHA';
+  console.log(`# ---- .github/workflows/ci.yml ----\n${CONSUMER_CI(sha)}\n# ---- .github/workflows/pr-autofix.yml ----\n${CONSUMER_AUTOFIX(sha)}`);
   process.exit(0);
 }
 if (SELF_TEST) report = selfTest();
