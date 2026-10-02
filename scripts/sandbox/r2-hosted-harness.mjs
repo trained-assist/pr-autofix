@@ -379,6 +379,12 @@ ${CAPTURE_STEP('after', toolSha)}`;
 function liveRun() {
   if (!EVIDENCE_OUT) die('--run requires --evidence-out <dir>: the bundle must be durable before teardown');
   if (!spawnSync('gh', ['auth', 'status'], { encoding: 'utf8' }).stdout) die('gh is not authenticated — the live phases need a token');
+  // The consumer's workflow calls the shipped reusable workflow at $TOOL_SHA. A SHA that exists
+  // only locally makes GitHub reject the whole workflow FILE ("likely failed because of a
+  // workflow file issue", zero jobs) — the run burns minutes and produces no evidence at all.
+  const toolRepo = ((gitOut(['-C', CODE, 'remote', 'get-url', 'origin']) || '').match(/github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/) || [])[1];
+  if (toolRepo && spawnSync('gh', ['api', `repos/${toolRepo}/commits/${TOOL_SHA}`], { encoding: 'utf8' }).status !== 0)
+    die(`tool SHA ${TOOL_SHA.slice(0, 8)} is not on github.com/${toolRepo} — push the branch first; the consumer pins the shipped workflow at that SHA`);
   const org = gh(['repo', 'view', '--json', 'owner', '-q', '.owner.login']).split('\n')[0];
   const slug = `${REPO}-${Date.now().toString(36)}`;
   const full = `${org}/${slug}`;
