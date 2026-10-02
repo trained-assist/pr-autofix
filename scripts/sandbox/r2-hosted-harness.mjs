@@ -468,7 +468,27 @@ function liveRun() {
     };
     const ciRun = waitFor('ci.yml');
     say(`CI run ${ciRun.databaseId}: ${ciRun.conclusion} — ${ciRun.url}`);
-    const run = waitFor('pr-autofix.yml');
+    // A workflow_run consumer fires PR Autofix for EVERY completed CI run — including the GREEN
+    // CI of the fix PR, whose autofix job is then skipped. The newest run at evidence time is
+    // that empty one, so "wait for a completed run" would judge a skipped job and call the
+    // product defective for its own success. The fix run is the one whose autofix job started.
+    const autofixJobConclusion = (id) => (gh(['api', `repos/${full}/actions/runs/${id}/jobs`,
+      '--jq', '[.jobs[] | select(.name | startswith("autofix"))][0].conclusion ?? "absent"'], { check: false }) || 'absent').trim();
+    const waitForFixRun = () => {
+      for (;;) {
+        const list = (JSON.parse(gh(['run', 'list', '--repo', full, '--workflow', 'pr-autofix.yml',
+          '--limit', '5', '--json', 'databaseId,status,conclusion,url,headSha,createdAt'], { check: false }) || '[]')
+          .filter((r) => r.status === 'completed')
+          .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)));
+        for (const r of list) {
+          const c = autofixJobConclusion(r.databaseId);
+          if (c && c !== 'skipped' && c !== 'absent') return r;
+        }
+        if (Date.now() - started > 30 * 60_000) die('no PR Autofix run with a started autofix job in 30 min');
+        spawnSync('sleep', ['15']);
+      }
+    };
+    const run = waitForFixRun();
     say(`PR Autofix run ${run.databaseId}: ${run.conclusion} — ${run.url}`);
 
     phase('evidence — collected from the run, written before teardown');
@@ -518,26 +538,37 @@ function liveRun() {
     const runnerAfter = { ...state.after, gitlinks: state.after.gitlinks || [] };
     const runnerBefore = { ...state.before, gitlinks: state.before.gitlinks || [] };
 
-    // The fix PR the fixer opens is the only place the patch and the changed-file list exist — and
-    // ONLY the fixer's PR counts. Falling back to "any PR" is how a bundle gets a green verdict
-    // carrying the harness's own fixture diff: the fix branch is `fix/ci-*` off the failing branch,
-    // which is the shipped convention, so identification is by that, not by guessing.
-    let fixFiles = [], patch = '', prUrl = '';
+    // ONLY the fixer's PR counts: it is identified by the shipped branch convention
+    // `fix/ci-<sanitized original branch>-<ts>` (autofix.mjs), which the fixture PR's own head
+    // (`harness/failing-pr`) can never carry — no "any PR" fallback can green the bundle with
+    // the harness's own diff. Its BASE is the shipped BASE_BRANCH (default `main`), so
+    // `baseRefName === prBranch` was never the product's shape: the fix branch neutralises the
+    // fixture on top of main, and the PR-level net diff is EMPTY. The actual patch — what the
+    // fixer changed, which is what R2 asks for — lives in the fix COMMIT, so the bundle reads
+    // files and patch from the commit the PR carries, not from the PR's net diff.
+    let fixFiles = [], patch = '', prUrl = '', fixCommit = '';
     try {
       const prs = JSON.parse(gh(['pr', 'list', '--repo', full, '--state', 'all', '--json', 'url,number,headRefName,baseRefName,title'], { check: false }) || '[]');
-      const pr = prs.find((p) => /^fix\/ci-/.test(p.headRefName) && p.baseRefName === prBranch);
+      const safePrBranch = prBranch.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 40);
+      const pr = prs.find((p) => p.headRefName.startsWith(`fix/ci-${safePrBranch}-`));
       if (pr) {
         prUrl = pr.url;
-        const files = JSON.parse(gh(['pr', 'view', String(pr.number), '--repo', full, '--json', 'files,headRefOid'], { check: false }) || '{}');
-        fixFiles = ((files.files || []).map((f) => f.path) || []).filter(Boolean);
-        patch = (spawnSync('gh', ['pr', 'diff', String(pr.number), '--repo', full], { encoding: 'utf8' }).stdout || '').trim();
-        writeFileSync(path.join(outDir, `${slug}-patch.diff`), patch);
-      } else say(`::warning::no fix/ci-* PR based on ${prBranch} (PRs: ${prs.map((p) => p.headRefName).join(', ') || 'none'}) — the bundle is INCOMPLETE`);
+        const prCommits = JSON.parse(gh(['pr', 'view', String(pr.number), '--repo', full, '--json', 'commits'], { check: false }) || '{}').commits || [];
+        const fixC = [...prCommits].reverse().find((c) => /\[autofix\]/.test(c.messageHeadline || '')) || null;
+        if (fixC) {
+          fixCommit = fixC.oid;
+          const api = JSON.parse(gh(['api', `repos/${full}/commits/${fixC.oid}`], { check: false }) || '{}');
+          fixFiles = (api.files || []).map((f) => f.filename).filter(Boolean);
+          patch = (api.files || []).map((f) =>
+            `diff --git a/${f.filename} b/${f.filename}\n--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch || ''}\n`).join('');
+          if (patch) writeFileSync(path.join(outDir, `${slug}-patch.diff`), patch);
+        } else say('::warning::the fix PR carries no [autofix] commit — the bundle is INCOMPLETE');
+      } else say(`::warning::no fix/ci-${safePrBranch}-* PR (PRs: ${prs.map((p) => p.headRefName).join(', ') || 'none'}) — the bundle is INCOMPLETE`);
     } catch { say('::warning::the fix PR could not be read — the bundle is INCOMPLETE'); }
 
     const meta = { consumer: full, ci_run: { id: String(ciRun.databaseId), url: ciRun.url, conclusion: ciRun.conclusion },
       run_id: String(run.databaseId), run_url: run.url, conclusion: run.conclusion,
-      caller_sha: callerSha, tool_sha: TOOL_SHA, fix_pr: prUrl, changed_files: fixFiles,
+      caller_sha: callerSha, tool_sha: TOOL_SHA, fix_pr: prUrl, fix_commit: fixCommit, changed_files: fixFiles,
       runner_state: { before: runnerBefore, after: runnerAfter }, logs, jobs: jobsFile,
       shipped_job: shippedJob.name ? { name: shippedJob.name, conclusion: shippedJob.conclusion, startedAt: shippedJob.startedAt, completedAt: shippedJob.completedAt } : null,
       patch: patch ? `${slug}-patch.diff` : '' };
