@@ -106,30 +106,45 @@ jobs:
       # inside a reusable workflow `github.workflow_ref` is the CALLER's workflow, and fetching
       # from that ref 404s — autofix would never run. persist-credentials: false leaves no token
       # in the clone; the caller token is still used by the `actions/checkout` step above.
-      - name: Materialize the pinned tool tree
-        if: steps.guard.outputs.skip == 'false'
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: pr-autofix
-          persist-credentials: false
-
-      # R1 (pr-autofix#54) — the tool tree leaves the consumer root right after materialization
-      # (actions/checkout cannot place it outside GITHUB_WORKSPACE). The fixer below stages with
-      # `git add -A` in the CONSUMER repo: with the tool tree here, that staged an unsolicited
-      # `160000` gitlink for the nested git repo into every fix commit, and the scanner read the
-      # tool's fixtures as the consumer's failures. Same guard as the checkout: no tree, no run.
-      - name: Relocate the tool tree out of the consumer root
+      # R1 (pr-autofix#61) — THE CHECK RUNS BEFORE ANY WRITE. actions/checkout RESOLVES `path`
+      # AGAINST GITHUB_WORKSPACE AND REFUSES ANYTHING OUTSIDE IT (input-helper.ts:42-52:
+      # "Repository path … is not under …"). The earlier claim that `path` is taken verbatim was
+      # wrong, and that error is what produced the defect: with containment, delivery can only be
+      # pointed outside the consumer by scoping GITHUB_WORKSPACE — which the Materialize step
+      # below does for its own process only (its absolute `path` is the fail-safe pair: drop the
+      # env and checkout refuses loudly instead of writing into the consumer root). The consumer
+      # tree is never a materialization target: no path inside it is claimed or cleared, and no
+      # relocation step exists to collide with consumer content. The fixer below stages with
+      # `git add -A` in the CONSUMER repo — a tool tree in the root would stage an unsolicited
+      # `160000` gitlink for the nested git repo into every fix commit, and the scanner would read
+      # the tool's fixtures as the consumer's failures. This step keeps the REAL GITHUB_WORKSPACE:
+      # what can already sit in the target (a previous tool clone on a self-hosted runner) is
+      # refused loudly — a symlink or a directory without `.git` is not our checkout, and
+      # checkout@v4 would clear its contents — never overwritten. Same guard as the checkout: no
+      # tree, no run.
+      - name: Delivery target is outside the consumer tree
         if: steps.guard.outputs.skip == 'false'
         run: |
           set -euo pipefail
-          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
-            echo "::error::the pinned tool tree was not materialized — refusing to run"
+          target="$RUNNER_TEMP/pr-autofix"
+          case "$target/" in
+            "$GITHUB_WORKSPACE/"*) echo "::error::the tool target $target is inside the consumer tree — refusing"; exit 1 ;;
+          esac
+          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target/.git" ]; }; then
+            echo "::error::$target exists and is not a tool checkout — refusing to overwrite it"
             exit 1
           fi
-          rm -rf "$RUNNER_TEMP/pr-autofix"
-          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
+
+      - name: Materialize the pinned tool tree
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        env:
+          GITHUB_WORKSPACE: ${{ runner.temp }}
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: ${{ runner.temp }}/pr-autofix
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         if: steps.guard.outputs.skip == 'false'

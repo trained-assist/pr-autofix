@@ -54,30 +54,44 @@ jobs:
       # a chance to break. `payload-verify` below then proves both directions (missing AND
       # undeclared) against the manifest committed at that same SHA — and it runs the CLI FROM the
       # tree, because only running it can prove it starts.
+      # R1 (pr-autofix#61) — THE CHECK RUNS BEFORE ANY WRITE. actions/checkout RESOLVES `path`
+      # AGAINST GITHUB_WORKSPACE AND REFUSES ANYTHING OUTSIDE IT (input-helper.ts:42-52:
+      # "Repository path … is not under …"). The earlier claim that `path` is taken verbatim was
+      # wrong, and that error is what produced the defect: with containment, delivery can only be
+      # pointed outside the consumer by scoping GITHUB_WORKSPACE — which the Materialize step
+      # below does for its own process only. The consumer tree is therefore never a
+      # materialization target: no path inside it is claimed or cleared (prepareExistingDirectory
+      # → rmRF), and no relocation step exists to collide with consumer content. From here on
+      # scan (`check-docs --dir .`), `git status` and `git add -A` see the consumer and only the
+      # consumer: the tool's fixtures are never its violations, and the nested git repo can never
+      # be staged as an unsolicited `160000` gitlink. This step keeps the REAL GITHUB_WORKSPACE,
+      # so its assertion below is meaningful: what can already sit in the delivery target on a
+      # self-hosted runner is a previous tool clone — a symlink or a directory without `.git` is
+      # NOT our checkout, and checkout@v4 would clear its contents (prepareExistingDirectory →
+      # remove=true → rmRF of every entry) — refused loudly, never silently overwritten. The
+      # absolute `path` below is the fail-safe pair for the env line: if the env is ever dropped,
+      # checkout refuses loudly instead of writing into the consumer root.
+      - name: Delivery target is outside the consumer tree
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/pr-autofix"
+          case "$target/" in
+            "$GITHUB_WORKSPACE/"*) echo "::error::the tool target $target is inside the consumer tree — refusing"; exit 1 ;;
+          esac
+          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target/.git" ]; }; then
+            echo "::error::$target exists and is not a tool checkout — refusing to overwrite it"
+            exit 1
+          fi
+
       - name: Materialize the pinned tool tree
         uses: actions/checkout@v4
+        env:
+          GITHUB_WORKSPACE: ${{ runner.temp }}
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
-          path: pr-autofix
+          path: ${{ runner.temp }}/pr-autofix
           persist-credentials: false
-
-      # R1 (pr-autofix#54) — INSTALLING THE TOOL MUST NOT CHANGE THE CONSUMER. actions/checkout
-      # refuses a `path` outside GITHUB_WORKSPACE, so the tree can only be materialized inside
-      # the consumer root — and immediately moved out of it. From here on scan
-      # (`check-docs --dir .`), `git status` and `git add -A` see the consumer and only the
-      # consumer: the tool's fixtures are never its violations, and the nested git repo can never
-      # be staged as an unsolicited `160000` gitlink. Every tool path below is
-      # $RUNNER_TEMP/pr-autofix/… — the same directory the runner already owns for scratch.
-      - name: Relocate the tool tree out of the consumer root
-        run: |
-          set -euo pipefail
-          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
-            echo "::error::the pinned tool tree was not materialized — refusing to run"
-            exit 1
-          fi
-          rm -rf "$RUNNER_TEMP/pr-autofix"
-          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
 
       - name: The tree we are about to run is the tree the manifest declares
         run: |

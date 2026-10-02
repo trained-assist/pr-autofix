@@ -277,14 +277,21 @@ function baseEnv({ workspace, consumerDir, runnerTemp, head, extra = {} }) {
 }
 
 const RUN_TOOL = /(^|[^\w-])(node|npm|npx)\s/;
-const RELOCATED = /\bmv\b[\s\S]*RUNNER_TEMP|RUNNER_TEMP[\s\S]*\bmv\b/;
 
-// Deliver: start at the tool materialization, run the shipped steps verbatim, stop when the
-// tool leaves the consumer root (or when the job would start EXECUTING the tool — delivery
-// is over by then). Steps before materialization (consumer checkout, guards, setup-node) are
-// not part of the delivery boundary.
+// The delivery window starts at the collision preflight ("Delivery target is outside the
+// consumer tree") when the shipped form has one, else at the materialization itself: the
+// preflight is part of delivery — it must run BEFORE any write, and T5's negative scenarios
+// (symlink / foreign directory / target inside the workspace) assert its loud refusal.
+const isPreflight = (s) => typeof s.run === 'string' && /RUNNER_TEMP\/pr-autofix/.test(s.run) && /refusing/.test(s.run);
+const isDeliveryStart = (s) => isToolCheckout(s) || materializeName(s) || isPreflight(s);
+
+// Deliver: start at the preflight/materialization, run the shipped steps verbatim, stop when the
+// tool tree has been materialized OUTSIDE the consumer root — delivery is complete at that
+// point (there is no relocation step to wait for; the form is "straight to the runner temp").
+// Steps before that (consumer checkout, guards, setup-node) are not part of the delivery
+// boundary; steps after it EXECUTE the tool and are not delivery either.
 async function runDelivery(steps, ctxA, { workspace, consumerDir, runnerTemp, head }) {
-  const startIdx = steps.findIndex((s) => (isToolCheckout(s) || materializeName(s)) && evalIf(s.if, ctxA));
+  const startIdx = steps.findIndex((s) => isDeliveryStart(s) && evalIf(s.if, ctxA));
   if (startIdx === -1) return { error: 'no tool materialization step found in this job' };
   const executed = [];
   let code = 0;
@@ -298,20 +305,26 @@ async function runDelivery(steps, ctxA, { workspace, consumerDir, runnerTemp, he
       const r = await spawnBash(script, { env, cwd: workspace });
       executed.push({ name, code: r.code, tail: `${r.stdout}${r.stderr}`.trim().split('\n').slice(-6).join('\n') });
       if (r.code !== 0) { code = r.code; break; }
-      if (RELOCATED.test(script)) { executed.push({ name: '(delivery)', relocated: true }); break; }
       continue;
     }
     if (isToolCheckout(step)) {
+      // The runner resolves a step's `env:` into the step process AFTER the process environment
+      // (actions/runner: Runner.Sdk/ProcessInvoker.cs copies step env last, re-forcing only
+      // GITHUB_ACTIONS/CI) — the shipped Materialize step scopes GITHUB_WORKSPACE that way, and
+      // the probe must execute the shipped form, not a hand-made approximation of it.
       const env = baseEnv({ workspace, consumerDir, runnerTemp, head,
-        extra: { INPUT_TOKEN: 'synthetic-fixture-token' } });
+        extra: { INPUT_TOKEN: 'synthetic-fixture-token',
+          ...Object.fromEntries(Object.entries(step.env || {}).map(([k, v]) => [k, render(String(v), ctxA)])) } });
       for (const [k, v] of Object.entries(step.with || {})) {
         const rendered = render(String(v), ctxA);
         if (rendered !== '') env[`INPUT_${k.toUpperCase()}`] = rendered;
       }
       const r = await runCheckoutDist({ env });
-      executed.push({ name, code: r.code, tail: `${r.stdout}${r.stderr}`.trim().split('\n').slice(-6).join('\n') });
+      executed.push({ name, code: r.code, tail: `${r.stdout}${r.stderr}`.trim().split('\n').slice(-6).join('\n'),
+        step_env: step.env || {} });
       if (r.code !== 0) { code = r.code; break; }
-      continue;
+      executed.push({ name: '(delivery)', delivered: true }); // the tool tree is outside the consumer root — delivery is over
+      break;
     }
     executed.push({ name, skipped: `uses:${step.uses || '?'} is not delivery` });
   }
@@ -366,6 +379,10 @@ for (const [wf, variant] of SCENARIOS) {
   const consumerDir = consumerSub ? path.join(workspace, consumerSub) : workspace;
   const runnerTemp = path.join(caseDir, 'rt');
   mkdirSync(runnerTemp, { recursive: true });
+  // `${{ runner.temp }}` and $RUNNER_TEMP must be the SAME per case: the shipped form renders the
+  // path from the expression while the preflight reads the env, and a probe that let them diverge
+  // would test a delivery nobody ships.
+  ctx.globals['runner.temp'] = runnerTemp;
 
   buildFixture(consumerDir, variant);
   const fpBefore = fingerprint(consumerDir);

@@ -88,28 +88,40 @@ jobs:
       # script that cannot start behind a green check. It also downloaded to $RUNNER_TEMP and then
       # ran `/tmp/autofix.mjs`, two different paths on a GitHub runner. Same mechanism as the
       # reusable workflows now: the whole pinned tree, so every import comes with it.
+      # R1 (pr-autofix#61) — THE CHECK RUNS BEFORE ANY WRITE. actions/checkout RESOLVES `path`
+      # AGAINST GITHUB_WORKSPACE AND REFUSES ANYTHING OUTSIDE IT (input-helper.ts:42-52:
+      # "Repository path … is not under …"). The earlier claim that `path` is taken verbatim was
+      # wrong, and that error is what produced the defect: with containment, delivery can only be
+      # pointed outside the consumer by scoping GITHUB_WORKSPACE — which the Materialize step
+      # below does for its own process only (its absolute `path` is the fail-safe pair: drop the
+      # env and checkout refuses loudly instead of writing into the consumer root) — the same
+      # separation of roots as the callable workflows: the consumer root keeps exactly what the
+      # consumer owns. Autofix stages with `git add -A` here too — a tool tree in the root would
+      # become an unsolicited gitlink in the fix commit. This step keeps the REAL GITHUB_WORKSPACE:
+      # what can already sit in the target on a self-hosted runner is refused loudly — a symlink
+      # or a directory without `.git` is not our checkout, and checkout@v4 would clear its
+      # contents — never silently overwritten.
+      - name: Delivery target is outside the consumer tree
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/pr-autofix"
+          case "$target/" in
+            "$GITHUB_WORKSPACE/"*) echo "::error::the tool target $target is inside the consumer tree — refusing"; exit 1 ;;
+          esac
+          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target/.git" ]; }; then
+            echo "::error::$target exists and is not a tool checkout — refusing to overwrite it"
+            exit 1
+          fi
+
       - name: Materialize the pinned tool tree
         uses: actions/checkout@v4
+        env:
+          GITHUB_WORKSPACE: ${{ runner.temp }}
         with:
           repository: trained-assist/pr-autofix
           ref: ${{ github.workflow_sha }}
-          path: pr-autofix
+          path: ${{ runner.temp }}/pr-autofix
           persist-credentials: false
-
-      # R1 (pr-autofix#54) — the same separation of roots as the callable workflows: actions/checkout
-      # can only materialize inside GITHUB_WORKSPACE, so the pinned tree is moved straight into
-      # $RUNNER_TEMP and the consumer root keeps exactly what the consumer owns. Autofix stages
-      # with `git add -A` here too — a tool tree left in the root becomes an unsolicited gitlink
-      # in the fix commit.
-      - name: Relocate the tool tree out of the consumer root
-        run: |
-          set -euo pipefail
-          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
-            echo "::error::the pinned tool tree was not materialized — refusing to run autofix"
-            exit 1
-          fi
-          rm -rf "$RUNNER_TEMP/pr-autofix"
-          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
 
       - uses: actions/setup-node@v4
         with:
