@@ -82,8 +82,8 @@
     },
     {
       "path": "scripts/lib/devbaseline/log.mjs",
-      "sha256": "883b952b88511df2cd111659610d3929f9d222dd59fb69691c04c930186e8fcc",
-      "bytes": 9179
+      "sha256": "046b387a8ddade72b1da3a033b6a849f983869a10f6265c5db9fee586086cafe",
+      "bytes": 9944
     },
     {
       "path": "scripts/lib/devbaseline/payload.mjs",

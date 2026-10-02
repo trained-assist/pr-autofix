@@ -197,8 +197,12 @@ function findStep(jobs, namePrefix) {
     `env=${JSON.stringify(autoEnv)}`);
 
   const logSrc = readFileSync(LOG_MJS, 'utf8');
+  // Comments may document WHY the fallback is gone — the scan is on executable code only.
+  const logCode = logSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
   check('case4: log.mjs contains no GITHUB_WORKFLOW fallback',
-    !logSrc.includes('GITHUB_WORKFLOW'), 'log.mjs still reads GITHUB_WORKFLOW_*');
+    !logCode.includes('GITHUB_WORKFLOW'), 'log.mjs still reads GITHUB_WORKFLOW_* in code');
 }
 
 const failed = results.filter(r => !r.ok);
