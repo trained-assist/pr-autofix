@@ -92,6 +92,24 @@ const workspace = path.join(root, 'workspace');
 const fakebin = path.join(root, 'fakebin');
 for (const d of [runnerTemp, workspace, fakebin]) mkdirSync(d, { recursive: true });
 
+// The shipped cleanup job delivers the pinned tree with a run step that FETCHES it (pr-autofix#67):
+// actions/checkout cannot install outside the consumer root, and a step `env:` cannot move
+// GITHUB_WORKSPACE — runner 2.337.0 writes its runtime context over it. That fetch must be
+// exercised offline and by SHA, so the URL is redirected to a local bare mirror (both spellings)
+// in this probe's HOME, and GIT_ALLOW_PROTOCOL=file below refuses every other transport.
+const MIRROR = path.join(root, 'tool.git');
+try {
+  execFileSync('git', ['clone', '--bare', '--quiet', CODE, MIRROR], { stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['-C', MIRROR, 'config', 'uploadpack.allowAnySHA1InWant', 'true'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  for (const prefix of ['https://github.com/trained-assist/pr-autofix.git', 'https://github.com/trained-assist/pr-autofix']) {
+    execFileSync('git', ['config', '--global', '--add', `url.file://${MIRROR}.insteadOf`, prefix],
+      { env: { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  }
+} catch (e) {
+  console.error(`::error::cannot build the local tool mirror: ${e.message}`);
+  process.exit(2);
+}
+
 // The pinned identity the payload is served under. Shape matches what fetch-payload.mjs
 // accepts on loopback: owner/repo/<sha>. A fix that pins must fetch THIS, never a branch.
 // A checkout without git cannot establish a pin, so that is a broken HARNESS (exit 2), never a
@@ -250,12 +268,13 @@ async function runJob({ inputs, secrets, ghMode, cwd }) {
   for (const step of steps) {
     if (!step.run) {
       // Emulate `uses:` steps the way the runner really does them. actions/checkout materialises
-      // the FULL tool tree at the requested ref — that is the one delivery shape that cannot
-      // half-work, because it brings every import with it. It also resolves `path` against
-      // GITHUB_WORKSPACE (the STEP's, which the shipped Materialize step scopes to the runner
-      // temp) and refuses anything outside it (input-helper.ts:42-52) — and it CLEARS a target
-      // that exists without `.git` (prepareExistingDirectory → rmRF), which is exactly what
-      // destroyed a consumer-owned directory in R1. Emulating the copy alone hid all three.
+      // the FULL tool tree at the requested ref. It resolves `path` against GITHUB_WORKSPACE —
+      // the CONTEXT's value, never a step's (NodeScriptActionHandler.cs:42-50 writes the runtime
+      // context over the step environment; pr-autofix#67) — and refuses anything outside it
+      // (input-helper.ts:42-52); it also CLEARS a target that exists without `.git`
+      // (prepareExistingDirectory → rmRF), which is what destroyed a consumer-owned directory in
+      // #61. The supported form no longer uses checkout for delivery at all, so this branch stays
+      // only to make an unsupported form fail with the real containment error.
       if (/^actions\/checkout@/.test(String(step.uses || ''))) {
         const stepRoot = stepEnv(step, inputs, secrets).GITHUB_WORKSPACE || workspace;
         const sub = render(String((step.with && step.with.path) || '').trim(), { inputs, secrets });
@@ -291,10 +310,18 @@ function spawnOne(block, { env, secrets, ghMode, cwd }) {
   writeFileSync(GH_LOG, '');
   const script = path.join(root, `step-${Math.random().toString(36).slice(2)}.sh`);
   writeFileSync(script, block, { mode: 0o755 });
+  // The runner's order (pr-autofix#67): the CONTEXT supplies GITHUB_WORKSPACE and a step's `env:`
+  // cannot move it — NodeScriptActionHandler.cs:42-50 writes the runtime context over the step
+  // environment and GitHubContext.cs:49-64 exports the workspace from it — so the context value
+  // goes last here too, and a step env that tries to set it is dropped instead of believed. Other
+  // GITHUB_* names here are fixture values this probe owns; the workspace is the one variable
+  // delivery ever tried to move.
+  const CONTEXT_OWNED = new Set(['GITHUB_WORKSPACE']);
+  const stepOnly = Object.entries(env || {}).filter(([k]) => !CONTEXT_OWNED.has(k));
   const r = spawn('/usr/bin/env', ['-i', `PATH=${RUNNER_PATH}`, `HOME=${root}`, `RUNNER_TEMP=${runnerTemp}`,
-    `GITHUB_WORKSPACE=${workspace}`, 'GITHUB_ENV=/dev/null', 'GITHUB_OUTPUT=/dev/null',
+    'GIT_ALLOW_PROTOCOL=file', `GITHUB_WORKSPACE=${workspace}`, 'GITHUB_ENV=/dev/null', 'GITHUB_OUTPUT=/dev/null',
     'GITHUB_PATH=/dev/null', 'GH_TOKEN=stub-token-synthetic',
-    ...Object.entries(env || {}).map(([k, v]) => `${k}=${v}`),
+    ...stepOnly.map(([k, v]) => `${k}=${v}`),
     ...Object.entries(secrets || {}).filter(([k]) => !k.startsWith('__')).map(([k, v]) => `${k}=${v}`),
     '/usr/bin/bash', script],
     { encoding: 'utf8', cwd: cwd || workspace, timeout: 60_000 });
@@ -308,6 +335,7 @@ function spawnOne(block, { env, secrets, ghMode, cwd }) {
       clearTimeout(t);
       resolve({
         code: timedOut ? 124 : code, stdout, stderr,
+        ignored_context_overrides: Object.keys(env || {}).filter((k) => CONTEXT_OWNED.has(k)),
         calls: existsSync(GH_LOG) ? readFileSync(GH_LOG, 'utf8').trim().split('\n').filter(Boolean) : [],
       });
     });
@@ -327,7 +355,7 @@ check('the cleanup job declares at least one run step', runSteps.length >= 1, `$
 // The existing regression only greps for the script's NAME, which is why a job with no delivery
 // at all passed; here the job must actually bring the tool in.
 const deliversViaAction = steps.some(s => !!s.uses);
-const deliversViaShell = runSteps.some(s => /fetch-payload|curl -|wget |git clone|tar |unzip /.test(s.run));
+const deliversViaShell = runSteps.some(s => /fetch-payload|curl -|wget |git (clone|fetch|init)|tar |unzip /.test(s.run));
 check('the cleanup job delivers the tool before running it (checkout/fetch precedes the run)',
   deliversViaAction || deliversViaShell,
   `steps: ${steps.map(s => s.uses ? `uses:${s.uses}` : 'run').join(' → ')}`);

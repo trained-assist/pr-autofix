@@ -1,29 +1,37 @@
 #!/usr/bin/env node
-// R1 consumer-collision probe — materializing the pinned tool must not destroy a
-// consumer-owned `pr-autofix/` catalog (pr-autofix#61).
+// R1 consumer-collision probe — installing the pinned tool must never change a consumer-owned
+// `pr-autofix/` catalog, and it must actually install (pr-autofix#61, #67).
 //
-// The shipped delivery (all four delivery points) runs `uses: actions/checkout …
-// path: pr-autofix` INSIDE the consumer root and relocates the tree to $RUNNER_TEMP only
-// afterwards. Real actions/checkout clears an existing target directory that has no `.git`
-// of its own (git-directory-helper.ts), so a consumer that already tracks
-// `pr-autofix/consumer-owned.md` loses that content; the later `mv` carries the REPLACEMENT
-// away, the original is gone, and autofix's `git add -A` stages
-// ` D pr-autofix/consumer-owned.md` into the next fix commit.
+// Two forms of this defect class have shipped, and this probe is the one that must stay green
+// across both:
+//   #61 — delivery materialized INSIDE the consumer root (`actions/checkout … path: pr-autofix`,
+//     then `mv`). Real actions/checkout clears a target that has no `.git` of its own
+//     (prepareExistingDirectory → git-directory-helper.ts), so the consumer's file was gone and
+//     autofix's `git add -A` staged its deletion.
+//   #67 — the v1.7.9 form delivered outside the root with
+//     `env: GITHUB_WORKSPACE: ${{ runner.temp }}` + an absolute `path:`, which the runner never
+//     honours (NodeScriptActionHandler writes the runtime context over a step env): checkout saw
+//     the CONSUMER workspace, refused the runner-temp path and exited 1 — an INSTALL REFUSAL, not
+//     a content loss. This probe used to model the opposite env order and called that release
+//     clean; the env order below is now the runner's, and the verdict distinguishes the two
+//     failures instead of naming every red scenario "content lost".
 //
-// Unlike r1-root-separation-probe.mjs (which EMULATES checkout), this probe runs the REAL,
-// unmodified actions/checkout@v4 dist and then executes the shipped delivery `run:` blocks
-// verbatim, read from the live workflow files. Fully offline: the tool repository is a local
-// bare mirror reached through `url.<mirror>.insteadOf`, and GIT_ALLOW_PROTOCOL=file refuses
-// any network transport, so a green run cannot be the network's doing.
+// Unlike r1-root-separation-probe.mjs (which EMULATES checkout), this probe executes the shipped
+// delivery steps verbatim, read from the live workflow files, and runs the REAL unmodified
+// actions/checkout@v4 dist whenever a delivery point still ships a checkout step. Fully offline:
+// the tool repository is a local bare mirror reached through `url.<mirror>.insteadOf` (both URL
+// forms), and GIT_ALLOW_PROTOCOL=file refuses any network transport, so a green run cannot be the
+// network's doing.
 //
 // Fixtures: a consumer that OWNS `pr-autofix/` three ways — tracked file, untracked file,
-// tracked symlink. Delivery must leave every one of them byte-identical, and the tool must
-// still be materialized OUTSIDE the consumer root (a delivery that materializes nothing
-// would otherwise pass the preservation checks vacuously).
+// tracked symlink. Delivery must leave every one of them byte-identical, and the tool must still
+// be materialized OUTSIDE the consumer root (a delivery that materializes nothing would otherwise
+// pass the preservation checks vacuously).
 //
 //   node scripts/sandbox/r1-consumer-collision-probe.mjs [--checkout <actions/checkout tree>]
 //                                                        [--code <repo>] [--keep] [--json]
-// exit 0 = delivery left the consumer byte-identical; 1 = defect reproduced; 2 = harness error
+// exit 0 = delivery installed the tool and left the consumer byte-identical;
+//      1 = defect reproduced; 2 = harness error
 
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync,
   readdirSync, readlinkSync, lstatSync } from 'node:fs';
@@ -69,7 +77,7 @@ let TOOL_SHA;
 try { TOOL_SHA = execFileSync('git', ['-C', CODE, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(); }
 catch { die(`${CODE} is not a git checkout — cannot establish the pinned tool identity`); }
 
-// ── the real actions/checkout dist ─────────────────────────────────────────────
+// ── the real actions/checkout dist — resolved only if a delivery point still ships one ──
 function resolveCheckout() {
   const usable = (d) => d && existsSync(path.join(d, 'dist', 'index.js'));
   if (usable(CHECKOUT_ARG)) return CHECKOUT_ARG;
@@ -93,9 +101,15 @@ function resolveCheckout() {
   }
   return cache;
 }
-const CHECKOUT = resolveCheckout();
-const CHECKOUT_DIST = path.join(CHECKOUT, 'dist', 'index.js');
-const CHECKOUT_DIST_SHA = createHash('sha256').update(readFileSync(CHECKOUT_DIST)).digest('hex');
+let CHECKOUT = null;
+let CHECKOUT_DIST_SHA = null;
+function checkoutDist() {
+  if (!CHECKOUT) {
+    CHECKOUT = resolveCheckout();
+    CHECKOUT_DIST_SHA = createHash('sha256').update(readFileSync(path.join(CHECKOUT, 'dist', 'index.js'))).digest('hex');
+  }
+  return CHECKOUT_DIST_SHA ? path.join(CHECKOUT, 'dist', 'index.js') : null;
+}
 
 // ── sandbox ────────────────────────────────────────────────────────────────────
 const sandboxBase = process.env.DEVBASELINE_SANDBOX_TMP || path.join(CODE, '.devbaseline-sandbox');
@@ -109,12 +123,16 @@ mkdirSync(TMP, { recursive: true });
 const git = (args, cwd, opts = {}) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
 
-// Local bare mirror of the tool + insteadOf, so `actions/checkout` fetches from disk.
+// Local bare mirror of the tool + insteadOf, so both delivery forms fetch from disk. Both URL
+// forms are registered because git rewrites the LONGEST matching prefix: a run step that fetches
+// `…/pr-autofix.git` and an action that fetches `…/pr-autofix` must land on the same mirror.
 const MIRROR = path.join(root, 'tool.git');
 try {
   git(['clone', '--bare', '--quiet', CODE, MIRROR]);
   git(['-C', MIRROR, 'config', 'uploadpack.allowAnySHA1InWant', 'true']); // GitHub allows sha fetches; the mirror must too
-  execFileSync('git', ['config', '--global', `url.file://${MIRROR}.insteadOf`, `https://github.com/${TOOL_REPO}`],
+  execFileSync('git', ['config', '--global', `url.file://${MIRROR}.insteadOf`, `https://github.com/${TOOL_REPO}.git`],
+    { env: { ...process.env, HOME, GIT_CONFIG_NOSYSTEM: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['config', '--global', '--add', `url.file://${MIRROR}.insteadOf`, `https://github.com/${TOOL_REPO}`],
     { env: { ...process.env, HOME, GIT_CONFIG_NOSYSTEM: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
 } catch (e) { die(`cannot build the local tool mirror: ${e.message}`); }
 
@@ -229,7 +247,9 @@ function spawnBash(block, { env, cwd }) {
 }
 
 function runCheckoutDist({ env }) {
-  const child = spawn(process.execPath, [CHECKOUT_DIST], { env });
+  const dist = checkoutDist();
+  if (!dist) die('a delivery point ships an actions/checkout step but no checkout tree is available');
+  const child = spawn(process.execPath, [dist], { env });
   return new Promise((resolve) => {
     let stdout = '', stderr = '', timedOut = false;
     const t = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 120_000);
@@ -295,35 +315,40 @@ async function runDelivery(steps, ctxA, { workspace, consumerDir, runnerTemp, he
   if (startIdx === -1) return { error: 'no tool materialization step found in this job' };
   const executed = [];
   let code = 0;
+  // The runner's environment order (pr-autofix#67): a step's `env:` is applied, then the runtime
+  // context is written OVER it — NodeScriptActionHandler.cs:42-50 exports GITHUB_WORKSPACE from
+  // GitHubContext.cs:49-64. So the context values are re-applied last here too. An earlier version
+  // of this probe merged them the other way round and therefore reported "clean" on v1.7.9, where
+  // every delivery failed with "Repository path … is not under …".
+  const runnerEnv = (extra) => {
+    const context = baseEnv({ workspace, consumerDir, runnerTemp, head });
+    const env = { ...context, ...extra };
+    for (const [k, v] of Object.entries(context)) if (k.startsWith('GITHUB_')) env[k] = v;
+    return env;
+  };
   for (const step of steps.slice(startIdx, startIdx + 8)) {
     const name = step.name || step.uses || '(unnamed)';
     if (step.run) {
       const script = render(step.run, ctxA);
       if (RUN_TOOL.test(script)) { executed.push({ name, stopped: 'tool execution begins — delivery is over' }); break; }
-      const env = { ...baseEnv({ workspace, consumerDir, runnerTemp, head }),
-        ...Object.fromEntries(Object.entries(step.env || {}).map(([k, v]) => [k, render(String(v), ctxA)])) };
+      const env = runnerEnv(Object.fromEntries(Object.entries(step.env || {}).map(([k, v]) => [k, render(String(v), ctxA)])));
       const r = await spawnBash(script, { env, cwd: workspace });
       executed.push({ name, code: r.code, tail: `${r.stdout}${r.stderr}`.trim().split('\n').slice(-6).join('\n') });
       if (r.code !== 0) { code = r.code; break; }
       continue;
     }
     if (isToolCheckout(step)) {
-      // The runner resolves a step's `env:` into the step process AFTER the process environment
-      // (actions/runner: Runner.Sdk/ProcessInvoker.cs copies step env last, re-forcing only
-      // GITHUB_ACTIONS/CI) — the shipped Materialize step scopes GITHUB_WORKSPACE that way, and
-      // the probe must execute the shipped form, not a hand-made approximation of it.
-      const env = baseEnv({ workspace, consumerDir, runnerTemp, head,
-        extra: { INPUT_TOKEN: 'synthetic-fixture-token',
-          ...Object.fromEntries(Object.entries(step.env || {}).map(([k, v]) => [k, render(String(v), ctxA)])) } });
+      const extra = { INPUT_TOKEN: 'synthetic-fixture-token',
+        ...Object.fromEntries(Object.entries(step.env || {}).map(([k, v]) => [k, render(String(v), ctxA)])) };
       for (const [k, v] of Object.entries(step.with || {})) {
         const rendered = render(String(v), ctxA);
-        if (rendered !== '') env[`INPUT_${k.toUpperCase()}`] = rendered;
+        if (rendered !== '') extra[`INPUT_${k.toUpperCase()}`] = rendered;
       }
-      const r = await runCheckoutDist({ env });
+      const r = await runCheckoutDist({ env: runnerEnv(extra) });
       executed.push({ name, code: r.code, tail: `${r.stdout}${r.stderr}`.trim().split('\n').slice(-6).join('\n'),
         step_env: step.env || {} });
       if (r.code !== 0) { code = r.code; break; }
-      executed.push({ name: '(delivery)', delivered: true }); // the tool tree is outside the consumer root — delivery is over
+      executed.push({ name: `${name} (delivery)`, delivered: true }); // the tool tree is outside the consumer root — delivery is over
       break;
     }
     executed.push({ name, skipped: `uses:${step.uses || '?'} is not delivery` });
@@ -514,11 +539,11 @@ const preflightCases = [];
       const verdictWord = c.allow ? 'allows' : 'refuses';
       const checks = [
         { name: `${c.name}: the preflight ${verdictWord} (exit ${r.code})`, ok: c.allow ? r.code === 0 : r.code !== 0, detail: out.split('\n').slice(-1)[0] || '(no output)' },
-        { name: `${c.name}: the refusal is explicit, not a silent skip`, ok: c.allow || /refusing/.test(out), detail: c.allow ? '' : (/refusing/.test(out) ? '' : out.split('\n').slice(-2).join(' | ').slice(0, 200)) },
+        { name: `${c.name}: ${c.allow ? 'the allowance is deliberate (no refusal)' : 'the refusal is explicit, not a silent skip'}`, ok: c.allow || /refusing/.test(out), detail: c.allow ? '' : (/refusing/.test(out) ? '' : out.split('\n').slice(-2).join(' | ').slice(0, 200)) },
         { name: `${c.name}: nothing in the target was written or destroyed`, ok: targetAfter === targetBefore, detail: targetAfter === targetBefore ? '' : `before=${targetBefore.slice(0, 120)} after=${targetAfter.slice(0, 120)}` },
         { name: `${c.name}: the consumer tree is byte-identical`, ok: consumerAfter === consumerBefore, detail: consumerAfter === consumerBefore ? '' : 'the consumer changed' },
       ];
-      preflightCases.push({ name: c.name, exit: r.code, output: out, checks });
+      preflightCases.push({ name: c.name, expect: verdictWord, exit: r.code, output: out, checks });
       for (const k of checks) say(`${k.ok ? 'ok  ' : 'FAIL'} ${k.name}${k.ok ? '' : ` — ${k.detail}`}`);
     }
   }
@@ -526,19 +551,31 @@ const preflightCases = [];
 
 const failedScenarios = results.filter((s) => !s.passed);
 const failedPreflight = preflightCases.flatMap((c) => c.checks).filter((k) => !k.ok).length;
+// Two different failures used to share one sentence, which is how #67 read as "content lost" when
+// nothing was installed at all (R2). Name them apart: an install refusal leaves the consumer
+// untouched, a content loss does not.
+const installRefused = results.filter((s) => s.checks.find((c) => c.name.startsWith('a.'))?.ok === false);
+const contentLost = results.filter((s) => ['c.', 'd.', 'e.', 'f.'].some((p) => s.checks.find((c) => c.name.startsWith(p))?.ok === false));
+const notInstalled = results.filter((s) => s.checks.find((c) => c.name.startsWith('b.'))?.ok === false);
 const report = {
   probe: 'r1-consumer-collision-probe',
   code: CODE,
   tool_sha: TOOL_SHA,
-  actions_checkout: { dir: CHECKOUT, dist_sha256: CHECKOUT_DIST_SHA, pinned_review_sha: CHECKOUT_PIN },
+  actions_checkout: CHECKOUT
+    ? { dir: CHECKOUT, dist_sha256: CHECKOUT_DIST_SHA, pinned_review_sha: CHECKOUT_PIN }
+    : null, // the shipped delivery is a run step — no action dist was needed, and none was fetched
   transport: 'local bare mirror via url.insteadOf; GIT_ALLOW_PROTOCOL=file (no network)',
   scenarios: results,
   preflight_cases: preflightCases,
-  verdict: failedScenarios.length
-    ? `DEFECT — consumer content lost at ${failedScenarios.length}/${results.length} scenarios`
-    : failedPreflight
-      ? `DEFECT — the collision preflight fails ${failedPreflight} check(s)`
-      : 'clean — delivery leaves the consumer byte-identical',
+  preflight_shape: `${preflightCases.filter((c) => c.expect === 'refuses').length} refusal cases + ${preflightCases.filter((c) => c.expect === 'allows').length} deliberate allowance (not four failures)`,
+  verdict: (failedScenarios.length || failedPreflight)
+    ? `DEFECT — ${[
+        installRefused.length ? `install refused at ${installRefused.length}/${results.length} scenarios` : '',
+        notInstalled.length ? `tool tree absent at ${notInstalled.length}/${results.length} scenarios` : '',
+        contentLost.length ? `CONSUMER CONTENT LOST at ${contentLost.length}/${results.length} scenarios` : '',
+        failedPreflight ? `the collision preflight fails ${failedPreflight} check(s)` : '',
+      ].filter(Boolean).join('; ')}`
+    : 'clean — the tool is installed outside the consumer and the consumer is byte-identical',
 };
 writeFileSync(path.join(sandboxBase, 'results.json'), `${JSON.stringify(report, null, 2)}\n`);
 
