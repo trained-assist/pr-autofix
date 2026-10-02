@@ -449,8 +449,17 @@ function liveRun() {
     writeFileSync(path.join(outDir, logs), sanitize(raw));
     // The failing job's own log, always: a red shipped job is the moment the bundle must carry the
     // reason, and the reason disappears with the disposable consumer at teardown.
-    const failedLog = spawnSync('gh', ['run', 'view', String(run.databaseId), '--repo', full, '--log-failed'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
-    if (failedLog.stdout && failedLog.stdout.trim()) writeFileSync(path.join(outDir, `${slug}-failed.log`), sanitize(failedLog.stdout));
+    // Per-job logs, because `gh run view --log` does NOT carry the log of a reusable-workflow
+    // job: the run-level dump ended at the caller, which is how a bundle can look complete while
+    // containing no trace of the shipped step that actually ran.
+    const jobLogs = [];
+    for (const v of [ciView, fixView]) for (const j of v.jobs || []) {
+      if (!j.databaseId) continue;
+      const jl = spawnSync('gh', ['api', `repos/${full}/actions/jobs/${j.databaseId}/logs`, '--include'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
+      if (!jl.stdout || !jl.stdout.trim()) continue;
+      jobLogs.push(`===== job ${j.name} (${j.conclusion}) — ${j.url}\n${jl.stdout}`);
+    }
+    writeFileSync(path.join(outDir, `${slug}-joblogs.txt`), sanitize(jobLogs.join('\n')));
     // Job-level evidence: which jobs the run actually had and how each concluded. A workflow that
     // never started leaves a `skipped` job and no error line anywhere, so the log alone cannot tell
     // "the fixer ran and did nothing" from "the fixer never ran".
