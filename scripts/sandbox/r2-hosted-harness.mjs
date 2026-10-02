@@ -449,6 +449,15 @@ function liveRun() {
     writeFileSync(path.join(outDir, logs), sanitize(raw));
     // The failing job's own log, always: a red shipped job is the moment the bundle must carry the
     // reason, and the reason disappears with the disposable consumer at teardown.
+    // Job-level evidence: which jobs the run actually had and how each concluded. A workflow that
+    // never started leaves a `skipped` job and no error line anywhere, so the log alone cannot tell
+    // "the fixer ran and did nothing" from "the fixer never ran".
+    const jobsFile = `${slug}-jobs.json`;
+    const view = (r) => JSON.parse(gh(['run', 'view', String(r.databaseId), '--repo', full,
+      '--json', 'conclusion,event,headSha,workflowName,createdAt,updatedAt,jobs'], { check: false }) || '{}');
+    const ciView = view(ciRun), fixView = view(run);
+    writeFileSync(path.join(outDir, jobsFile), `${JSON.stringify({ ci: ciView, autofix: fixView }, null, 2)}\n`);
+    const shippedJob = (fixView.jobs || []).find((j) => /^autofix/.test(j.name)) || {};
     // Per-job logs, because `gh run view --log` does NOT carry the log of a reusable-workflow
     // job: the run-level dump ended at the caller, which is how a bundle can look complete while
     // containing no trace of the shipped step that actually ran.
@@ -460,15 +469,6 @@ function liveRun() {
       jobLogs.push(`===== job ${j.name} (${j.conclusion}) — ${j.url}\n${jl.stdout}`);
     }
     writeFileSync(path.join(outDir, `${slug}-joblogs.txt`), sanitize(jobLogs.join('\n')));
-    // Job-level evidence: which jobs the run actually had and how each concluded. A workflow that
-    // never started leaves a `skipped` job and no error line anywhere, so the log alone cannot tell
-    // "the fixer ran and did nothing" from "the fixer never ran".
-    const jobsFile = `${slug}-jobs.json`;
-    const view = (r) => JSON.parse(gh(['run', 'view', String(r.databaseId), '--repo', full,
-      '--json', 'conclusion,event,headSha,workflowName,createdAt,updatedAt,jobs'], { check: false }) || '{}');
-    const ciView = view(ciRun), fixView = view(run);
-    writeFileSync(path.join(outDir, jobsFile), `${JSON.stringify({ ci: ciView, autofix: fixView }, null, 2)}\n`);
-    const shippedJob = (fixView.jobs || []).find((j) => /^autofix/.test(j.name)) || {};
     say(`shipped job autofix: ${shippedJob.conclusion || 'absent'}`);
     const state = {};
     for (const when of ['before', 'after']) {
