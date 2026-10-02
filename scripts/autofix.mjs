@@ -45,6 +45,8 @@
 //   fail:ai_conflict_resolution AI tried to resolve conflicts but failed/left markers
 //   fail:permissions_no_workflow permission error but no patchable workflow found
 //   fail:race_pr_closed         PR was already closed/merged before we started
+//   fail:race_pr_superseded     PR still open but no longer ours: `superseded` label or head moved mid-run
+//   fail:guard_unknown_state    live PR state could not be read — failing closed, nothing mutated
 //   fail:update_branch          clean merge, but GitHub refused update-branch (head moved)
 //   fail:ai_no_diagnose         Stage 1 could not identify root cause
 //   fail:ai_low_confidence      Stage 1 diagnosed but confidence too low to patch
@@ -69,6 +71,7 @@ import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createGuard, classifyLivePr, runGuardedSequence, GUARD } from './lib/supersede-guard.mjs';
 
 const LOG_CHAR_LIMIT = 120000; // raw log cap BEFORE compressLog (which fits LOG_TOKEN_BUDGET)
 const FILE_CHAR_LIMIT = 8000;
@@ -1371,6 +1374,44 @@ if (process.env.AUTOFIX_SELFTEST === '1') {
     rmSync(gt, { recursive: true, force: true });
   }
 
+  // ── Supersede guard (trained-assist-engineering#27) ─────────────────────
+  // Pure decision: open + no `superseded` label + stable head = actionable.
+  // Unknown live state (null PR or a failed read) is NOT actionable: this is
+  // the class defect the first draft had — it proceeded on a failed fetch.
+  check('guard: open PR actionable', classifyLivePr({ state: 'open', labels: [], head: { sha: 'abc123' } }, '', 7).state === GUARD.OK);
+  check('guard: closed detected', classifyLivePr({ state: 'closed', labels: [], head: { sha: 'abc123' } }, 'abc123', 7).state === GUARD.STALE);
+  check('guard: superseded label detected', /superseded/.test(classifyLivePr({ state: 'open', labels: [{ name: 'superseded' }], head: { sha: 'abc123' } }, 'abc123', 7).reason));
+  check('guard: unrelated label ignored', classifyLivePr({ state: 'open', labels: [{ name: 'wip' }], head: { sha: 'abc123' } }, 'abc123', 7).state === GUARD.OK);
+  check('guard: head moved detected', /head moved/.test(classifyLivePr({ state: 'open', labels: [], head: { sha: 'def456' } }, 'abc123', 7).reason));
+  check('guard: NO live data fails closed (fail-open regression)', classifyLivePr(null, 'abc123', 7).state === GUARD.UNKNOWN);
+  check('guard: read error fails closed', classifyLivePr({ readError: 'HTTP 502' }, 'abc123', 7).state === GUARD.UNKNOWN);
+
+  // End-to-end, mocked: the REAL publish sequence (push → PR → cleanup →
+  // auto-merge → close original) driven through the REAL guard with a scripted
+  // GitHub. A mutation recorder must stay EMPTY when the PR stops being ours
+  // between diagnosis and publish — that race is what pure prStaleReason
+  // self-tests cannot show.
+  const MUTATIONS = ['push', 'create-pr', 'close-stale', 'auto-merge', 'close-original'];
+  const healthy = { state: 'open', labels: [], head: { sha: 'head-1' } };
+  const scenarios = [
+    ['healthy', () => healthy, { aborted: false }],
+    ['superseded mid-run', () => (mutations.length ? { state: 'open', labels: [{ name: 'superseded' }], head: { sha: 'head-1' } } : healthy), { aborted: true, afterZeroMutations: true }],
+    ['head moved mid-run', () => (mutations.length ? { state: 'open', labels: [], head: { sha: 'head-2' } } : healthy), { aborted: true, afterZeroMutations: true }],
+    ['api failure mid-run', () => (mutations.length ? { throw: 'HTTP 502 from gh api' } : healthy), { aborted: true, afterZeroMutations: true }],
+    ['api failure from the start (read fails)', () => { throw new Error('HTTP 503 from gh api'); }, { aborted: true, afterZeroMutations: true, wantState: GUARD.UNKNOWN }],
+  ];
+  for (const [name, next, want] of scenarios) {
+    const mutations = [];
+    const scriptedSteps = MUTATIONS.map(name => ({ where: `before ${name}`, run: async () => { mutations.push(name); } }));
+    const guard = createGuard({ prNumber: 7, fetchPr: () => { const r = next(); if (r && r.throw) throw new Error(r.throw); return r; } });
+    const res = await runGuardedSequence({ guard, steps: scriptedSteps });
+    check(`guard e2e: ${name} → aborted=${res.aborted}`, res.aborted === want.aborted);
+    if (want.wantState) check(`guard e2e: ${name} → state=${want.wantState}`, res.state === want.wantState);
+    if (want.afterZeroMutations) {
+      check(`guard e2e: ${name} → no mutation happened`, mutations.length === 0, `mutations=${JSON.stringify(mutations)}`);
+    }
+  }
+
   globalThis.fetch = originalFetch;
   if (failed > 0) { console.error(`SELFTEST FAILED: ${failed} check(s)`); process.exit(1); }
   console.log('SELFTEST PASS');
@@ -1390,24 +1431,46 @@ try {
   sh('git config user.email "autofix@trained-assist.bot"');
 } catch { /* non-fatal — will fail later if identity really needed */ }
 
-// ── Race condition guard (the CI-failure part is skipped in batch mode) ─────
+// ── Live-PR guard (supersede-aware) + race guard ────────────────────────────
+// One live read decides everything: stale (closed / `superseded` / head moved),
+// unknown (read failed) or ok. Unknown is NOT ok — we mutate nothing until
+// GitHub confirms the PR is still ours. Batch mode targets stale fix branches
+// instead of a live PR, so it keeps its previous behaviour (no guard).
+const prGuard = BATCH_MODE ? null : createGuard({
+  prNumber: PR_NUMBER,
+  fetchPr: n => JSON.parse(sh(`gh api "repos/${REPO}/pulls/${n}"`)),
+});
+
+function abortOnGuard(verdict) {
+  const category = verdict.state === GUARD.UNKNOWN ? 'fail:guard_unknown_state' : 'fail:race_pr_superseded';
+  log('guard', `[${verdict.where}] ${verdict.reason} — aborting before any mutation`);
+  writeStats(category, { reason: verdict.reason, where: verdict.where, guard_state: verdict.state });
+  process.exit(0); // not a failure of the tool — there is simply nothing to fix
+}
+
+if (prGuard) {
+  const startVerdict = prGuard.check('start');
+  if (startVerdict.state !== GUARD.OK) abortOnGuard(startVerdict);
+}
 {
+  // CI-state race: the PR may have gone green between the webhook and this run.
+  let prInfo;
   try {
-    const prViewRaw = sh(`gh pr view ${PR_NUMBER} -R ${REPO} --json state,statusCheckRollup`);
-    const prInfo = JSON.parse(prViewRaw);
-    if (prInfo.state !== 'OPEN') {
-      writeStats('fail:race_pr_closed', { reason: `PR is already ${prInfo.state}` });
-      log('guard', `PR #${PR_NUMBER} is already ${prInfo.state} — aborting`);
-      process.exit(0); // not a real failure — nothing to do
-    }
-    const checks = prInfo.statusCheckRollup || [];
-    if (!BATCH_MODE && checks.length > 0 && !checks.some(c => c.conclusion === 'FAILURE' || c.conclusion === 'TIMED_OUT')) {
-      writeStats('fail:race_pr_closed', { reason: 'CI no longer shows failures' });
-      log('guard', `PR #${PR_NUMBER} CI no longer shows failures — aborting`);
-      process.exit(0);
-    }
+    prInfo = JSON.parse(sh(`gh pr view ${PR_NUMBER} -R ${REPO} --json state,statusCheckRollup`));
   } catch (e) {
-    log('guard', `could not check PR state (${e.message}) — proceeding anyway`);
+    // Fail closed (same rule as the supersede guard): no readable PR → no write.
+    abortOnGuard({ state: GUARD.UNKNOWN, reason: `could not read PR #${PR_NUMBER} state (${e.message}) — failing closed`, where: 'start' });
+  }
+  if (prInfo.state !== 'OPEN') {
+    writeStats('fail:race_pr_closed', { reason: `PR is already ${prInfo.state}` });
+    log('guard', `PR #${PR_NUMBER} is already ${prInfo.state} — aborting`);
+    process.exit(0); // not a real failure — nothing to do
+  }
+  const checks = prInfo.statusCheckRollup || [];
+  if (!BATCH_MODE && checks.length > 0 && !checks.some(c => c.conclusion === 'FAILURE' || c.conclusion === 'TIMED_OUT')) {
+    writeStats('fail:race_pr_closed', { reason: 'CI no longer shows failures' });
+    log('guard', `PR #${PR_NUMBER} CI no longer shows failures — aborting`);
+    process.exit(0);
   }
 }
 
@@ -1583,6 +1646,10 @@ if (outOfDateResult) {
   if (outOfDateResult.inPlace) {
     // expected_head_sha: if the author pushed since we checked out, GitHub refuses (422)
     // instead of merging into a head we never looked at.
+    if (prGuard) {
+      const inPlaceVerdict = prGuard.check('before update-branch in place');
+      if (inPlaceVerdict.state !== GUARD.OK) abortOnGuard(inPlaceVerdict);
+    }
     try {
       sh(`gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/update-branch" -f expected_head_sha=${outOfDateResult.headSha}`);
     } catch (e) {
@@ -1952,9 +2019,6 @@ const fixPaths = sh(`git show --name-only --format= ${fixCommitSha}`).split('\n'
 log('gate', `fix commit ${fixCommitSha.slice(0, 8)}: ${fixPaths.length} path(s)`);
 
 sh(`git checkout -b ${fixBranch}`);
-sh(`git -c core.hooksPath=/dev/null push --no-verify origin ${fixBranch}`);
-
-log('publish', `pushed fix branch: ${fixBranch}`);
 
 const prTitle = `fix: auto-fix CI failure in ${ORIGINAL_BRANCH || safeBranch}`;
 const prBody = [
@@ -1971,49 +2035,84 @@ const prBody = [
 ].join('\n');
 
 writeFileSync('pr-body.txt', prBody);
-let newPRUrl;
-try {
-  newPRUrl = sh(
-    `gh pr create --repo "${REPO}" --base "${BASE_BRANCH}" --head "${fixBranch}" --title "${prTitle}" --body-file pr-body.txt`
-  ).trim();
-} finally {
-  unlinkSync('pr-body.txt');
-}
+let newPRUrl = null;
+let newPRNumber = null;
 
-const newPRNumber = newPRUrl.match(/\/pull\/(\d+)$/)?.[1] || '?';
-log('publish', `created new PR #${newPRNumber}: ${newPRUrl}`);
+// ── Publish sequence — every mutation re-checks live PR state ───────────────
+// Order matters for recoverability: the replacement PR exists BEFORE anything
+// is closed, so an abort at a later step leaves a reviewable fix behind.
+// Each step is individually tolerant of its own API failure (as before) — the
+// guard decides whether the step may run at all, not whether it succeeds.
+const publishSteps = [
+  { where: 'before push', run: () => {
+    sh(`git -c core.hooksPath=/dev/null push --no-verify origin ${fixBranch}`);
+    log('publish', `pushed fix branch: ${fixBranch}`);
+  } },
+  { where: 'before publish', run: () => {
+    try {
+      newPRUrl = sh(
+        `gh pr create --repo "${REPO}" --base "${BASE_BRANCH}" --head "${fixBranch}" --title "${prTitle}" --body-file pr-body.txt`
+      ).trim();
+    } finally {
+      unlinkSync('pr-body.txt');
+    }
+    newPRNumber = newPRUrl.match(/\/pull\/(\d+)$/)?.[1] || '?';
+    log('publish', `created new PR #${newPRNumber}: ${newPRUrl}`);
+  } },
+  { where: 'before stale-fix cleanup', run: () => {
+    try {
+      const safeBranchForClose = (ORIGINAL_BRANCH || 'unknown').replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 40);
+      const stalePRs = JSON.parse(
+        sh(`gh pr list -R "${REPO}" --json number,headRefName --state open`)
+      ).filter(pr =>
+        pr.headRefName.startsWith(`fix/ci-${safeBranchForClose}-`) &&
+        String(pr.number) !== String(newPRNumber)
+      );
+      for (const stale of stalePRs) {
+        sh(`gh pr close ${stale.number} -R "${REPO}" --comment "♻️ Superseded by #${newPRNumber}: ${newPRUrl}"`);
+        log('publish', `closed stale fix PR #${stale.number} (superseded by #${newPRNumber})`);
+      }
+    } catch (e) {
+      log('publish', `could not close stale fix PRs: ${e.message.slice(0, 80)}`);
+    }
+  } },
+  { where: 'before auto-merge', run: () => {
+    try {
+      // Locked to the pushed head: an out-of-date fix branch then physically
+      // cannot merge (the old plain --auto merged whatever was green later).
+      const headSha = sh('git rev-parse HEAD').trim();
+      sh(`gh pr merge --auto --squash "${newPRNumber}" -R "${REPO}" --match-head-commit "${headSha}"`);
+      log('publish', `auto-merge enabled on PR #${newPRNumber} (locked to ${headSha.slice(0, 7)})`);
+    } catch (e) {
+      log('publish', `auto-merge not available (${e.message.slice(0, 80)}) — PR will need manual merge`);
+    }
+  } },
+  { where: 'before closing original', run: () => {
+    try {
+      sh(`gh pr close ${PR_NUMBER} -R "${REPO}" --comment "🤖 Superseded by #${newPRNumber}: ${newPRUrl} (pending CI + auto-merge)."`);
+      log('publish', `closed original PR #${PR_NUMBER}`);
+    } catch (e) {
+      log('publish', `could not close original PR: ${e.message.slice(0, 80)}`);
+    }
+  } },
+];
 
-// Close any stale fix/ci-* PRs for the same original branch (excluding the one just created)
-try {
-  const safeBranchForClose = (ORIGINAL_BRANCH || 'unknown').replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 40);
-  const stalePRs = JSON.parse(
-    sh(`gh pr list -R "${REPO}" --json number,headRefName --state open`)
-  ).filter(pr =>
-    pr.headRefName.startsWith(`fix/ci-${safeBranchForClose}-`) &&
-    String(pr.number) !== String(newPRNumber)
-  );
-  for (const stale of stalePRs) {
-    sh(`gh pr close ${stale.number} -R "${REPO}" --comment "♻️ Superseded by #${newPRNumber}: ${newPRUrl}"`);
-    log('publish', `closed stale fix PR #${stale.number} (superseded by #${newPRNumber})`);
+// BATCH_MODE has no live PR (it fixes stale branches), so it keeps the old
+// straight-line behaviour; a live run re-verifies GitHub before every step.
+const publishResult = prGuard
+  ? await runGuardedSequence({ guard: prGuard, steps: publishSteps })
+  : { aborted: false, at: null, state: null, reason: null };
+
+if (publishResult.aborted) {
+  if (existsSync('pr-body.txt')) unlinkSync('pr-body.txt');
+  if (newPRUrl) {
+    await prComment(
+      `🛑 Stopped at "${publishResult.at}": ${publishResult.reason}.\n` +
+      `The replacement PR ${newPRUrl} was already created — review and merge it manually; ` +
+      `nothing was merged or closed automatically after the guard stopped.`
+    );
   }
-} catch (e) {
-  log('publish', `could not close stale fix PRs: ${e.message.slice(0, 80)}`);
-}
-
-try {
-  sh(`gh pr merge --auto --squash "${newPRNumber}" -R "${REPO}"`);
-  log('publish', `auto-merge enabled on PR #${newPRNumber}`);
-} catch (e) {
-  log('publish', `auto-merge not available (${e.message.slice(0, 80)}) — PR will need manual merge`);
-}
-
-// Close the original PR immediately — don't rely on webhook events from ci-fix-cleanup.yml
-// which can be dropped by GitHub. The fix PR is now the source of truth.
-try {
-  sh(`gh pr close ${PR_NUMBER} -R "${REPO}" --comment "🤖 Superseded by #${newPRNumber}: ${newPRUrl} (pending CI + auto-merge)."`);
-  log('publish', `closed original PR #${PR_NUMBER}`);
-} catch (e) {
-  log('publish', `could not close original PR: ${e.message.slice(0, 80)}`);
+  abortOnGuard({ state: publishResult.state, reason: publishResult.reason, where: publishResult.at });
 }
 
 await prComment([
