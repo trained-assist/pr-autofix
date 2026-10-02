@@ -17,11 +17,15 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+// Default = the checkout this scanner ships in, derived from its own location. An absolute path
+// captured while authoring it would pass on one machine and ENOENT on every runner — the exact
+// "it only works where it was written" shape this scanner exists to catch.
 const CODE = (() => {
   const i = process.argv.indexOf('--code');
-  return i !== -1 && process.argv[i + 1] ? path.resolve(process.argv[i + 1])
-    : '/home/vova/users/trained-assist-product-owner/engineering-workspaces/trained-assist-product-owner/trained-assist-pr-autofix/ws-8d0ed1cfd31494e5/code';
+  return i !== -1 && process.argv[i + 1] ? path.resolve(process.argv[i + 1]) : path.resolve(HERE, '..', '..');
 })();
 const AS_JSON = process.argv.includes('--json');
 
@@ -62,6 +66,13 @@ function walk(dir, out = []) {
     else if (/\.ya?ml$/.test(e)) out.push(path.relative(CODE, p));
   }
   return out;
+}
+
+// A missing tree is a broken harness, not a verdict: say so with exit 2 instead of letting a bare
+// ENOENT stack trace masquerade as "the scan found a gap" (or, read lazily, as "it passed").
+if (!existsSync(path.join(CODE, '.github/workflows'))) {
+  console.error(`::error::no workflow tree at ${CODE} — pass --code <repo>`);
+  process.exit(2);
 }
 
 const workflows = [...walk(path.join(CODE, '.github/workflows')), ...walk(path.join(CODE, 'templates'))];

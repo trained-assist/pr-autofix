@@ -26,15 +26,23 @@ import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+// The repo this probe grades is the checkout the probe itself lives in. Resolving it from
+// import.meta.url is the only default that is true on a developer machine AND on a CI runner —
+// an absolute path baked in at authoring time is green locally and ENOENT everywhere else, which
+// is the same "fix lives on one machine" shape R1 is about.
 const CODE = (() => {
   const i = process.argv.indexOf('--code');
-  if (i !== -1 && process.argv[i + 1]) return path.resolve(process.argv[i + 1]);
-  return '/home/vova/users/trained-assist-product-owner/engineering-workspaces/trained-assist-product-owner/trained-assist-pr-autofix/ws-8d0ed1cfd31494e5/code';
+  return i !== -1 && process.argv[i + 1] ? path.resolve(process.argv[i + 1]) : path.resolve(HERE, '..', '..');
 })();
 const AS_JSON = process.argv.includes('--json');
 const WF = path.join(CODE, '.github/workflows/ci-fix-cleanup.yml');
+if (!existsSync(WF)) {
+  console.error(`::error::no ${WF} — pass --code <repo>`);
+  process.exit(2);
+}
 
 const results = [];
 const check = (name, cond, detail = '') => results.push({ name, ok: !!cond, detail });
@@ -86,7 +94,15 @@ for (const d of [runnerTemp, workspace, fakebin]) mkdirSync(d, { recursive: true
 
 // The pinned identity the payload is served under. Shape matches what fetch-payload.mjs
 // accepts on loopback: owner/repo/<sha>. A fix that pins must fetch THIS, never a branch.
-const sha = execFileSync('git', ['-C', CODE, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+// A checkout without git cannot establish a pin, so that is a broken HARNESS (exit 2), never a
+// verdict — guessing a SHA here would test a delivery of nothing.
+let sha;
+try {
+  sha = execFileSync('git', ['-C', CODE, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+} catch {
+  console.error(`::error::${CODE} is not a git checkout — cannot establish the pinned SHA`);
+  process.exit(2);
+}
 const PAYLOAD_BASE = `http://127.0.0.1:${0}/trained-assist/pr-autofix/${sha}`;
 let port = 0;
 
