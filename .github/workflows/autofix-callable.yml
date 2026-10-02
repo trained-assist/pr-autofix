@@ -185,4 +185,7 @@ jobs:
           name: ci-fixer-stats-pr${{ inputs.pr_number }}-run${{ github.run_id }}
           path: ci-fixer-stats.json
           if-no-files-found: ignore
+          # A MIRROR of the receipt TTL, not its executor: GitHub expires this copy server-side
+          # after 90 days. The locally testable enforcement is `retention-sweep` (R4) in
+          # devbaseline-callable.yml — this number alone is configuration, not a cleanup.
           retention-days: 90

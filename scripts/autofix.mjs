@@ -306,8 +306,9 @@ function writeStats(category, extra = {}) {
   // is not a 40-hex SHA is not a commit either: it is recorded as null, not asserted.
   const { patch_commit: rawPatchCommit, patch_source: rawPatchSource, ...extraRest } = extra;
   const patchCommit = /^[0-9a-f]{40}$/.test(String(rawPatchCommit ?? '')) ? String(rawPatchCommit) : null;
+  const recordTs = new Date().toISOString();
   const stats = {
-    ts: new Date().toISOString(),
+    ts: recordTs,
     repo: REPO || '',
     pr: PR_NUMBER || '',
     branch: ORIGINAL_BRANCH || '',
@@ -339,7 +340,9 @@ function writeStats(category, extra = {}) {
       log_tokens: LOG_TOKEN_BUDGET, log_tokens_used: 0,
       max_files: GATE_MAX_FILES, max_lines: GATE_MAX_LINES,
     },
-    retention: extra.retention || { ttl_days: 90, artifact: `ci-fixer-stats-pr${PR_NUMBER || 'local'}-run${RUN_ID || '0'}` },
+    // R4 — `written_at` is what makes the TTL a DATE. Without it no sweeper can decide whether
+    // this record is expired, and `ttl_days` stays a number nobody executes.
+    retention: extra.retention || { ttl_days: 90, written_at: recordTs, artifact: `ci-fixer-stats-pr${PR_NUMBER || 'local'}-run${RUN_ID || '0'}` },
     credentials: extra.credentials ?? [],
     ...extraRest,
     ...(typeof agentFellBack === 'string' ? { agent_fallback: agentFellBack } : {}),

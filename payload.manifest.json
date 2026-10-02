@@ -42,8 +42,8 @@
     },
     {
       "path": "scripts/devbaseline.mjs",
-      "sha256": "37e3818164d8284168942aa4fd2860b8d6073b944c1611532d43c53362bb49ea",
-      "bytes": 22625
+      "sha256": "7193c30e340dd87d97a6f30790c227bad2f84daf275a87c1ce2a7eef23870c6d",
+      "bytes": 24434
     },
     {
       "path": "scripts/lib/devbaseline/adapter.mjs",
@@ -104,6 +104,11 @@
       "path": "scripts/lib/devbaseline/resolve.mjs",
       "sha256": "37a31685c1e8b2eedb1950d94039c55f7a6f9e440ebc34f48beda4135917f868",
       "bytes": 5489
+    },
+    {
+      "path": "scripts/lib/devbaseline/retention.mjs",
+      "sha256": "d93b6db81b32053d7abc8ad519821cb9ddf7fd1e95323a2c7b08b4f87a0794ee",
+      "bytes": 5646
     },
     {
       "path": "scripts/lib/devbaseline/run.mjs",

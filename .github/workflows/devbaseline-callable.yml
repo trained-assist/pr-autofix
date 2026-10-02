@@ -124,6 +124,24 @@ jobs:
           fi
           exit "$code"
 
+      # R4 — retention has an EXECUTOR, not just a number. The `retention-days` below configures
+      # GitHub's server-side artifact expiry (a mirror, asserted as configuration); this step is
+      # the local half: every receipt this job wrote carries `retention.written_at + ttl_days`,
+      # and the sweep deletes exactly the ones past their deadline. `if: always()` because the
+      # records of a FAILED run are just as much subject to the TTL. Active records (no
+      # written_at) and unreadable files are kept and reported — never silently deleted.
+      - name: Retention is executed, not declared (retention-sweep)
+        if: always()
+        run: |
+          set -euo pipefail
+          store="$RUNNER_TEMP/receipts"
+          mkdir -p "$store"
+          # Collect every receipt this job produced into the store the sweeper owns.
+          for f in devbaseline-verify.json; do
+            [ -f "$f" ] && cp "$f" "$store/" || true
+          done
+          node pr-autofix/scripts/devbaseline.mjs retention-sweep --dir "$store"
+
       - name: Upload the verify record
         if: always()
         uses: actions/upload-artifact@v4
@@ -131,6 +149,8 @@ jobs:
           name: devbaseline-verify-${{ github.run_id }}
           path: devbaseline-verify.json
           if-no-files-found: ignore
+          # A MIRROR of the local TTL, not its executor: GitHub expires this copy server-side
+          # after 90 days. The deletion that is actually testable is retention-sweep above (R4).
           retention-days: 90
 
       - name: Inventory row for this repository

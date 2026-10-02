@@ -176,7 +176,13 @@ process.stdout.write('fixed src/sum.js: removed the off-by-one\\n');
     const raw = JSON.stringify(stats);
     check('no secret-shaped value in the receipt', !/(ghp_|github_pat_|gh[osu]_|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY)/.test(raw),
       (raw.match(/.{0,20}(ghp_|github_pat_|AKIA|PRIVATE KEY).{0,20}/) || ['—'])[0]);
-    check('retention is present with a ttl', Number(stats.retention?.ttl_days) > 0 && !!stats.retention?.artifact, JSON.stringify(stats.retention));
+    // R4 (design §2.7): the old check here was `ttl_days > 0 && artifact` — a NUMBER asserted as
+    // if it were a cleanup. It is superseded by r4-retention-probe.mjs, which executes the sweep
+    // with an accelerated clock (expired removed, active kept, repeat safe). What THIS receipt
+    // can honestly assert is that its own deadline is computable: `written_at` makes ttl a date.
+    check('retention carries a COMPUTABLE deadline (written_at + ttl_days), not just a number',
+      Number(stats.retention?.ttl_days) > 0 && !!stats.retention?.artifact && !!stats.retention?.written_at,
+      JSON.stringify(stats.retention));
     check('llm_usage is recorded from the actual run', typeof stats.llm_usage?.calls === 'number', JSON.stringify(stats.llm_usage));
   }
 
