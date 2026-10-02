@@ -76,6 +76,21 @@ jobs:
           path: pr-autofix
           persist-credentials: false
 
+      # R1 (pr-autofix#54) — `path: pr-autofix` can only materialize inside GITHUB_WORKSPACE, so
+      # the tree is moved out of the consumer root immediately: this job runs in the CALLER's
+      # repository, and installing a tool must leave that repository's scan, status and diff
+      # exactly as it found them (pr-autofix#54). Enforced class-wide by
+      # scripts/sandbox/r1-root-separation-probe.mjs.
+      - name: Relocate the tool tree out of the consumer root
+        run: |
+          set -euo pipefail
+          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
+            echo "::error::the pinned tool tree was not materialized — refusing to run anything"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/pr-autofix"
+          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
+
       # Branch deletion is destructive and irreversible, so the OWNERSHIP decision lives in
       # scripts/lib/devbaseline/cleanup.mjs as a pure predicate (false by default) and this step is
       # only the executor. R4: the previous loop filtered by the `pr-autofix-fix/` prefix alone, so
@@ -94,11 +109,11 @@ jobs:
             echo "::error::no gh_token provided — refusing to guess a branch list; nothing deleted"
             exit 1
           fi
-          if [ ! -f pr-autofix/scripts/cleanup-branches.mjs ]; then
-            echo "::error::the pinned tool tree is not in the workspace — refusing to run anything"
+          if [ ! -f "$RUNNER_TEMP/pr-autofix/scripts/cleanup-branches.mjs" ]; then
+            echo "::error::the pinned tool tree is not in the runner temp — refusing to run anything"
             exit 1
           fi
-          node pr-autofix/scripts/cleanup-branches.mjs \
+          node "$RUNNER_TEMP/pr-autofix/scripts/cleanup-branches.mjs" \
             --repo "${GITHUB_REPOSITORY}" \
             --pr "${PR_NUMBER:-}" \
             --keep "${KEEP_BRANCHES:-[]}" \

@@ -115,6 +115,22 @@ jobs:
           path: pr-autofix
           persist-credentials: false
 
+      # R1 (pr-autofix#54) — the tool tree leaves the consumer root right after materialization
+      # (actions/checkout cannot place it outside GITHUB_WORKSPACE). The fixer below stages with
+      # `git add -A` in the CONSUMER repo: with the tool tree here, that staged an unsolicited
+      # `160000` gitlink for the nested git repo into every fix commit, and the scanner read the
+      # tool's fixtures as the consumer's failures. Same guard as the checkout: no tree, no run.
+      - name: Relocate the tool tree out of the consumer root
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
+            echo "::error::the pinned tool tree was not materialized — refusing to run"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/pr-autofix"
+          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
+
       - uses: actions/setup-node@v4
         if: steps.guard.outputs.skip == 'false'
         with:
@@ -157,11 +173,11 @@ jobs:
           AUTOFIX_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-          if [ ! -f pr-autofix/scripts/autofix.mjs ]; then
-            echo "::error::the pinned tool tree is not in the workspace — refusing to run autofix"
+          if [ ! -f "$RUNNER_TEMP/pr-autofix/scripts/autofix.mjs" ]; then
+            echo "::error::the pinned tool tree is not in the runner temp — refusing to run autofix"
             exit 1
           fi
-          node pr-autofix/scripts/autofix.mjs
+          node "$RUNNER_TEMP/pr-autofix/scripts/autofix.mjs"
 
       - name: Report unfixed failure
         if: steps.guard.outputs.skip == 'false' && steps.autofix.outcome != 'success'
