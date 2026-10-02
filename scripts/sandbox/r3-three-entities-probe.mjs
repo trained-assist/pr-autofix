@@ -24,6 +24,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { GH_STUB_SOURCE } from './gh-stub-source.mjs';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -60,27 +61,7 @@ try {
   const fakebin = path.join(root, 'fakebin');
   mkdirSync(fakebin, { recursive: true });
 
-  const ghStub = `#!/usr/bin/env node
-const a = process.argv.slice(2);
-const has = s => a.includes(s);
-const out = s => process.stdout.write(s);
-if (a[0] === 'pr') {
-  if (a[1] === 'view') {
-    if (has('--json') && a.join(' ').includes('statusCheckRollup'))
-      out(JSON.stringify({ state: 'OPEN', statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }));
-    else
-      out(JSON.stringify({ title: 'fix: failing sum test', body: 'sum returns wrong value', commits: [{ messageHeadline: 'feat change' }] }));
-  } else if (a[1] === 'create') out('https://github.com/o/r/pull/2');
-  else if (a[1] === 'list') out('[]');
-  else out('');
-} else if (a[0] === 'api') {
-  const joined = a.join(' ');
-  if (joined.includes('/logs')) out('npm test\\nnot ok 1 - sum\\nERROR: Process completed with exit code 1\\n');
-  else if (joined.includes('/jobs')) out(JSON.stringify([{ id: 1, name: 'test', conclusion: 'failure' }]));
-  else out('{}');
-} else if (a[0] === 'run') out('not ok 1 - sum\\nERROR: Process completed with exit code 1\\n');
-else out('');
-`;
+  const ghStub = GH_STUB_SOURCE;
   writeFileSync(path.join(fakebin, 'gh'), ghStub);
   chmodSync(path.join(fakebin, 'gh'), 0o755);
 
