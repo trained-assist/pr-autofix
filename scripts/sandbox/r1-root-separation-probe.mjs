@@ -1,18 +1,26 @@
 #!/usr/bin/env node
 // R1 root-separation probe — installing the tool must not change the consumer.
 //
-// Defect (pr-autofix#54): PR #51 replaced the out-of-tree delivery with a pinned
-// `actions/checkout … path: pr-autofix` INSIDE the consumer root. From that moment the tool's
-// own tree (fixtures included) was part of every consumer's working tree: the shipped
-// `check-docs --dir .` reported the tool's fixtures as the CONSUMER's violations (a clean
-// repository blocked, needs_human), and autofix's `git add -A` staged the nested git repo as an
-// unsolicited `160000` gitlink in the fix commit. The invariant the verdict names:
-// «установка не меняет scan/status/diff потребителя».
+// Defect (pr-autofix#54 → #61): PR #51 replaced the out-of-tree delivery with a pinned
+// `actions/checkout … path: pr-autofix` INSIDE the consumer root, and the #57 "fix" kept the
+// collision in place by moving the tree out only AFTER the checkout had already claimed the path.
+// From that moment the tool's own tree (fixtures included) was part of every consumer's working
+// tree: the shipped `check-docs --dir .` reported the tool's fixtures as the CONSUMER's violations
+// (a clean repository blocked, needs_human), autofix's `git add -A` staged the nested git repo as
+// an unsolicited `160000` gitlink in the fix commit, and a consumer that legitimately owned a
+// `pr-autofix/` catalog of its own LOST it (actions/checkout clears a target without `.git` —
+// prepareExistingDirectory → rmRF). The invariant the verdict names:
+// «установка не меняет scan/status/diff потребителя», and (it.5) the consumer's own paths are
+// never a materialization target at all.
 //
 // The probe is driven by the LIVE workflow files, not by a frozen copy of them:
 //   1. parse `.github/workflows/devbaseline-callable.yml` / `autofix-callable.yml`,
-//   2. render the `${{ }}` expressions the way a runner does,
-//   3. emulate `actions/checkout` (consumer fixture / pinned tool tree at `path:`),
+//   2. render the `${{ }}` expressions the way a runner does — `${{ runner.temp }}` is per-run,
+//      and a step's `env:` reaches its process AFTER the process environment (actions/runner:
+//      Runner.Sdk/ProcessInvoker.cs), which is what lets the Materialize step scope
+//      GITHUB_WORKSPACE to the runner temp,
+//   3. emulate `actions/checkout` (consumer fixture / pinned tool tree at the step's resolved
+//      `path:` under the step's resolved GITHUB_WORKSPACE),
 //   4. execute the shipped `run:` blocks sequentially in a synthetic consumer with
 //      `bash -e -o pipefail`, stop-on-failure and `if: always()` — the runner's own semantics.
 //
@@ -25,10 +33,18 @@
 //   d. failed→fix: the REAL scripts/autofix.mjs with ladder/gh/opencode stubs through the
 //      shipped autofix step → the fix commit touches only consumer paths, zero tooling gitlink;
 //   e. static: all FOUR delivery points (devbaseline/autofix/ci-fix-cleanup callables +
-//      templates/batch-fix-prs) relocate the tool tree to $RUNNER_TEMP right after the pinned
-//      checkout, and no run: block addresses `pr-autofix/…` outside the $RUNNER_TEMP form.
+//      templates/batch-fix-prs) deliver the pinned tree straight into `${{ runner.temp }}`
+//      (path AND the step-scoped GITHUB_WORKSPACE that checkout's containment check reads),
+//      behind a collision preflight, with no relocation step left anywhere, and no run: block
+//      addressing `pr-autofix/…` outside the $RUNNER_TEMP form.
 //
-// RED on the unfixed delivery (a, b, c, e fail), GREEN after the fix.
+// The consumer fixture OWNS a `pr-autofix/consumer-owned.md` of its own (specClean): an empty
+// fixture makes every preservation check vacuous — a delivery that destroys the directory the
+// consumer never had would pass. The real-checkout end of this class lives in
+// scripts/sandbox/r1-consumer-collision-probe.mjs, which executes the shipped steps against
+// actions/checkout dist at the pinned SHA.
+//
+// RED on the consumer-root delivery (a, b, c, e fail), GREEN on the runner-temp delivery.
 //   node scripts/sandbox/r1-root-separation-probe.mjs [--code <repo>] [--json] [--keep]
 // exit 0 = installing the tool leaves the consumer untouched; 1 = defect; 2 = harness error
 
@@ -212,21 +228,31 @@ function baseEnv({ workspace, runnerTemp, extra = {} }) {
 async function runJob(steps, ctx, { workspace, consumerSpec, extraEnv = {} }) {
   const runnerTemp = path.join(root, `runner-temp-${String(++stepSeq)}`);
   mkdirSync(runnerTemp, { recursive: true });
+  // `${{ runner.temp }}` is a per-run value: the shipped form renders the delivery `path:` from
+  // it, and the preflight reads $RUNNER_TEMP. A context whose `runner.temp` stays empty tests a
+  // path nobody ships (`/pr-autofix`).
+  const runCtx = { ...ctx, globals: { ...ctx.globals, 'runner.temp': runnerTemp } };
   const out = [];
   let jobCode = 0;
   let failed = false;
   for (const step of steps) {
     const name = step.name || step.uses || '(unnamed)';
-    if (!evalIf(step.if, ctx)) { out.push({ name, skipped: 'if' }); continue; }
+    if (!evalIf(step.if, runCtx)) { out.push({ name, skipped: 'if' }); continue; }
     const always = /always\(\)/.test(String(step.if || ''));
     if (failed && !always) { out.push({ name, skipped: 'previous failure' }); continue; }
 
     if (!step.run) {
       if (/^actions\/checkout@/.test(String(step.uses || ''))) {
-        const sub = String((step.with && step.with.path) || '').trim();
+        const sub = String(render(String((step.with && step.with.path) || ''), runCtx)).trim();
         if (sub) {
-          materializeTool(path.join(workspace, sub));
-          out.push({ name, code: 0, emulated: `tool checkout -> ${sub}` });
+          // The step's own `env:` decides where checkout resolves `path` from: the shipped
+          // Materialize step scopes GITHUB_WORKSPACE to the runner temp, and the real action
+          // resolves + containment-checks against exactly that (input-helper.ts:42-52). Emulating
+          // a fixed workspace would test a delivery that does not exist.
+          const stepRoot = stepEnv(step, runCtx).GITHUB_WORKSPACE || workspace;
+          const dest = path.resolve(stepRoot, sub);
+          materializeTool(dest);
+          out.push({ name, code: 0, emulated: `tool checkout -> ${dest} (GITHUB_WORKSPACE=${stepRoot})` });
         } else {
           ensureConsumer(workspace, consumerSpec);
           out.push({ name, code: 0, emulated: 'consumer checkout' });
@@ -237,8 +263,8 @@ async function runJob(steps, ctx, { workspace, consumerSpec, extraEnv = {} }) {
       continue;
     }
 
-    const env = { ...baseEnv({ workspace, runnerTemp, extra: extraEnv }), ...stepEnv(step, ctx) };
-    const block = render(step.run, ctx);
+    const env = { ...baseEnv({ workspace, runnerTemp, extra: extraEnv }), ...stepEnv(step, runCtx) };
+    const block = render(step.run, runCtx);
     const r = await spawnBash(block, { env, cwd: workspace });
     out.push({ name, code: r.code, stdout: r.stdout, stderr: r.stderr });
     if (r.code !== 0 && !(step['continue-on-error'] === true || step['continue-on-error'] === 'true')) {
@@ -255,11 +281,19 @@ const gitIn = (dir, args) => execFileSync('git', ['-C', dir, ...args], { encodin
 // ── fixtures ───────────────────────────────────────────────────────────────────
 const README = '# clean-consumer\n\nA clean docs consumer: the tool must be invisible to it.\n';
 const DOCS_ADAPTER = `${JSON.stringify({ schema_version: 1, profile: 'docs', autofix: { enabled: false } }, null, 2)}\n`;
-const specClean = { files: { 'README.md': README, '.devbaseline.json': DOCS_ADAPTER } };
+// The consumer OWNS a pr-autofix/ directory of its own. Without it every preservation check here
+// is vacuous: a delivery that cleared a directory the consumer never had would look clean.
+const OWNED = '# Consumer-owned file — installing a tool must never touch it.\n';
+const specClean = { files: {
+  'README.md': README,
+  '.devbaseline.json': DOCS_ADAPTER,
+  'pr-autofix/consumer-owned.md': OWNED,
+} };
 const specBroken = {
   files: {
     'README.md': README,
     '.devbaseline.json': DOCS_ADAPTER,
+    'pr-autofix/consumer-owned.md': OWNED,
     // A failure that BELONGS TO THE CONSUMER — the controlled failure of scenario b.
     'docs/config.json': '{ "staging": , }\n',
   },
@@ -393,7 +427,7 @@ const wsC = path.join(root, 'c-workspace');
   };
   // Only the steps that touch the tool tree and the fix: guard/duplicate-PR, npm ci (consumer
   // dependencies — the fixture has none) and artifact upload are outside what R1 is about.
-  const wanted = new Set(['Materialize the pinned tool tree', 'Relocate the tool tree out of the consumer root', 'Run autofix pipeline']);
+  const wanted = new Set(['Delivery target is outside the consumer tree', 'Materialize the pinned tool tree', 'Run autofix pipeline']);
   const dSteps = autoSteps.filter((s) => wanted.has(String(s.name || '')));
   const before = gitIn(wsD, ['rev-parse', 'HEAD']);
   const d = await runJob(dSteps, autoCtx, {
@@ -426,24 +460,45 @@ const wsC = path.join(root, 'c-workspace');
     paths.join(', ') || '—');
 }
 
-// ── scenario e — static: ALL four delivery points separate the roots ───────────
+// ── scenario e — static: ALL four delivery points keep the tool OUT of the consumer ──
+// The delivery form is a CONTRACT of this class, not a style choice: actions/checkout resolves
+// `path` against GITHUB_WORKSPACE and refuses anything outside it (input-helper.ts:42-52), so the
+// only way to keep the consumer's paths unclaimed is the pair — an absolute `path` under
+// `${{ runner.temp }}` AND a step-scoped `GITHUB_WORKSPACE: ${{ runner.temp }}` (the containment
+// root the real action reads), with the collision preflight before it. Each half alone is either
+// a loud failure or the old defect, so both are asserted, in all four delivery points.
+const RUNNER_TEMP = '${{ runner.temp }}';
 for (const rel of FOUR) {
   let steps;
   try { steps = yamlSteps(path.join(CODE, rel)); } catch (e) {
     check(`${rel}: parses as YAML`, false, e.message);
     continue;
   }
-  const ci = steps.findIndex((s) => /^actions\/checkout@/.test(String(s.uses || '')) && String((s.with && s.with.path) || '').trim() === 'pr-autofix');
-  check(`${rel}: the pinned tool checkout (path: pr-autofix) is present`, ci !== -1, 'no tool checkout found');
+  // The TOOL checkout, not the consumer's own: the consumer checkout is a bare `actions/checkout`
+  // with no `repository`/`path`, and anchoring on `uses:` alone asserted against the wrong step.
+  const ci = steps.findIndex((s) => /^actions\/checkout@/.test(String(s.uses || ''))
+    && (String((s.with && s.with.repository) || '').trim() || String((s.with && s.with.path) || '').trim()));
+  const toolStep = ci === -1 ? null : steps[ci];
+  const toolPath = String((toolStep?.with && toolStep.with.path) || '').trim();
+  const stepWs = String((toolStep?.env && toolStep.env.GITHUB_WORKSPACE) || '').trim();
+  check(`${rel}: the pinned tool checkout is present`, toolStep !== null, 'no checkout step found');
+  check(`${rel}: the tool checkout delivers under \${{ runner.temp }}`, toolPath.startsWith(RUNNER_TEMP),
+    `path: ${toolPath || '(none)'}`);
+  check(`${rel}: the checkout step scopes GITHUB_WORKSPACE to \${{ runner.temp }} (containment root)`,
+    stepWs === RUNNER_TEMP, `env.GITHUB_WORKSPACE: ${stepWs || '(none)'}`);
+  const preflight = steps.findIndex((s, i) => typeof s.run === 'string' && /RUNNER_TEMP\/pr-autofix/.test(s.run) && /refusing/.test(s.run));
+  check(`${rel}: the collision preflight runs BEFORE the materialization`, ci === -1 ? false : preflight !== -1 && preflight < ci,
+    `preflight@${preflight}, checkout@${ci}`);
   const stripRelocated = (t) => String(t).split('$RUNNER_TEMP/pr-autofix').join('');
   const bareRefs = steps.filter((s) => /pr-autofix\//.test(stripRelocated(String(s.run || ''))));
   check(`${rel}: no run: block addresses pr-autofix/ outside $RUNNER_TEMP`, bareRefs.length === 0,
     `${bareRefs.length} step(s), first: ${String(bareRefs[0]?.name || '')}`);
-  const mvIdx = steps.findIndex((s, i) => i > ci && /mv "\$GITHUB_WORKSPACE\/pr-autofix" "\$RUNNER_TEMP\/pr-autofix"/.test(String(s.run || '')));
-  check(`${rel}: a relocate step moves the tool tree to $RUNNER_TEMP`, ci !== -1 && mvIdx !== -1, `checkout@${ci}, mv@${mvIdx}`);
+  const mv = steps.findIndex((s) => /\bmv\b[\s\S]*pr-autofix/.test(String(s.run || '')));
+  check(`${rel}: no relocation step is left (the second destructive mechanism)`, mv === -1,
+    mv === -1 ? '' : `step: ${String(steps[mv].name || '(unnamed)')}`);
   const firstToolRun = steps.findIndex((s, i) => i > ci && /pr-autofix\/scripts\//.test(String(s.run || '')));
-  check(`${rel}: relocation happens BEFORE the tool is executed`, mvIdx !== -1 && (firstToolRun === -1 || mvIdx < firstToolRun),
-    `mv@${mvIdx}, first tool run@${firstToolRun}`);
+  check(`${rel}: tool commands address the $RUNNER_TEMP tree`, firstToolRun === -1 || /RUNNER_TEMP/.test(String(steps[firstToolRun].run)),
+    `first tool run@${firstToolRun}`);
 }
 
 const failed = results.filter((r) => !r.ok);

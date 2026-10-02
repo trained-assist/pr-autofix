@@ -68,28 +68,41 @@ jobs:
       # clone. The invariant is enforced by scripts/sandbox/r1-delivery-boundary-scan.mjs, and the
       # step that runs is rehearsed by scripts/sandbox/r1-shipped-run-step-probe.mjs in an EMPTY
       # consumer runner — not by grepping this file for a script name.
+      # R1 (pr-autofix#61) — THE CHECK RUNS BEFORE ANY WRITE. actions/checkout RESOLVES `path`
+      # AGAINST GITHUB_WORKSPACE AND REFUSES ANYTHING OUTSIDE IT (input-helper.ts:42-52:
+      # "Repository path … is not under …"). The earlier claim that `path` is taken verbatim was
+      # wrong, and that error is what produced the defect: with containment, delivery can only be
+      # pointed outside the consumer by scoping GITHUB_WORKSPACE — which the Materialize step
+      # below does for its own process only (its absolute `path` is the fail-safe pair: drop the
+      # env and checkout refuses loudly instead of writing into the consumer root). This job runs
+      # in the CALLER's repository, and installing a tool must leave that repository's scan,
+      # status and diff exactly as it found them (pr-autofix#61): the consumer tree is never a
+      # materialization target and no relocation step exists to collide with its content. This
+      # step keeps the REAL GITHUB_WORKSPACE: what can already sit in the target on a self-hosted
+      # runner — a symlink or a directory without `.git` — is not our checkout, and checkout@v4
+      # would clear its contents (prepareExistingDirectory → rmRF); refused loudly, never
+      # silently overwritten. Enforced class-wide by scripts/sandbox/r1-root-separation-probe.mjs.
+      - name: Delivery target is outside the consumer tree
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/pr-autofix"
+          case "$target/" in
+            "$GITHUB_WORKSPACE/"*) echo "::error::the tool target $target is inside the consumer tree — refusing"; exit 1 ;;
+          esac
+          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target/.git" ]; }; then
+            echo "::error::$target exists and is not a tool checkout — refusing to overwrite it"
+            exit 1
+          fi
+
       - name: Materialize the pinned tool tree
         uses: actions/checkout@v4
+        env:
+          GITHUB_WORKSPACE: ${{ runner.temp }}
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
-          path: pr-autofix
+          path: ${{ runner.temp }}/pr-autofix
           persist-credentials: false
-
-      # R1 (pr-autofix#54) — `path: pr-autofix` can only materialize inside GITHUB_WORKSPACE, so
-      # the tree is moved out of the consumer root immediately: this job runs in the CALLER's
-      # repository, and installing a tool must leave that repository's scan, status and diff
-      # exactly as it found them (pr-autofix#54). Enforced class-wide by
-      # scripts/sandbox/r1-root-separation-probe.mjs.
-      - name: Relocate the tool tree out of the consumer root
-        run: |
-          set -euo pipefail
-          if [ ! -d "$GITHUB_WORKSPACE/pr-autofix" ]; then
-            echo "::error::the pinned tool tree was not materialized — refusing to run anything"
-            exit 1
-          fi
-          rm -rf "$RUNNER_TEMP/pr-autofix"
-          mv "$GITHUB_WORKSPACE/pr-autofix" "$RUNNER_TEMP/pr-autofix"
 
       # Branch deletion is destructive and irreversible, so the OWNERSHIP decision lives in
       # scripts/lib/devbaseline/cleanup.mjs as a pure predicate (false by default) and this step is
