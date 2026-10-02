@@ -516,13 +516,13 @@ function liveRun() {
     const evidence = { caller_sha: callerSha, tool_sha: TOOL_SHA, run_id: String(run.databaseId), run_url: run.url,
       logs, patch: meta.patch, changed_files: fixFiles.join(','), receipt: 'runner-state.json',
       shipped_job: shippedJob.name ? `${shippedJob.name} — ${shippedJob.conclusion}` : '' };
-    writeFileSync(path.join(outDir, `${slug}-verdict.json`), `${JSON.stringify(judgeFix({
-      fixFiles, runnerBefore, runnerAfter, evidence,
-    }), null, 2)}\n`);
+    const verdict = judgeFix({ fixFiles, runnerBefore, runnerAfter, evidence });
+    writeFileSync(path.join(outDir, `${slug}-verdict.json`), `${JSON.stringify(verdict, null, 2)}\n`);
     say(`bundle: ${outDir}/${slug}-*`);
 
     if (KEEP && !verdict.ok) {
       say(`consumer KEPT for inspection: https://github.com/${full} — delete it after reading`);
+      teardownDone = true;
     } else {
       phase('teardown — only now, with the bundle durable on disk');
       gh(['repo', 'delete', full, '--yes']);
@@ -530,14 +530,14 @@ function liveRun() {
       say(`deleted ${full}`);
     }
 
-    const verdict = judgeFix({ fixFiles, runnerBefore, runnerAfter, evidence });
     if (AS_JSON) console.log(JSON.stringify(verdict, null, 2));
     say(`\nverdict: ${verdict.ok ? 'clean' : 'DEFECT'} — ${verdict.checks.map((c) => `${c.ok ? 'ok' : 'FAIL'} ${c.name}`).join('; ')}`);
     return verdict.ok ? 0 : 1;
   } finally {
     // A failed run must never leave a disposable consumer behind: that is how an org fills with
-    // evidence repos nobody owns. But teardown only happens once the bundle is written.
-    if (!teardownDone) {
+    // evidence repos nobody owns — except under --keep, where a red run deliberately keeps the
+    // consumer alive because the consumer is the only place its job logs still exist.
+    if (!teardownDone && !KEEP) {
       const bundle = existsSync(outDir) && readdirSync(outDir).some((f) => f.startsWith(slug));
       if (bundle) {
         const d = spawnSync('gh', ['repo', 'delete', full, '--yes'], { encoding: 'utf8' });
