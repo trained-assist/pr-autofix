@@ -470,7 +470,9 @@ for (const [wf, variant] of SCENARIOS) {
 // target (or puts the target inside the consumer) and asserts three things: the shipped preflight
 // exits non-zero with an explicit refusal, the obstacle is byte-identical afterwards (nothing was
 // written AND nothing was destroyed), and the consumer tree is untouched. The last case pins the
-// other side of the rule: a real previous tool checkout (it has `.git`) is NOT an obstacle.
+// other side of the rule: a previous checkout PROVEN ours (delivery marker + our origin,
+// pr-autofix#70) is allowed through, while the same checkout WITHOUT the marker — a legacy
+// install or anything that merely looks like one — is refused before any write.
 const preflightCases = [];
 {
   const wf = '.github/workflows/devbaseline-callable.yml';
@@ -485,6 +487,10 @@ const preflightCases = [];
     say('FAIL a collision preflight is shipped — none found');
   } else {
     const script = render(pf.run, ctx);
+    // The preflight now reads $TOOL_REPOSITORY (ownership guard, pr-autofix#70): the runner
+    // resolves the step's `env:` before the script runs, so the probe must too — otherwise
+    // `set -u` fails the block before it can prove anything.
+    const preflightEnv = Object.fromEntries(Object.entries(pf.env || {}).map(([k, v]) => [k, render(String(v), ctx)]));
     const ABSENT = '(absent)';
     // The obstacle ITSELF, not its parent directory: the runner's own marker files
     // (GITHUB_ENV/GITHUB_OUTPUT/…) are created inside the temp dir when the step env is built,
@@ -500,7 +506,8 @@ const preflightCases = [];
       { name: 'symlink at the target', obstacle: 'symlink' },
       { name: 'foreign directory at the target', obstacle: 'dir' },
       { name: 'target inside the consumer tree', obstacle: 'inside' },
-      { name: 'a previous tool checkout is not an obstacle', obstacle: 'tool-checkout', allow: true },
+      { name: 'a tool checkout proven ours is not an obstacle', obstacle: 'tool-checkout', allow: true },
+      { name: 'a tool checkout WITHOUT the ownership marker is refused', obstacle: 'tool-checkout-no-marker' },
     ];
     for (const c of cases) {
       const caseDir = path.join(root, `preflight-${c.obstacle}`);
@@ -520,10 +527,13 @@ const preflightCases = [];
       } else if (c.obstacle === 'dir') {
         mkdirSync(target, { recursive: true });
         writeFileSync(path.join(target, 'keep.md'), OWNED);
-      } else if (c.obstacle === 'tool-checkout') {
-        mkdirSync(path.join(target, '.git'), { recursive: true });
-        writeFileSync(path.join(target, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/trained-assist/pr-autofix\n');
-        writeFileSync(path.join(target, 'marker'), OWNED);
+      } else if (c.obstacle === 'tool-checkout' || c.obstacle === 'tool-checkout-no-marker') {
+        // A real previous install of THIS tool: git repo, origin = the tool repository, and (for
+        // the proven case) the ownership marker the guard reads. The marker-less twin is what a
+        // legacy install looks like — same shape, no proof — and must be refused (pr-autofix#70).
+        execFileSync('git', ['init', '-q', target]);
+        execFileSync('git', ['-C', target, 'remote', 'add', 'origin', 'https://github.com/trained-assist/pr-autofix.git']);
+        if (c.obstacle === 'tool-checkout') writeFileSync(path.join(target, '.git', 'pr-autofix-delivery'), 'repo=trained-assist/pr-autofix\n');
       } else if (c.obstacle === 'inside') {
         extra.RUNNER_TEMP = path.join(workspace, 'scratch'); // a misconfigured runner: target lands in the consumer
         mkdirSync(extra.RUNNER_TEMP, { recursive: true });
@@ -531,7 +541,7 @@ const preflightCases = [];
       const consumerBefore = fingerprint(consumerDir);
       const targetPath = c.obstacle === 'inside' ? path.join(extra.RUNNER_TEMP, 'pr-autofix') : target;
       const targetBefore = targetFp(targetPath);
-      const env = { ...baseEnv({ workspace, consumerDir, runnerTemp, head }), ...extra };
+      const env = { ...baseEnv({ workspace, consumerDir, runnerTemp, head }), ...preflightEnv, ...extra };
       const r = await spawnBash(script, { env, cwd: workspace });
       const out = `${r.stdout}${r.stderr}`.trim();
       const consumerAfter = fingerprint(consumerDir);

@@ -103,19 +103,32 @@ jobs:
       # and assert the SHA afterwards. No GITHUB_* or RUNNER_* variable is set anywhere in this
       # file — scripts/sandbox/r1-runner-faithful-delivery-probe.mjs fails the build if a step ever
       # tries again. The preflight runs BEFORE any write: the target must lie outside the consumer
-      # tree, and a symlink or a directory without `.git` there is not our own tool checkout —
-      # refused loudly, never cleared. Autofix stages with `git add -A` in the consumer repo, so a
-      # tool tree in its root would become an unsolicited gitlink in the fix commit.
+      # tree, and it is replaceable only with PROVEN ownership — the delivery marker and the
+      # origin URL must both name this tool repository (pr-autofix#70). Anything else — a foreign
+      # checkout, a marker-less install — is refused loudly, never cleared. Autofix stages with
+      # `git add -A` in the consumer repo, so a tool tree in its root would become an unsolicited
+      # gitlink in the fix commit.
       - name: Delivery target is outside the consumer tree
+        env:
+          TOOL_REPOSITORY: trained-assist/pr-autofix
         run: |
           set -euo pipefail
           target="$RUNNER_TEMP/pr-autofix"
           case "$target/" in
             "$GITHUB_WORKSPACE/"*) echo "::error::the tool target $target is inside the consumer tree — refusing"; exit 1 ;;
           esac
-          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target/.git" ]; }; then
-            echo "::error::$target exists and is not a tool checkout — refusing to overwrite it"
-            exit 1
+          # OWNERSHIP GUARD (pr-autofix#70): the delivery target is replaced ONLY with proven
+          # ownership — the marker `.git/pr-autofix-delivery` and the origin URL must both name
+          # $TOOL_REPOSITORY, the target must not be a symlink, and `.git` must be a directory.
+          # A foreign checkout, a marker-less install or anything else is refused BEFORE any
+          # write: never cleared, renamed or bypassed.
+          if [ -e "$target" ] || [ -L "$target" ]; then
+            marker="$(cat "$target/.git/pr-autofix-delivery" 2>/dev/null || true)"
+            origin="$(git -C "$target" config --get remote.origin.url 2>/dev/null || true)"
+            if [ -L "$target" ] || [ ! -d "$target/.git" ] || [ "$marker" != "repo=$TOOL_REPOSITORY" ] || [ "$origin" != "https://github.com/$TOOL_REPOSITORY.git" ]; then
+              echo "::error::$target exists but ownership is not proven (marker and origin must both name $TOOL_REPOSITORY) — refusing to overwrite it"
+              exit 1
+            fi
           fi
 
       - name: Materialize the pinned tool tree
@@ -127,9 +140,21 @@ jobs:
           target="$RUNNER_TEMP/pr-autofix"
           [ -n "${RUNNER_TEMP:-}" ] || { echo "::error::RUNNER_TEMP is empty — refusing to install the tool"; exit 1; }
           case "$target" in /*) : ;; *) echo "::error::the tool target $target is not absolute — refusing"; exit 1 ;; esac
-          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target/.git" ]; }; then
-            echo "::error::$target is not a tool checkout — refusing to overwrite it"
-            exit 1
+          # Defense in depth: the SAME ownership guard as the preflight — only a proven-ours target
+          # may be replaced here, and only at this point. Everything the guard refuses is left
+          # exactly as it was found.
+          # OWNERSHIP GUARD (pr-autofix#70): the delivery target is replaced ONLY with proven
+          # ownership — the marker `.git/pr-autofix-delivery` and the origin URL must both name
+          # $TOOL_REPOSITORY, the target must not be a symlink, and `.git` must be a directory.
+          # A foreign checkout, a marker-less install or anything else is refused BEFORE any
+          # write: never cleared, renamed or bypassed.
+          if [ -e "$target" ] || [ -L "$target" ]; then
+            marker="$(cat "$target/.git/pr-autofix-delivery" 2>/dev/null || true)"
+            origin="$(git -C "$target" config --get remote.origin.url 2>/dev/null || true)"
+            if [ -L "$target" ] || [ ! -d "$target/.git" ] || [ "$marker" != "repo=$TOOL_REPOSITORY" ] || [ "$origin" != "https://github.com/$TOOL_REPOSITORY.git" ]; then
+              echo "::error::$target exists but ownership is not proven (marker and origin must both name $TOOL_REPOSITORY) — refusing to overwrite it"
+              exit 1
+            fi
           fi
           rm -rf "$target"
           git init -q "$target"
@@ -140,6 +165,10 @@ jobs:
             echo "::error::the delivered tree is not the pinned SHA — refusing to run it"
             exit 1
           fi
+          # Ownership is now proven by construction (pinned SHA + our origin), so the marker this
+          # guard reads on the next run is written last — an install that died above leaves no
+          # claim to the target and is refused rather than reused.
+          printf 'repo=%s\n' "$TOOL_REPOSITORY" > "$target/.git/pr-autofix-delivery"
 
       - uses: actions/setup-node@v4
         with:

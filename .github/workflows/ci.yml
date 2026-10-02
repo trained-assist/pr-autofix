@@ -80,6 +80,25 @@ jobs:
       # tracked, untracked and symlinked. A consumer that loses a byte fails here.
       - name: Delivery never destroys a consumer-owned pr-autofix/ catalog (R1, pr-autofix#61)
         run: node scripts/sandbox/r1-consumer-collision-probe.mjs
+      # R1 (pr-autofix#70), iteration 7: the it.6 cross-review found that the collision preflight
+      # decided ownership by ONE predicate — "`.git` exists" — so a FOREIGN Git checkout at the
+      # delivery target (an orphan of another step, a reused self-hosted runner) was declared
+      # "our previous clone" and `rm -rf`'d in all four delivery points, tracked and untracked data
+      # included. The rule is now proven ownership (marker + origin) and refusal before any write.
+      # This probe executes the shipped preflight/materialize blocks of all four points over a
+      # state matrix (empty / ours / foreign / legacy / plain / symlink, each with a repeat pass),
+      # and class-scans that the guard text has not drifted between the four copies. It was RED on
+      # the it.6 merge 2daff54 — 16/24 scenarios, the foreign checkout destroyed at 4/4 points.
+      - name: Delivery target ownership is proven, not assumed (R1, pr-autofix#70)
+        run: node scripts/sandbox/r1-delivery-target-ownership-probe.mjs
+      # R2 (pr-autofix#71): the hosted failed→fix evidence harness. Its LIVE phase creates a
+      # disposable consumer and dispatches a real shipped workflow — never inside CI. What CI
+      # gates is the harness itself: its decision logic must detect a gitlink, an extra staged
+      # path, a destroyed untracked file and an incomplete bundle. A detector that cannot fail
+      # proves nothing, and an unexercised harness is exactly the "written but wired into no job"
+      # defect this epic exists to kill.
+      - name: The hosted-evidence harness can actually fail (R2, pr-autofix#71)
+        run: node scripts/sandbox/r2-hosted-harness.mjs --self-test
       - name: The receipt never wears the caller's identity (R2, pr-autofix#55)
         run: node scripts/sandbox/r2-reusable-receipt-probe.mjs
       # R3/R4: provenance entities and retention enforcement, each with its own named step.
