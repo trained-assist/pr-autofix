@@ -136,9 +136,18 @@ function judgeFix({ fixFiles = [], runnerBefore = null, runnerAfter = null, evid
     add('no tool tree materialized into the consumer tree', toolPaths.length === 0, toolPaths.slice(0, 4).join(', '));
   }
 
-  const need = ['caller_sha', 'tool_sha', 'run_id', 'run_url', 'logs', 'patch', 'changed_files', 'receipt'];
+  const need = ['caller_sha', 'tool_sha', 'run_id', 'run_url', 'logs', 'patch', 'changed_files', 'receipt', 'shipped_job'];
   const missing = need.filter((k) => !evidence[k]);
   add('the evidence bundle is complete before teardown', missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : `${need.length} fields`);
+
+  // The reviewer's question is "did a SHIPPED workflow run?", and a workflow file that never
+  // started produces no error line — only a `skipped` job. A green bundle without this check can
+  // be assembled from a consumer whose fixer never executed at all.
+  const raw = evidence.shipped_job || {};
+  const job = typeof raw === 'string' ? { name: raw.split(' — ')[0], conclusion: raw.split(' — ').slice(1).join(' — ') } : raw;
+  const ran = job.name && job.conclusion && !/^(skipped|cancelled|neutral)$/.test(job.conclusion);
+  add('the shipped autofix job actually ran', Boolean(ran),
+    `${job.name || 'no autofix job'} — ${job.conclusion || 'absent'}`);
 
   return { checks, ok: checks.every((c) => c.ok) };
 }
@@ -172,7 +181,7 @@ function selfTest() {
   const evidenceOk = {
     caller_sha: 'c'.repeat(40), tool_sha: TOOL_SHA, run_id: '1', run_url: 'https://example.invalid/runs/1',
     logs: 'sanitized.log', patch: 'fix.patch', changed_files: '.devbaseline/log.json,broken/bad.md',
-    receipt: '.devbaseline/log.json',
+    receipt: '.devbaseline/log.json', shipped_job: 'autofix — success',
   };
 
   const scenarios = [
@@ -205,6 +214,11 @@ function selfTest() {
     {
       name: 'an incomplete evidence bundle is a defect (no teardown before durability)',
       input: { fixFiles: ['.devbaseline/log.json'], runnerBefore: before, runnerAfter: after, evidence: { ...evidenceOk, patch: '' } },
+      expect: false,
+    },
+    {
+      name: 'a skipped shipped job is a defect (a workflow that never started produces no error line)',
+      input: { fixFiles: ['.devbaseline/log.json'], runnerBefore: before, runnerAfter: after, evidence: { ...evidenceOk, shipped_job: 'autofix — skipped' } },
       expect: false,
     },
   ];
@@ -400,6 +414,15 @@ function liveRun() {
     const logs = `${slug}-logs.txt`;
     const log = spawnSync('gh', ['run', 'view', String(run.databaseId), '--repo', full, '--log'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
     writeFileSync(path.join(outDir, logs), sanitize(log.stdout || ''));
+    // Job-level evidence: which jobs the run actually had and how each concluded. A workflow that
+    // never started leaves a `skipped` job and no error line anywhere, so the log alone cannot tell
+    // "the fixer ran and did nothing" from "the fixer never ran".
+    const jobsFile = `${slug}-jobs.json`;
+    const runView = JSON.parse(gh(['run', 'view', String(run.databaseId), '--repo', full,
+      '--json', 'conclusion,event,headSha,workflowName,createdAt,updatedAt,jobs'], { check: false }) || '{}');
+    writeFileSync(path.join(outDir, jobsFile), `${JSON.stringify(runView, null, 2)}\n`);
+    const shippedJob = (runView.jobs || []).find((j) => j.name === 'autofix') || {};
+    say(`shipped job autofix: ${shippedJob.conclusion || 'absent'}`);
     const state = {};
     for (const when of ['before', 'after']) {
       try {
@@ -413,29 +436,35 @@ function liveRun() {
     const runnerAfter = { ...state.after, gitlinks: state.after.gitlinks || [] };
     const runnerBefore = { ...state.before, gitlinks: state.before.gitlinks || [] };
 
-    // The fix PR the fixer opens is the only place the patch and the changed-file list exist.
+    // The fix PR the fixer opens is the only place the patch and the changed-file list exist — and
+    // ONLY the fixer's PR counts. Falling back to "any PR" is how a bundle gets a green verdict
+    // carrying the harness's own fixture diff: the fix branch is `fix/ci-*` off the failing branch,
+    // which is the shipped convention, so identification is by that, not by guessing.
     let fixFiles = [], patch = '', prUrl = '';
     try {
-      const prs = JSON.parse(gh(['pr', 'list', '--repo', full, '--state', 'all', '--json', 'url,number,headRefName,title'], { check: false }) || '[]');
-      const pr = prs.find((p) => /fix/i.test(p.title) || /fix/i.test(p.headRefName)) || prs[0];
+      const prs = JSON.parse(gh(['pr', 'list', '--repo', full, '--state', 'all', '--json', 'url,number,headRefName,baseRefName,title'], { check: false }) || '[]');
+      const pr = prs.find((p) => /^fix\/ci-/.test(p.headRefName) && p.baseRefName === prBranch);
       if (pr) {
         prUrl = pr.url;
         const files = JSON.parse(gh(['pr', 'view', String(pr.number), '--repo', full, '--json', 'files,headRefOid'], { check: false }) || '{}');
         fixFiles = ((files.files || []).map((f) => f.path) || []).filter(Boolean);
         patch = (spawnSync('gh', ['pr', 'diff', String(pr.number), '--repo', full], { encoding: 'utf8' }).stdout || '').trim();
         writeFileSync(path.join(outDir, `${slug}-patch.diff`), patch);
-      }
-    } catch { say('::warning::no fix PR found — the bundle is INCOMPLETE'); }
+      } else say(`::warning::no fix/ci-* PR based on ${prBranch} (PRs: ${prs.map((p) => p.headRefName).join(', ') || 'none'}) — the bundle is INCOMPLETE`);
+    } catch { say('::warning::the fix PR could not be read — the bundle is INCOMPLETE'); }
 
     const meta = { consumer: full, run_id: String(run.databaseId), run_url: run.url, conclusion: run.conclusion,
       caller_sha: callerSha, tool_sha: TOOL_SHA, fix_pr: prUrl, changed_files: fixFiles,
-      runner_state: { before: runnerBefore, after: runnerAfter }, logs, patch: patch ? `${slug}-patch.diff` : '' };
+      runner_state: { before: runnerBefore, after: runnerAfter }, logs, jobs: jobsFile,
+      shipped_job: shippedJob.name ? { name: shippedJob.name, conclusion: shippedJob.conclusion, startedAt: shippedJob.startedAt, completedAt: shippedJob.completedAt } : null,
+      patch: patch ? `${slug}-patch.diff` : '' };
     writeFileSync(path.join(outDir, `${slug}-run.json`), `${JSON.stringify(meta, null, 2)}\n`);
     const checksums = Object.entries(readdirSync(outDir)).filter(([f]) => f.startsWith(slug))
       .map(([f]) => `${sha256(readFileSync(path.join(outDir, f)))}  ${f}`);
     writeFileSync(path.join(outDir, `${slug}-SHA256SUMS`), `${checksums.join('\n')}\n`);
     const evidence = { caller_sha: callerSha, tool_sha: TOOL_SHA, run_id: String(run.databaseId), run_url: run.url,
-      logs, patch: meta.patch, changed_files: fixFiles.join(','), receipt: 'runner-state.json' };
+      logs, patch: meta.patch, changed_files: fixFiles.join(','), receipt: 'runner-state.json',
+      shipped_job: shippedJob.name ? `${shippedJob.name} — ${shipedJob.conclusion}` : '' };
     writeFileSync(path.join(outDir, `${slug}-verdict.json`), `${JSON.stringify(judgeFix({
       fixFiles, runnerBefore, runnerAfter, evidence,
     }), null, 2)}\n`);
