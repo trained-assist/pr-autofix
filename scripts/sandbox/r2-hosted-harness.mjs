@@ -473,7 +473,7 @@ function liveRun() {
     // that empty one, so "wait for a completed run" would judge a skipped job and call the
     // product defective for its own success. The fix run is the one whose autofix job started.
     const autofixJobConclusion = (id) => (gh(['api', `repos/${full}/actions/runs/${id}/jobs`,
-      '--jq', '[.jobs[] | select(.name | startswith("autofix"))][0].conclusion ?? "absent"'], { check: false }) || 'absent').trim();
+      '--jq', '[.jobs[] | select(.name | startswith("autofix"))][0].conclusion // "absent"'], { check: false }) || 'absent').trim();
     const waitForFixRun = () => {
       for (;;) {
         const list = (JSON.parse(gh(['run', 'list', '--repo', full, '--workflow', 'pr-autofix.yml',
