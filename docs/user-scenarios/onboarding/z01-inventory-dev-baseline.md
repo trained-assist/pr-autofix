@@ -206,9 +206,17 @@ CLI проверки — этот репозиторий (`node scripts/devbasel
   (или честное `unpinned:local`, если ref неизвестен), `patch.commit` = коммит патча
   потребителя, `patch_refs` = ссылки на патч; **ни одно поле не перезаписывается другим
   писателем**, потому что слот не перезаписываем.
+- **КОГДА** заполняются слоты `tool.commit`/`tool.version`, **ТОГДА** они берутся ТОЛЬКО из
+  доставленного пина (`AUTOFIX_WORKFLOW_REF`/`AUTOFIX_WORKFLOW_SHA`, то есть `job.workflow_*`),
+  **ТОГДА** identity вызывающего workflow (`GITHUB_WORKFLOW_REF`/`GITHUB_WORKFLOW_SHA` — в
+  reusable workflow это workflow потребителя по контракту GitHub) не является identity
+  инструмента и **никогда** не подставляется, **ТОГДА** без достоверного пина слоты честно
+  деградируют до `unpinned:local`, а не до «уверенного» чужого SHA.
 - **Доказательство:** сами логи (AC-44); песочница проверяет и положительный случай (check назвал
   правило), и негативный контроль (check молчит → правило не выдумывается), и фактические
-  SHA/attempt/patch/path/budget в receipt — `repro-r6-receipt.mjs`.
+  SHA/attempt/patch/path/budget в receipt — `repro-r6-receipt.mjs`; env настоящего reusable-гейта
+  с разными consumer/tool SHA и чтение сохранённого JSON, включая случай без пина —
+  `r2-reusable-receipt-probe.mjs`.
 
 ### S8 — Новое покрытие не разъезжается со старым
 **Блок:** `ci` job в каждом репозитории (проверка baseline при изменении конфигурации).
@@ -231,7 +239,7 @@ CLI проверки — этот репозиторий (`node scripts/devbasel
 
 ### S9 — Граница поставки: reusable workflow доставляет исполняемый код, а не ссылку на него
 **Блок:** все три reusable-workflow инструмента (`ci-fix-cleanup`, `devbaseline-callable`,
-`autofix-callable`).
+`autofix-callable`) и шаблон `templates/batch-fix-prs`.
 
 - **КОГДА** reusable workflow запускает код инструмента, **ТОГДА** она материализует дерево
   инструмента из пинованного коммита (`actions/checkout` от `job.workflow_repository` @
@@ -239,13 +247,23 @@ CLI проверки — этот репозиторий (`node scripts/devbasel
   `GITHUB_ACTION_PATH` (предоставляемая composite action, а обычному run-шагу недоступная) не
   используется нигде, **ТОГДА** ни один скрипт инструмента не содержит относительных импортов
   за пределами доставленного дерева.
+- **КОГДА** дерево инструмента материализовано, **ТОГДА** оно сразу переносится ВНЕ корня
+  потребителя (в `$RUNNER_TEMP`, куда `actions/checkout` не может положить его сам), **ТОГДА**
+  установка инструмента не меняет scan/status/diff потребителя: чистый consumer проходит гейт,
+  controlled failure относится к файлам consumer (ни одного нарушения под `pr-autofix/`),
+  no-change оставляет пустой индекс, а фикс-коммит содержит только пути consumer — ни одного
+  tooling gitlink. Откат к доставке внутрь корня запрещён: именно он делал чистый репозиторий
+  красным.
 - **КОГДА** проверяется граница поставки, **ТОГДА** это делается сканом по всем workflow и
-  шаблонам (`r1-delivery-boundary-scan`) и исполнением shipped run-step в пустом consumer
+  шаблонам (`r1-delivery-boundary-scan`), исполнением shipped run-step в пустом consumer
   runner (`r1-shipped-run-step-probe`: пустой `RUNNER_TEMP`, пустой workspace, mock `gh`,
-  `GITHUB_ACTION_PATH` не подставляется искусственно), **ТОГДА** оба подключены в
-  `staging-gate` — проверка, которую не запускает ни один джоб, не существует.
+  `GITHUB_ACTION_PATH` не подставляется искусственно) и исполнением shipped шагов раздельности
+  корней (`r1-root-separation-probe`: реальная раскладка доставки во всех 4 точках, реальный
+  failed→fix без tooling gitlink), **ТОГДА** все подключены в `staging-gate` — проверка,
+  которую не запускает ни один джоб, не существует.
 - **Доказательство:** зелёный `staging-gate` на актуальной версии PR; shipped run-step
-  отрабатывает в пустом consumer runner (dry-run, отказ по scope, падение API, реальное удаление).
+  отрабатывает в пустом consumer runner (dry-run, отказ по scope, падение API, реальное удаление);
+  `r1-root-separation-probe` — 31/31 на актуальной версии PR и красный на 526d2b7 (дефектный).
 
 ## 3. Не-цели (что сознательно НЕ делаем в Z01)
 

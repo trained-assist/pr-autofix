@@ -58,6 +58,14 @@ jobs:
         run: |
           node scripts/sandbox/r1-delivery-boundary-scan.mjs
           node scripts/sandbox/r1-shipped-run-step-probe.mjs
+      # R1 (pr-autofix#54) + R2 (pr-autofix#55), iteration 4: the two blockers of the it.3
+      # cross-review. Both probes read the LIVE workflow files and execute their shipped steps /
+      # saved receipts, so a regression at ANY delivery point turns a named step red here instead
+      # of being discovered by the next consumer that upgrades its pin.
+      - name: Installing the tool leaves the consumer untouched (R1, pr-autofix#54)
+        run: node scripts/sandbox/r1-root-separation-probe.mjs
+      - name: The receipt never wears the caller's identity (R2, pr-autofix#55)
+        run: node scripts/sandbox/r2-reusable-receipt-probe.mjs
       # R3/R4: provenance entities and retention enforcement, each with its own named step.
       - name: Three provenance entities, not one (R3)
         run: node scripts/sandbox/r3-three-entities-probe.mjs
