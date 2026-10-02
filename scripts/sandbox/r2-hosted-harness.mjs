@@ -470,7 +470,8 @@ function liveRun() {
       if (!jl.stdout || !jl.stdout.trim()) continue;
       jobLogs.push(`===== job ${j.name} (${j.conclusion}) — ${j.url}\n${jl.stdout}`);
     }
-    writeFileSync(path.join(outDir, `${slug}-joblogs.txt`), sanitize(jobLogs.join('\n')));
+    writeFileSync(path.join(outDir, `${slug}-joblogs.txt`),
+      jobLogs.join('\n').replace(/\u001b\[[0-9;]*[A-Za-z]/g, ''));
     say(`shipped job autofix: ${shippedJob.conclusion || 'absent'}`);
     const state = {};
     for (const when of ['before', 'after']) {
@@ -520,10 +521,14 @@ function liveRun() {
     }), null, 2)}\n`);
     say(`bundle: ${outDir}/${slug}-*`);
 
-    phase('teardown — only now, with the bundle durable on disk');
-    gh(['repo', 'delete', full, '--yes']);
-    teardownDone = true;
-    say(`deleted ${full}`);
+    if (KEEP && !verdict.ok) {
+      say(`consumer KEPT for inspection: https://github.com/${full} — delete it after reading`);
+    } else {
+      phase('teardown — only now, with the bundle durable on disk');
+      gh(['repo', 'delete', full, '--yes']);
+      teardownDone = true;
+      say(`deleted ${full}`);
+    }
 
     const verdict = judgeFix({ fixFiles, runnerBefore, runnerAfter, evidence });
     if (AS_JSON) console.log(JSON.stringify(verdict, null, 2));
