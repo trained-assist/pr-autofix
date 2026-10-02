@@ -76,6 +76,11 @@ if (a[0] === 'pr') {
   const joined = a.join(' ');
   if (joined.includes('/logs')) out('npm test\\nnot ok 1 - sum\\nERROR: Process completed with exit code 1\\n');
   else if (joined.includes('/jobs')) out(JSON.stringify([{ id: 1, name: 'test', conclusion: 'failure' }]));
+  // The supersede guard re-reads the live PR before every mutation and fails
+  // CLOSED on an unreadable answer. A bare {} used to pass as "fine" only
+  // because the old code treated a missing read as permission to act; the
+  // scenario now models a real, stable, open PR.
+  else if (/\\/pulls\\/\\d+/.test(joined)) out(JSON.stringify({ state: 'open', labels: [], head: { sha: 'a'.repeat(40) } }));
   else out('{}');
 } else if (a[0] === 'run') out('not ok 1 - sum\\nERROR: Process completed with exit code 1\\n');
 else out('');
