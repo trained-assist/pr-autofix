@@ -57,7 +57,15 @@ const TOOL_SHA = flag('--tool-sha') || gitOut(['-C', CODE, 'rev-parse', 'HEAD'])
 const EVIDENCE_OUT = flag('--evidence-out');
 const CONSUMER_ROOT = flag('--consumer-root');
 
-const die = (msg) => { console.error(`::error::${msg}`); process.exit(2); };
+// Inside the live run a failure must be an exception, not process.exit: only unwinding reaches
+// the finally below, and that is what deletes the disposable consumer instead of leaking it.
+// Outside it (argument checks, self-test) an immediate exit is correct — nothing was created.
+let livePhase = false;
+const die = (msg) => {
+  if (livePhase) throw new Error(msg);
+  console.error(`::error::${msg}`);
+  process.exit(2);
+};
 function gitOut(args, cwd) {
   try { return spawnSync('git', args, { cwd, encoding: 'utf8' }).stdout.trim(); }
   catch { return null; }
@@ -118,6 +126,16 @@ function judgeFix({ fixFiles = [], runnerBefore = null, runnerAfter = null, evid
 
   const gitlinks = (runnerAfter?.gitlinks || []).filter(Boolean);
   add('no tooling gitlink (160000) in the runner index', gitlinks.length === 0, gitlinks.slice(0, 4).join(', '));
+
+  // Fingerprints before and after the fixer ARE the R2 evidence — a remote tree of a deleted
+  // repository can never show untracked work, symlinks or extra staged paths. Without this
+  // check a failed artifact download degraded the comparison to "0 paths compared" and the
+  // verdict went green on an empty base: an incomplete bundle must be red, not quiet.
+  const beforeOk = Boolean(runnerBefore && runnerBefore.fingerprint && runnerBefore.index !== undefined);
+  const afterOk = Boolean(runnerAfter && runnerAfter.fingerprint && runnerAfter.index !== undefined);
+  add('runner state captured before and after the fixer', beforeOk && afterOk,
+    beforeOk && afterOk ? `${Object.keys(runnerBefore.fingerprint).length} path(s) fingerprinted on each side`
+      : `missing: ${[!beforeOk && 'before', !afterOk && 'after'].filter(Boolean).join(', ')}`);
 
   if (runnerBefore && runnerAfter) {
     // Everything the fixer had no business touching must be byte-identical; only the fix's own
@@ -209,6 +227,11 @@ function selfTest() {
         runnerAfter: after,
         evidence: evidenceOk,
       },
+      expect: false,
+    },
+    {
+      name: 'a missing runner-state artifact is a defect (a 503 download leaves nothing to compare)',
+      input: { fixFiles: ['.devbaseline/log.json'], runnerBefore: { gitlinks: [] }, runnerAfter: after, evidence: evidenceOk },
       expect: false,
     },
     {
@@ -392,6 +415,8 @@ function liveRun() {
   const work = CONSUMER_ROOT ? path.resolve(CONSUMER_ROOT) : path.join(CODE, '.devbaseline-sandbox', slug);
   const phase = (name) => say(`── ${name}`);
   let teardownDone = false;
+  let sawRuns = false;
+  livePhase = true;
   try {
     phase('setup — disposable consumer');
     // A real consumer of this product carries the two repository secrets the shipped workflow
@@ -467,6 +492,7 @@ function liveRun() {
       }
     };
     const ciRun = waitFor('ci.yml');
+    sawRuns = true;
     say(`CI run ${ciRun.databaseId}: ${ciRun.conclusion} — ${ciRun.url}`);
     // A workflow_run consumer fires PR Autofix for EVERY completed CI run — including the GREEN
     // CI of the fix PR, whose autofix job is then skipped. The newest run at evidence time is
@@ -527,13 +553,30 @@ function liveRun() {
     say(`shipped job autofix: ${shippedJob.conclusion || 'absent'}`);
     const state = {};
     for (const when of ['before', 'after']) {
-      try {
-        const dl = path.join(outDir, '_artifact');
-        mkdirSync(dl, { recursive: true });
-        gh(['run', 'download', String((when === 'before' ? ciRun : run).databaseId), '--repo', full, '--name', `runner-state-${when}`, '--dir', dl]);
-        state[when] = JSON.parse(readFileSync(path.join(dl, 'runner-state.json'), 'utf8'));
-        rmSync(dl, { recursive: true, force: true });
-      } catch { state[when] = {}; say(`::warning::no runner-state-${when} artifact; the bundle is INCOMPLETE and the verdict will say so`); }
+      // The artifact CDN is rate-limited for real (a 503 "egress is over the account limit"
+      // killed a whole run once): a transient blob error must cost retries, not the bundle.
+      // After the last attempt the state is recorded as missing — the verdict has a dedicated
+      // red check for exactly this, so an incomplete bundle can never read green.
+      const dl = path.join(outDir, '_artifact');
+      let lastErr = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          rmSync(dl, { recursive: true, force: true });
+          mkdirSync(dl, { recursive: true });
+          gh(['run', 'download', String((when === 'before' ? ciRun : run).databaseId), '--repo', full, '--name', `runner-state-${when}`, '--dir', dl]);
+          state[when] = JSON.parse(readFileSync(path.join(dl, 'runner-state.json'), 'utf8'));
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (attempt < 3) spawnSync('sleep', ['15']);
+        }
+      }
+      rmSync(dl, { recursive: true, force: true });
+      if (lastErr) {
+        state[when] = {};
+        say(`::warning::no runner-state-${when} artifact after 3 attempts (${lastErr.message.slice(0, 140)}) — the verdict will call the bundle INCOMPLETE`);
+      }
     }
     const runnerAfter = { ...state.after, gitlinks: state.after.gitlinks || [] };
     const runnerBefore = { ...state.before, gitlinks: state.before.gitlinks || [] };
@@ -596,13 +639,16 @@ function liveRun() {
     if (AS_JSON) console.log(JSON.stringify(verdict, null, 2));
     say(`\nverdict: ${verdict.ok ? 'clean' : 'DEFECT'} — ${verdict.checks.map((c) => `${c.ok ? 'ok' : 'FAIL'} ${c.name}`).join('; ')}`);
     return verdict.ok ? 0 : 1;
+  } catch (e) {
+    say(`::error::${e.message}`);
+    return 2;
   } finally {
     // A failed run must never leave a disposable consumer behind: that is how an org fills with
     // evidence repos nobody owns — except under --keep, where a red run deliberately keeps the
     // consumer alive because the consumer is the only place its job logs still exist.
     if (!teardownDone && !KEEP) {
       const bundle = existsSync(outDir) && readdirSync(outDir).some((f) => f.startsWith(slug));
-      if (bundle) {
+      if (bundle || !sawRuns) {
         const d = spawnSync('gh', ['repo', 'delete', full, '--yes'], { encoding: 'utf8' });
         say(d.status === 0 ? `teardown after failure: deleted ${full}` : `::warning::could not delete ${full} — delete it by hand`);
       } else say(`::error::no durable bundle, leaving ${full} in place — delete it by hand`);
