@@ -106,22 +106,27 @@ jobs:
       # inside a reusable workflow `github.workflow_ref` is the CALLER's workflow, and fetching
       # from that ref 404s — autofix would never run. persist-credentials: false leaves no token
       # in the clone; the caller token is still used by the `actions/checkout` step above.
-      # R1 (pr-autofix#61) — THE CHECK RUNS BEFORE ANY WRITE. actions/checkout RESOLVES `path`
-      # AGAINST GITHUB_WORKSPACE AND REFUSES ANYTHING OUTSIDE IT (input-helper.ts:42-52:
-      # "Repository path … is not under …"). The earlier claim that `path` is taken verbatim was
-      # wrong, and that error is what produced the defect: with containment, delivery can only be
-      # pointed outside the consumer by scoping GITHUB_WORKSPACE — which the Materialize step
-      # below does for its own process only (its absolute `path` is the fail-safe pair: drop the
-      # env and checkout refuses loudly instead of writing into the consumer root). The consumer
-      # tree is never a materialization target: no path inside it is claimed or cleared, and no
-      # relocation step exists to collide with consumer content. The fixer below stages with
-      # `git add -A` in the CONSUMER repo — a tool tree in the root would stage an unsolicited
-      # `160000` gitlink for the nested git repo into every fix commit, and the scanner would read
-      # the tool's fixtures as the consumer's failures. This step keeps the REAL GITHUB_WORKSPACE:
-      # what can already sit in the target (a previous tool clone on a self-hosted runner) is
-      # refused loudly — a symlink or a directory without `.git` is not our checkout, and
-      # checkout@v4 would clear its contents — never overwritten. Same guard as the checkout: no
-      # tree, no run.
+      # R1 — THE DELIVERY BOUNDARY (pr-autofix#61, #67). Two facts about the runner decide this
+      # step, and both were learned the hard way:
+      #   1. actions/checkout resolves `path` against GITHUB_WORKSPACE and REFUSES anything outside
+      #      it (input-helper.ts:42-52: "Repository path … is not under …"). That tool cannot
+      #      install anything outside the consumer tree, whatever path it is given.
+      #   2. A step's `env:` cannot move GITHUB_WORKSPACE for a JavaScript action. Runner 2.337.0
+      #      builds the step environment (ActionRunner.cs:240-252) and NodeScriptActionHandler then
+      #      writes the runtime context over it (:42-50), with GITHUB_WORKSPACE exported from
+      #      GitHubContext (:49-64). v1.7.9 shipped `env: GITHUB_WORKSPACE: ${{ runner.temp }}`
+      #      with an absolute `path:` — so every consumer's delivery installed NOTHING and failed
+      #      with exit 1. The runner's context is not ours to move.
+      # Delivery is therefore a plain run step: fetch the pinned commit of THIS workflow's own
+      # repository into $RUNNER_TEMP/pr-autofix and assert the SHA afterwards. No GITHUB_* or
+      # RUNNER_* variable is set anywhere in this file — scripts/sandbox/r1-runner-faithful-
+      # delivery-probe.mjs fails the build if a step ever tries again.
+      # The preflight runs BEFORE any write: the target must lie outside the consumer tree, and a
+      # symlink or a directory without `.git` there is not our own tool checkout — refused loudly,
+      # never cleared. This job runs in the CALLER's repository, and the fixer below stages with
+      # `git add -A` in that repo: a tool tree in the consumer root would become an unsolicited
+      # `160000` gitlink in every fix commit, and the scanner would read the tool's fixtures as the
+      # consumer's own failures. Same guard as before the install: no tree, no run.
       - name: Delivery target is outside the consumer tree
         if: steps.guard.outputs.skip == 'false'
         run: |
@@ -137,14 +142,27 @@ jobs:
 
       - name: Materialize the pinned tool tree
         if: steps.guard.outputs.skip == 'false'
-        uses: actions/checkout@v4
         env:
-          GITHUB_WORKSPACE: ${{ runner.temp }}
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: ${{ runner.temp }}/pr-autofix
-          persist-credentials: false
+          TOOL_REPOSITORY: ${{ job.workflow_repository }}
+          TOOL_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/pr-autofix"
+          [ -n "${RUNNER_TEMP:-}" ] || { echo "::error::RUNNER_TEMP is empty — refusing to install the tool"; exit 1; }
+          case "$target" in /*) : ;; *) echo "::error::the tool target $target is not absolute — refusing"; exit 1 ;; esac
+          if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target/.git" ]; }; then
+            echo "::error::$target is not a tool checkout — refusing to overwrite it"
+            exit 1
+          fi
+          rm -rf "$target"
+          git init -q "$target"
+          git -C "$target" remote add origin "https://github.com/$TOOL_REPOSITORY.git"
+          git -C "$target" -c protocol.version=2 fetch -q --depth=1 origin "$TOOL_SHA"
+          git -C "$target" checkout -q --detach FETCH_HEAD
+          if [ "$(git -C "$target" rev-parse HEAD)" != "$TOOL_SHA" ]; then
+            echo "::error::the delivered tree is not the pinned SHA — refusing to run it"
+            exit 1
+          fi
 
       - uses: actions/setup-node@v4
         if: steps.guard.outputs.skip == 'false'

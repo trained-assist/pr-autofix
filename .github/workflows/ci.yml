@@ -64,6 +64,14 @@ jobs:
       # of being discovered by the next consumer that upgrades its pin.
       - name: Installing the tool leaves the consumer untouched (R1, pr-autofix#54)
         run: node scripts/sandbox/r1-root-separation-probe.mjs
+      # R1 (pr-autofix#67): every probe below inverted the runner and called it fidelity. The step
+      # `env:` of a JavaScript action does NOT win — NodeScriptActionHandler writes the runtime
+      # context over it — so v1.7.9's `GITHUB_WORKSPACE: ${{ runner.temp }}` delivery installed
+      # nothing and failed every consumer with "Repository path … is not under …". This probe runs
+      # the shipped delivery under the runner's real order and asserts the tool is actually
+      # INSTALLED at the pinned SHA outside the consumer. It was red on v1.7.9 (c6291a1).
+      - name: Delivery installs the tool on a real runner's environment order (R1, pr-autofix#67)
+        run: node scripts/sandbox/r1-runner-faithful-delivery-probe.mjs
       # R1 (pr-autofix#61): the emulation above cannot see WHAT the real actions/checkout does
       # to a consumer-owned `pr-autofix/` catalog, and that is exactly the data-loss defect of
       # the it.4 cross-review. This probe runs the REAL pinned actions/checkout@v4 dist (from
