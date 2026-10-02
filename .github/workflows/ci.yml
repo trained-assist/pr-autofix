@@ -50,6 +50,24 @@ jobs:
       # named step: the log must say WHICH defect regressed, not just that a script exited non-zero.
       - name: The receipt carries the real run (R6)
         run: node scripts/sandbox/repro-r6-receipt.mjs
+      # R1: the delivery boundary is an INVARIANT of the repository, not a habit of one workflow.
+      # The shipped run-step is executed in an empty consumer runner (no GITHUB_ACTION_PATH, mock
+      # gh) — the exact shape that failed in #38 — and the scan proves every executed script tree
+      # is delivered. Both were written but wired into no job until now.
+      - name: The delivery boundary holds (R1)
+        run: |
+          node scripts/sandbox/r1-delivery-boundary-scan.mjs
+          node scripts/sandbox/r1-shipped-run-step-probe.mjs
+      # R3/R4: provenance entities and retention enforcement, each with its own named step.
+      - name: Three provenance entities, not one (R3)
+        run: node scripts/sandbox/r3-three-entities-probe.mjs
+      - name: Retention is executed, not declared (R4)
+        run: node scripts/sandbox/r4-retention-probe.mjs
+      # The class gate: a fact written into the receipt must have a production reader, or the
+      # slot must be gone. Scoped to THIS iteration's keys — the full --strict scan stays red on
+      # 17 legacy slots, which is a separate issue and is not silently softened here.
+      - name: Every gated slot has an owner (class gate)
+        run: node scripts/sandbox/contract-slot-scan.mjs --gate-keys retention,tool_commit,gate,patch
 
   # R7: the repository-context job did not exist, so AC-13 — the only AC written from the
   # consumer's side — had no job. `if: always()` is the load-bearing word: the report about the

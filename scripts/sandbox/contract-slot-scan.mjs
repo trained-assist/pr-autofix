@@ -22,9 +22,13 @@
 // purpose, and is meant to be re-run after the fix — not to be trusted as a proof on its own.
 //
 //   node scripts/sandbox/contract-slot-scan.mjs [--code <repo>] [--json] [--strict]
+//   node scripts/sandbox/contract-slot-scan.mjs --gate-keys retention,tool_commit,gate,patch
 // exit 1 = at least one NO_READER slot (default), or NO_READER + PRODUCER_TESTED_ONLY (--strict).
+// With --gate-keys: exit 1 when any named key is neither read by production code nor gone
+// from the contract (a comment mentioning a removed slot is not a writer).
 
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,6 +38,10 @@ const arg = (n, d) => { const i = argv.indexOf(n); return i !== -1 && argv[i + 1
 const CODE = path.resolve(arg('--code', path.join(HERE, '..', '..')));
 const AS_JSON = argv.includes('--json');
 const STRICT = argv.includes('--strict');
+const GATE_KEYS = (() => {
+  const i = argv.indexOf('--gate-keys');
+  return i !== -1 && argv[i + 1] ? argv[i + 1].split(',').map((s) => s.trim()).filter(Boolean) : [];
+})();
 
 // The two record builders. Keys are PARSED out of them, never hand-listed: a hand-written key list
 // is prose that goes stale exactly the way the hand-written payload file list did (#38).
@@ -158,8 +166,36 @@ const noReader = slots.filter((s) => s.verdict === 'NO_READER');
 const producerTested = slots.filter((s) => s.verdict === 'PRODUCER_TESTED_ONLY');
 const overloadable = slots.filter((s) => s.overloadable);
 
+// --gate-keys: the iteration's own invariants. A named key passes when it is either
+//   (a) read by production code (verdict ok — an independent owner exists), or
+//   (b) GONE from the contract: no writer outside comments. A comment that mentions a
+//       removed slot is documentation, not a writer — counting it as one would keep the
+//       gate red forever on prose. tool_commit is the case: the slot was deleted, and
+//       only the comments explaining the deletion still name it.
+const gateFailures = [];
+if (GATE_KEYS.length) {
+  const byKey = new Map(slots.map((s) => [s.key, s]));
+  for (const key of GATE_KEYS) {
+    const s = byKey.get(key);
+    if (!s) { gateFailures.push(`${key}: slot no longer exists (removed from the contract)`); continue; }
+    if (s.verdict === 'ok') continue;
+    // verdict is not ok: does any NON-comment line still write the slot?
+    const realWriters = s.writers.filter((w) => {
+      const [file, line] = w.split(':');
+      let src = '';
+      try { src = fs.readFileSync(path.join(CODE, file), 'utf8').split('\n')[Number(line) - 1] || ''; } catch { /* unreadable */ }
+      const trimmed = src.trim();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return false;
+      const before = src.slice(0, src.indexOf(key));
+      return !/\/\/\s*$/.test(before);
+    });
+    if (realWriters.length === 0) continue; // slot is gone (only comments name it) — gate passes
+    gateFailures.push(`${key}: ${s.verdict} — written at ${realWriters.slice(0, 3).join(', ')} and read by no production code`);
+  }
+}
+
 if (AS_JSON) {
-  console.log(JSON.stringify({ scan: 'contract slots', code: CODE, slots, noReader, producerTested, overloadable, receipt_readers }, null, 2));
+  console.log(JSON.stringify({ scan: 'contract slots', code: CODE, slots, noReader, producerTested, overloadable, receipt_readers, gateKeys: GATE_KEYS, gateFailures }, null, 2));
 } else {
   console.log(`\nContract-slot scan — ${slots.length} slot(s): ${noReader.length} NO_READER, ${producerTested.length} producer-tested-only, ${overloadable.length} overloadable\n`);
   for (const s of slots) {
@@ -178,6 +214,13 @@ if (AS_JSON) {
   if (!receipt_readers.production.length && !receipt_readers.workflows.length) {
     console.log('  → ROOT CAUSE SHAPE: no production code and no workflow ever opens a persisted receipt.');
   }
+  if (GATE_KEYS.length) {
+    console.log(`\nGate keys (${GATE_KEYS.join(', ')}): ${gateFailures.length ? 'RED' : 'green'}`);
+    for (const f of gateFailures) console.log(`  FAIL ${f}`);
+  }
 }
 
+if (GATE_KEYS.length) {
+  process.exit(gateFailures.length ? 1 : 0);
+}
 process.exit(STRICT ? (noReader.length + producerTested.length ? 1 : 0) : (noReader.length ? 1 : 0));
