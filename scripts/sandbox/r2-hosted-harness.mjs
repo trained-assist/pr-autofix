@@ -439,6 +439,10 @@ function liveRun() {
       return `===== run ${r.databaseId} (${r.workflowName || 'workflow'}) — ${r.conclusion} — ${r.url}\n${l.stdout || ''}`;
     }).join('\n');
     writeFileSync(path.join(outDir, logs), sanitize(raw));
+    // The failing job's own log, always: a red shipped job is the moment the bundle must carry the
+    // reason, and the reason disappears with the disposable consumer at teardown.
+    const failedLog = spawnSync('gh', ['run', 'view', String(run.databaseId), '--repo', full, '--log-failed'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
+    if (failedLog.stdout && failedLog.stdout.trim()) writeFileSync(path.join(outDir, `${slug}-failed.log`), sanitize(failedLog.stdout));
     // Job-level evidence: which jobs the run actually had and how each concluded. A workflow that
     // never started leaves a `skipped` job and no error line anywhere, so the log alone cannot tell
     // "the fixer ran and did nothing" from "the fixer never ran".
@@ -491,7 +495,7 @@ function liveRun() {
     writeFileSync(path.join(outDir, `${slug}-SHA256SUMS`), `${checksums.join('\n')}\n`);
     const evidence = { caller_sha: callerSha, tool_sha: TOOL_SHA, run_id: String(run.databaseId), run_url: run.url,
       logs, patch: meta.patch, changed_files: fixFiles.join(','), receipt: 'runner-state.json',
-      shipped_job: shippedJob.name ? `${shippedJob.name} — ${shipedJob.conclusion}` : '' };
+      shipped_job: shippedJob.name ? `${shippedJob.name} — ${shippedJob.conclusion}` : '' };
     writeFileSync(path.join(outDir, `${slug}-verdict.json`), `${JSON.stringify(judgeFix({
       fixFiles, runnerBefore, runnerAfter, evidence,
     }), null, 2)}\n`);
