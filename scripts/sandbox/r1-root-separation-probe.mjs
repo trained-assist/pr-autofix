@@ -94,6 +94,25 @@ const fakebin = path.join(root, 'fakebin');
 mkdirSync(HOME, { recursive: true });
 mkdirSync(fakebin, { recursive: true });
 
+// The shipped delivery is a run step that FETCHES the pinned tree from GitHub (pr-autofix#67):
+// actions/checkout cannot install outside the consumer, and a step `env:` cannot move
+// GITHUB_WORKSPACE — the runner writes its runtime context over it. So the probe redirects that
+// URL to a local bare mirror (both spellings, git rewrites the longest matching prefix) and
+// GIT_ALLOW_PROTOCOL=file below refuses every other transport. A green run therefore cannot be the
+// network's doing, and a delivery that fetches anything but the pinned commit fails loudly.
+const MIRROR = path.join(root, 'tool.git');
+try {
+  execFileSync('git', ['clone', '--bare', '--quiet', CODE, MIRROR], { stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['-C', MIRROR, 'config', 'uploadpack.allowAnySHA1InWant', 'true'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  for (const prefix of ['https://github.com/trained-assist/pr-autofix.git', 'https://github.com/trained-assist/pr-autofix']) {
+    execFileSync('git', ['config', '--global', '--add', `url.file://${MIRROR}.insteadOf`, prefix],
+      { env: { ...process.env, HOME, GIT_CONFIG_NOSYSTEM: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  }
+} catch (e) {
+  console.error(`::error::cannot build the local tool mirror: ${e.message}`);
+  process.exit(2);
+}
+
 // Stubs that must shadow anything real. Everything else (coreutils, git, node) comes from the
 // interpreter's toolchain and /usr/bin — a real runner has a full toolset; what must NOT be real
 // here is `gh` (destructive API), `opencode` (would talk to a model) and the ladder endpoint.
@@ -210,6 +229,7 @@ function baseEnv({ workspace, runnerTemp, extra = {} }) {
     HOME,
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_TERMINAL_PROMPT: '0',
+    GIT_ALLOW_PROTOCOL: 'file', // offline: any https fetch fails instead of "accidentally" succeeding
     GITHUB_WORKSPACE: workspace,
     RUNNER_TEMP: runnerTemp,
     GITHUB_OUTPUT: '/dev/null',
@@ -245,10 +265,12 @@ async function runJob(steps, ctx, { workspace, consumerSpec, extraEnv = {} }) {
       if (/^actions\/checkout@/.test(String(step.uses || ''))) {
         const sub = String(render(String((step.with && step.with.path) || ''), runCtx)).trim();
         if (sub) {
-          // The step's own `env:` decides where checkout resolves `path` from: the shipped
-          // Materialize step scopes GITHUB_WORKSPACE to the runner temp, and the real action
-          // resolves + containment-checks against exactly that (input-helper.ts:42-52). Emulating
-          // a fixed workspace would test a delivery that does not exist.
+          // A `path:` inside a delivery checkout resolves against GITHUB_WORKSPACE, and the
+          // runner's CONTEXT is what that action sees: NodeScriptActionHandler.cs:42-50 writes the
+          // runtime context over a step env (pr-autofix#67). A step-scoped GITHUB_WORKSPACE is
+          // therefore never honoured, and the supported form stopped using checkout for delivery
+          // altogether — this branch stays only so an unsupported form fails here with the real
+          // containment error instead of passing silently.
           const stepRoot = stepEnv(step, runCtx).GITHUB_WORKSPACE || workspace;
           const dest = path.resolve(stepRoot, sub);
           materializeTool(dest);
@@ -461,34 +483,40 @@ const wsC = path.join(root, 'c-workspace');
 }
 
 // ── scenario e — static: ALL four delivery points keep the tool OUT of the consumer ──
-// The delivery form is a CONTRACT of this class, not a style choice: actions/checkout resolves
-// `path` against GITHUB_WORKSPACE and refuses anything outside it (input-helper.ts:42-52), so the
-// only way to keep the consumer's paths unclaimed is the pair — an absolute `path` under
-// `${{ runner.temp }}` AND a step-scoped `GITHUB_WORKSPACE: ${{ runner.temp }}` (the containment
-// root the real action reads), with the collision preflight before it. Each half alone is either
-// a loud failure or the old defect, so both are asserted, in all four delivery points.
-const RUNNER_TEMP = '${{ runner.temp }}';
+// The delivery form is a CONTRACT of this class, not a style choice (pr-autofix#61, #67).
+// actions/checkout resolves `path` against GITHUB_WORKSPACE and refuses anything outside it
+// (input-helper.ts:42-52), and a step `env:` cannot move that variable for a JavaScript action —
+// runner 2.337.0 writes its runtime context over the step environment
+// (ActionRunner.cs:240-252 → NodeScriptActionHandler.cs:42-50 → GitHubContext.cs:49-64). So the
+// supported form is a plain run step that fetches the PINNED commit into $RUNNER_TEMP/pr-autofix,
+// asserts the SHA, and touches no runner context variable. Each half alone is either a loud
+// failure or the shipped defect, so every delivery point is checked for all of them.
 for (const rel of FOUR) {
   let steps;
   try { steps = yamlSteps(path.join(CODE, rel)); } catch (e) {
     check(`${rel}: parses as YAML`, false, e.message);
     continue;
   }
-  // The TOOL checkout, not the consumer's own: the consumer checkout is a bare `actions/checkout`
-  // with no `repository`/`path`, and anchoring on `uses:` alone asserted against the wrong step.
-  const ci = steps.findIndex((s) => /^actions\/checkout@/.test(String(s.uses || ''))
-    && (String((s.with && s.with.repository) || '').trim() || String((s.with && s.with.path) || '').trim()));
-  const toolStep = ci === -1 ? null : steps[ci];
-  const toolPath = String((toolStep?.with && toolStep.with.path) || '').trim();
-  const stepWs = String((toolStep?.env && toolStep.env.GITHUB_WORKSPACE) || '').trim();
-  check(`${rel}: the pinned tool checkout is present`, toolStep !== null, 'no checkout step found');
-  check(`${rel}: the tool checkout delivers under \${{ runner.temp }}`, toolPath.startsWith(RUNNER_TEMP),
-    `path: ${toolPath || '(none)'}`);
-  check(`${rel}: the checkout step scopes GITHUB_WORKSPACE to \${{ runner.temp }} (containment root)`,
-    stepWs === RUNNER_TEMP, `env.GITHUB_WORKSPACE: ${stepWs || '(none)'}`);
-  const preflight = steps.findIndex((s, i) => typeof s.run === 'string' && /RUNNER_TEMP\/pr-autofix/.test(s.run) && /refusing/.test(s.run));
-  check(`${rel}: the collision preflight runs BEFORE the materialization`, ci === -1 ? false : preflight !== -1 && preflight < ci,
-    `preflight@${preflight}, checkout@${ci}`);
+  const deliveryAt = steps.findIndex((s) => typeof s.run === 'string'
+    && /RUNNER_TEMP\/pr-autofix/.test(s.run) && /\bgit\b[\s\S]*\bfetch\b/.test(s.run));
+  check(`${rel}: the pinned delivery is a fetch run step into $RUNNER_TEMP/pr-autofix`,
+    deliveryAt !== -1, deliveryAt === -1 ? 'no run step fetches the tool there' : '');
+  const envOverrides = steps.flatMap((s, i) => Object.keys(s.env || {})
+    .filter((k) => /^(GITHUB_|RUNNER_)/.test(k))
+    .map((k) => `steps[${i}] ${s.name || '(unnamed)'}: env.${k}`));
+  check(`${rel}: no step overrides a runner context variable (GITHUB_*/RUNNER_*)`,
+    envOverrides.length === 0, envOverrides.slice(0, 2).join('; '));
+  if (deliveryAt === -1) continue;
+  const deliveryStep = steps[deliveryAt];
+  const deliveryText = `${Object.values(deliveryStep.env || {}).map(String).join('\n')}\n${String(deliveryStep.run || '')}`;
+  check(`${rel}: the delivery is pinned by commit (workflow_sha, not a branch)`,
+    /workflow_sha/.test(deliveryText), deliveryText.slice(0, 120));
+  check(`${rel}: the delivered tree is asserted to be the pinned SHA`,
+    /rev-parse/.test(String(deliveryStep.run || '')) && /TOOL_SHA/.test(String(deliveryStep.run || '')),
+    String(deliveryStep.run || '').slice(0, 120));
+  const preflight = steps.findIndex((s) => typeof s.run === 'string' && /RUNNER_TEMP\/pr-autofix/.test(s.run) && /refusing/.test(s.run));
+  check(`${rel}: the collision preflight runs BEFORE the materialization`,
+    preflight !== -1 && preflight < deliveryAt, `preflight@${preflight}, delivery@${deliveryAt}`);
   const stripRelocated = (t) => String(t).split('$RUNNER_TEMP/pr-autofix').join('');
   const bareRefs = steps.filter((s) => /pr-autofix\//.test(stripRelocated(String(s.run || ''))));
   check(`${rel}: no run: block addresses pr-autofix/ outside $RUNNER_TEMP`, bareRefs.length === 0,
@@ -496,7 +524,7 @@ for (const rel of FOUR) {
   const mv = steps.findIndex((s) => /\bmv\b[\s\S]*pr-autofix/.test(String(s.run || '')));
   check(`${rel}: no relocation step is left (the second destructive mechanism)`, mv === -1,
     mv === -1 ? '' : `step: ${String(steps[mv].name || '(unnamed)')}`);
-  const firstToolRun = steps.findIndex((s, i) => i > ci && /pr-autofix\/scripts\//.test(String(s.run || '')));
+  const firstToolRun = steps.findIndex((s, i) => i > deliveryAt && /pr-autofix\/scripts\//.test(String(s.run || '')));
   check(`${rel}: tool commands address the $RUNNER_TEMP tree`, firstToolRun === -1 || /RUNNER_TEMP/.test(String(steps[firstToolRun].run)),
     `first tool run@${firstToolRun}`);
 }

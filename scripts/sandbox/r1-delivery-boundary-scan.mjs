@@ -89,52 +89,70 @@ for (const wf of workflows) {
     if (!steps.length) continue;
 
     // How the job obtains code: an action that materialises a tree, or shell that fetches one.
-    // actions/checkout only delivers the TOOL's tree when it checks the tool out. Inside a reusable
-    // workflow a bare `actions/checkout` checks out the CALLER's repository — the consumer's code,
-    // which contains none of the tool's modules. That distinction is the whole bug class: a job can
-    // look like it has a checkout and still have no tool at all.
+    // A pinned delivery run-step (git fetch of the workflow's own commit into
+    // $RUNNER_TEMP/pr-autofix) brings the WHOLE tree, so it delivers every import exactly like a
+    // full-tree checkout did. Inside a reusable workflow a bare `actions/checkout` checks out the
+    // CALLER's repository — the consumer's code, which contains none of the tool's modules. That
+    // distinction is the whole bug class: a job can look like it has a checkout and still have no
+    // tool at all.
     const TOOL_REPO = 'trained-assist/pr-autofix';
     // A reusable workflow (on: workflow_call) runs in the CALLER's repository: a bare
     // `actions/checkout` there checks out the consumer's code, not the tool's. Only in the tool's
     // OWN CI does a bare checkout deliver the tree.
     const isReusable = /workflow_call/.test(JSON.stringify(doc.on || doc.true || {}));
-    const fullTreeAction = steps.some(st => {
-      if (!/^actions\/checkout@/.test(String(st.uses || ''))) return false;
-      const repo = String((st.with && st.with.repository) || '')
-        .replace(/\$\{\{\s*job\.workflow_repository\s*\}\}$/, TOOL_REPO).trim();
-      if (repo) return repo === TOOL_REPO;
-      return !isReusable;
-    });
+    const checkoutRepo = (st) => String((st.with && st.with.repository) || '')
+      .replace(/\$\{\{\s*job\.workflow_repository\s*\}\}$/, TOOL_REPO).trim();
+    const toolCheckoutStep = steps.find(st =>
+      /^actions\/checkout@/.test(String(st.uses || '')) && checkoutRepo(st) === TOOL_REPO);
+    const isToolFetch = (st) => typeof st.run === 'string'
+      && /RUNNER_TEMP\/pr-autofix/.test(st.run) && /\bgit\b[\s\S]*\bfetch\b/.test(st.run);
+    const toolFetchStep = steps.find(isToolFetch);
+    // In the tool's OWN CI a bare `actions/checkout` is the delivery: the repository it checks out
+    // IS the tool tree. In a reusable workflow it checks out the consumer's code instead.
+    const fullTreeAction = !!toolCheckoutStep || !!toolFetchStep
+      || (!isReusable && steps.some(st => /^actions\/checkout@/.test(String(st.uses || ''))));
     const jobText = steps.map(s => String(s.run || '')).join('\n');
-    const fetchIntoJob = /fetch-payload\.mjs|curl -|wget |git clone|tar |unzip /.test(jobText);
+    const fetchIntoJob = /fetch-payload\.mjs|curl -|wget |git clone|git fetch|tar |unzip /.test(jobText);
 
-    // ── the delivery FORM (R1 collision class, pr-autofix#61) ─────────────────────
-    // A different question from "is the import tree delivered": a checkout can bring the whole
-    // tree and STILL destroy the consumer. actions/checkout resolves `path` against
-    // GITHUB_WORKSPACE and refuses anything outside it (input-helper.ts:42-52), so keeping the
-    // consumer's own paths unclaimed is a CONTRACT of the class, and it is asserted here in every
-    // delivery point: an absolute path under `${{ runner.temp }}`, the step-scoped containment
-    // root that makes such a path legal for the real action, a collision preflight BEFORE any
-    // write, and no relocation step left over from the form that lost consumer content.
-    const toolCheckout = steps.find(st => /^actions\/checkout@/.test(String(st.uses || ''))
-      && String((st.with && st.with.repository) || '')
-        .replace(/\$\{\{\s*job\.workflow_repository\s*\}\}$/, TOOL_REPO).trim() === TOOL_REPO);
-    if (toolCheckout) {
-      const ci = steps.indexOf(toolCheckout);
-      const toolPath = String((toolCheckout.with && toolCheckout.with.path) || '').trim();
-      const stepWs = String((toolCheckout.env && toolCheckout.env.GITHUB_WORKSPACE) || '').trim();
-      if (!/^\$\{\{\s*runner\.temp\s*\}\}\//.test(toolPath)) {
-        note(wf, `job "${jobName}" materializes the tool tree at ${toolPath || '(no path)'} — a path inside the consumer`,
-          `path: ${toolPath}; the consumer may own that directory and checkout would clear it`);
+    // ── the delivery FORM (R1 collision class, pr-autofix#61, #67) ─────────────────────
+    // Two runner facts decide what a supported delivery looks like. actions/checkout resolves
+    // `path` against GITHUB_WORKSPACE and refuses anything outside it (input-helper.ts:42-52), and
+    // a step `env:` cannot move that variable for a JavaScript action — runner 2.337.0 writes the
+    // runtime context over the step environment (ActionRunner.cs:240-252 →
+    // NodeScriptActionHandler.cs:42-50 → GitHubContext.cs:49-64). Shipping
+    // `env: GITHUB_WORKSPACE: ${{ runner.temp }}` therefore installed NOTHING on v1.7.9 (#67).
+    // Delivery outside the consumer is a plain run step that fetches the PINNED commit into
+    // $RUNNER_TEMP/pr-autofix, and no step may ever try to override a runner context variable
+    // again. Both halves are asserted at every delivery point.
+    const envOverrides = [];
+    steps.forEach((st, i) => {
+      for (const k of Object.keys(st.env || {})) {
+        if (/^(GITHUB_|RUNNER_)/.test(k)) envOverrides.push(`steps[${i}] ${st.name || '(unnamed)'}: env.${k}`);
       }
-      if (stepWs !== '${{ runner.temp }}') {
-        note(wf, `job "${jobName}" does not scope the tool checkout's GITHUB_WORKSPACE to the runner temp`,
-          `env.GITHUB_WORKSPACE: ${stepWs || '(none)'}; the absolute path is then refused by the action`);
+    });
+    if (envOverrides.length) {
+      note(wf, `job "${jobName}" tries to override a runner context variable in a step env`,
+        `the runner writes its runtime context OVER step env (NodeScriptActionHandler:42-50); ${envOverrides.slice(0, 4).join('; ')}`);
+    }
+    const deliveryAt = toolFetchStep ? steps.indexOf(toolFetchStep) : (toolCheckoutStep ? steps.indexOf(toolCheckoutStep) : -1);
+    if (deliveryAt === -1) {
+      // Not a delivery job: the executed-script scan below is what judges it.
+    } else {
+      const fetchRun = String(toolFetchStep?.run || '');
+      // The pin arrives through the step env (`TOOL_SHA: ${{ job.workflow_sha }}`), and the script
+      // asserts it after checkout — a delivery that fetches "whatever main holds" is the defect
+      // pr-autofix#58 was opened for, so both halves are read, not just the run text.
+      const fetchEnv = Object.entries(toolFetchStep?.env || {}).map(([, v]) => String(v)).join('\n');
+      if (toolFetchStep && !/workflow_sha/.test(`${fetchEnv}\n${fetchRun}`)) {
+        note(wf, `job "${jobName}" does not pin its delivery by commit`, `no workflow_sha in env/run: ${fetchRun.slice(0, 120)}`);
+      }
+      if (toolFetchStep && (!/rev-parse/.test(fetchRun) || !/TOOL_SHA/.test(fetchRun))) {
+        note(wf, `job "${jobName}" does not assert the delivered SHA after checkout`, `run: ${fetchRun.slice(0, 120)}`);
       }
       const pre = steps.findIndex(st => /RUNNER_TEMP\/pr-autofix/.test(String(st.run || '')) && /refusing/.test(String(st.run || '')));
-      if (pre === -1 || pre > ci) {
+      if (pre === -1 || pre > deliveryAt) {
         note(wf, `job "${jobName}" has no collision preflight before the materialization`,
-          `preflight@${pre}, checkout@${ci}`);
+          `preflight@${pre}, delivery@${deliveryAt}`);
       }
       const mv = steps.find(st => /\bmv\b[\s\S]*pr-autofix/.test(String(st.run || '')));
       if (mv) note(wf, `job "${jobName}" still relocates the tool tree out of the consumer root`, `step: ${mv.name || '(unnamed)'}`);
