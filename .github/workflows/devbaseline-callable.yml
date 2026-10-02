@@ -93,7 +93,7 @@ jobs:
           # write: never cleared, renamed or bypassed.
           if [ -e "$target" ] || [ -L "$target" ]; then
             marker="$(cat "$target/.git/pr-autofix-delivery" 2>/dev/null || true)"
-            origin="$(git -C "$target" remote get-url origin 2>/dev/null || true)"
+            origin="$(git -C "$target" config --get remote.origin.url 2>/dev/null || true)"
             if [ -L "$target" ] || [ ! -d "$target/.git" ] || [ "$marker" != "repo=$TOOL_REPOSITORY" ] || [ "$origin" != "https://github.com/$TOOL_REPOSITORY.git" ]; then
               echo "::error::$target exists but ownership is not proven (marker and origin must both name $TOOL_REPOSITORY) — refusing to overwrite it"
               exit 1
@@ -121,7 +121,7 @@ jobs:
           # write: never cleared, renamed or bypassed.
           if [ -e "$target" ] || [ -L "$target" ]; then
             marker="$(cat "$target/.git/pr-autofix-delivery" 2>/dev/null || true)"
-            origin="$(git -C "$target" remote get-url origin 2>/dev/null || true)"
+            origin="$(git -C "$target" config --get remote.origin.url 2>/dev/null || true)"
             if [ -L "$target" ] || [ ! -d "$target/.git" ] || [ "$marker" != "repo=$TOOL_REPOSITORY" ] || [ "$origin" != "https://github.com/$TOOL_REPOSITORY.git" ]; then
               echo "::error::$target exists but ownership is not proven (marker and origin must both name $TOOL_REPOSITORY) — refusing to overwrite it"
               exit 1

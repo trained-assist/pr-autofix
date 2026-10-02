@@ -434,6 +434,9 @@ const preflightCases = [];
     say('FAIL a collision preflight is shipped — none found');
   } else {
     const script = render(pf.run, ctx);
+    // The preflight reads $TOOL_REPOSITORY (ownership guard, pr-autofix#70): the runner resolves
+    // the step's `env:` before the script runs, so the probe must too.
+    const preflightEnv = Object.fromEntries(Object.entries(pf.env || {}).map(([k, v]) => [k, render(String(v), ctx)]));
     const ABSENT = '(absent)';
     const targetFp = (p) => {
       let st;
@@ -446,7 +449,8 @@ const preflightCases = [];
       { name: 'symlink at the target', obstacle: 'symlink' },
       { name: 'foreign directory at the target', obstacle: 'dir' },
       { name: 'target inside the consumer tree', obstacle: 'inside' },
-      { name: 'a previous tool checkout is not an obstacle', obstacle: 'tool-checkout', allow: true },
+      { name: 'a tool checkout proven ours is not an obstacle', obstacle: 'tool-checkout', allow: true },
+      { name: 'a tool checkout WITHOUT the ownership marker is refused', obstacle: 'tool-checkout-no-marker' },
     ];
     for (const c of cases) {
       const caseDir = path.join(root, `preflight-${c.obstacle}`);
@@ -465,10 +469,12 @@ const preflightCases = [];
       } else if (c.obstacle === 'dir') {
         mkdirSync(target, { recursive: true });
         writeFileSync(path.join(target, 'keep.md'), OWNED);
-      } else if (c.obstacle === 'tool-checkout') {
-        mkdirSync(path.join(target, '.git'), { recursive: true });
-        writeFileSync(path.join(target, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/trained-assist/pr-autofix\n');
-        writeFileSync(path.join(target, 'marker'), OWNED);
+      } else if (c.obstacle === 'tool-checkout' || c.obstacle === 'tool-checkout-no-marker') {
+        // A real previous install of THIS tool; the marker-less twin is a legacy install — same
+        // shape, no proof — and must be refused before any write (pr-autofix#70).
+        execFileSync('git', ['init', '-q', target]);
+        execFileSync('git', ['-C', target, 'remote', 'add', 'origin', 'https://github.com/trained-assist/pr-autofix.git']);
+        if (c.obstacle === 'tool-checkout') writeFileSync(path.join(target, '.git', 'pr-autofix-delivery'), 'repo=trained-assist/pr-autofix\n');
       } else if (c.obstacle === 'inside') {
         extra.RUNNER_TEMP = path.join(workspace, 'scratch'); // a misconfigured runner: target lands in the consumer
         mkdirSync(extra.RUNNER_TEMP, { recursive: true });
@@ -477,7 +483,7 @@ const preflightCases = [];
       const targetPath = c.obstacle === 'inside' ? path.join(extra.RUNNER_TEMP, 'pr-autofix') : target;
       const targetBefore = targetFp(targetPath);
       const context = contextEnv({ workspace, runnerTemp, head });
-      const env = { ...context, ...extra };
+      const env = { ...context, ...preflightEnv, ...extra };
       for (const [k, v] of Object.entries(context)) if (k.startsWith('GITHUB_')) env[k] = v;
       const r = await spawnBash(script, { env, cwd: workspace });
       const out = `${r.stdout}${r.stderr}`.trim();
