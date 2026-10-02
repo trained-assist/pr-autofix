@@ -393,6 +393,14 @@ function liveRun() {
     mkdirSync(path.join(work, 'broken'), { recursive: true });
     writeFileSync(path.join(work, 'broken', 'bad.md'), CONSUMER_BAD_MD);
     writeFileSync(path.join(work, 'check.js'), CONSUMER_CHECK);
+    // The SHIPPED fixer is a Node consumer's fixer: `actions/setup-node` runs with `cache: npm`
+    // and the next step is `npm ci --ignore-scripts`. A disposable consumer without a lockfile is
+    // not a consumer of this product — it fails in setup-node, before the tool is ever executed.
+    writeFileSync(path.join(work, 'package.json'), `${JSON.stringify({ name: 'disposable-consumer', version: '1.0.0', private: true }, null, 2)}\n`);
+    writeFileSync(path.join(work, 'package-lock.json'), `${JSON.stringify({
+      name: 'disposable-consumer', version: '1.0.0', lockfileVersion: 3, requires: true,
+      packages: { '': { name: 'disposable-consumer', version: '1.0.0' } },
+    }, null, 2)}\n`);
     writeFileSync(path.join(work, '.github', 'workflows', 'ci.yml'), CONSUMER_CI(TOOL_SHA));
     writeFileSync(path.join(work, '.github', 'workflows', 'pr-autofix.yml'), CONSUMER_AUTOFIX(TOOL_SHA));
     gitOut(['init', '-q', '-b', 'main'], work);
