@@ -464,7 +464,9 @@ function liveRun() {
     const jobLogs = [];
     for (const v of [ciView, fixView]) for (const j of v.jobs || []) {
       if (!j.databaseId) continue;
-      const jl = spawnSync('gh', ['api', `repos/${full}/actions/jobs/${j.databaseId}/logs`, '--include'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
+      // gh refuses to print a body containing terminal escapes unless told to — runner logs are
+      // full of them, and the failure mode is an EMPTY bundle field, not an error.
+      const jl = spawnSync('gh', ['api', `repos/${full}/actions/jobs/${j.databaseId}/logs`, '--allow-escape-sequences'], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
       if (!jl.stdout || !jl.stdout.trim()) continue;
       jobLogs.push(`===== job ${j.name} (${j.conclusion}) — ${j.url}\n${jl.stdout}`);
     }
@@ -544,8 +546,9 @@ function liveRun() {
 // Sanitized logs: keep the structure (step names, exit codes, the evidence lines) and drop the
 // volatile/secret-bearing noise. A bundle that ships raw logs is a bundle that leaks tokens.
 function sanitize(text) {
+  const plain = String(text).replace(/\u001b\[[0-9;]*[A-Za-z]/g, '').replace(/\u001b\][^\u0007]*\u0007/g, '');
   const keep = /^(::group|::endgroup|::error|::warning|##\[|Run |=== |ok |FAIL |verdict:)|exited with code|Process completed|runner-state|"(run_id|tool_sha|caller_sha|gitlinks)"/;
-  return `${text.split('\n').filter((l) => keep.test(l) || /\bexit(ed)?\b.*\bcode\b/i.test(l)).join('\n')}\n`;
+  return `${plain.split('\n').filter((l) => keep.test(l) || /\bexit(ed)?\b.*\bcode\b/i.test(l)).join('\n')}\n`;
 }
 
 // ── entry ──────────────────────────────────────────────────────────────────────────
