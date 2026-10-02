@@ -22,7 +22,7 @@
 // exit 0 = shipped step works in an empty consumer runner; 1 = defect; 2 = harness error
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, cpSync } from 'node:fs';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -149,8 +149,37 @@ if (a[0] === 'api' && a.includes('-X') && a.includes('DELETE')) process.exit(0);
 process.exit(0);
 `;
 writeFileSync(path.join(fakebin, 'gh'), ghStub, { mode: 0o755 });
-for (const b of ['bash', 'node', 'env', 'cat', 'mkdir', 'ls', 'cp', 'sed', 'grep', 'tar', 'git', 'printf'])
+// Utilities a run-step may reach for. Symlinking them is best-effort on purpose — a missing `sed`
+// must not decide the verdict. The TOOLCHAIN below is not best-effort and is checked explicitly.
+for (const b of ['bash', 'cat', 'mkdir', 'ls', 'cp', 'sed', 'grep', 'tar', 'git', 'printf'])
   { try { symlinkSync(`/usr/bin/${b}`, path.join(fakebin, b)); } catch { /* optional */ } }
+
+// ── the consumer runner's PATH ───────────────────────────────────────────────────
+// "Empty consumer runner" means: no repository checkout, no delivered tool, no
+// GITHUB_ACTION_PATH. It does NOT mean "no toolchain" — a real reusable-workflow job runs
+// actions/checkout (a node action) and the shipped run-step executes `node …`, so node is
+// present by definition.
+//
+// An earlier version symlinked /usr/bin/node and ignored failure. That is true on a Debian-ish
+// dev box and false on a GitHub runner, where node lives under /opt/hostedtoolcache: the symlink
+// quietly did not exist, and the simulated step died with `node: command not found` (exit 127) —
+// a fault in THIS harness reported as a verdict about the shipped workflow. So the toolchain
+// directory comes from the interpreter actually running this probe, and its availability is
+// asserted before any step runs (see the guard below). fakebin stays FIRST, so the mock gh and
+// the redirected curl still shadow anything real.
+const TOOLCHAIN = path.dirname(process.execPath);
+const RUNNER_PATH = `${fakebin}:${TOOLCHAIN}`;
+
+function harnessCanRun(bin) {
+  const r = spawnSync('/usr/bin/env', ['-i', `PATH=${RUNNER_PATH}`, bin, '--version'], { encoding: 'utf8' });
+  return r.status === 0;
+}
+for (const bin of ['node', 'bash']) {
+  if (!harnessCanRun(bin)) {
+    console.error(`::error::empty consumer runner cannot resolve ${bin} (PATH=${RUNNER_PATH}) — harness incomplete, not a verdict`);
+    process.exit(2);
+  }
+}
 
 // curl is redirected at the loopback payload server (the pinned raw.githubusercontent URL
 // cannot be fetched from a sandbox; the PINNED invariant in fetch-payload.mjs is asserted by
@@ -245,7 +274,7 @@ function spawnOne(block, { env, secrets, ghMode, cwd }) {
   writeFileSync(GH_LOG, '');
   const script = path.join(root, `step-${Math.random().toString(36).slice(2)}.sh`);
   writeFileSync(script, block, { mode: 0o755 });
-  const r = spawn('/usr/bin/env', ['-i', `PATH=${fakebin}`, `HOME=${root}`, `RUNNER_TEMP=${runnerTemp}`,
+  const r = spawn('/usr/bin/env', ['-i', `PATH=${RUNNER_PATH}`, `HOME=${root}`, `RUNNER_TEMP=${runnerTemp}`,
     `GITHUB_WORKSPACE=${workspace}`, 'GITHUB_ENV=/dev/null', 'GITHUB_OUTPUT=/dev/null',
     'GITHUB_PATH=/dev/null', 'GH_TOKEN=stub-token-synthetic',
     ...Object.entries(env || {}).map(([k, v]) => `${k}=${v}`),
