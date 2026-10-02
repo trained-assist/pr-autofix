@@ -26,7 +26,7 @@
 // exit 0 = delivery left the consumer byte-identical; 1 = defect reproduced; 2 = harness error
 
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync,
-  readdirSync, readlinkSync } from 'node:fs';
+  readdirSync, readlinkSync, lstatSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import os from 'node:os';
@@ -439,7 +439,93 @@ for (const [wf, variant] of SCENARIOS) {
   results.push(scenario);
 }
 
+// ── T5 — the preflight must refuse LOUDLY, before any write ─────────────────────
+// A collision check that silently overwrites is worse than none, and one that holds only because
+// nothing happened to be in the way proves nothing. Each case puts a real obstacle in the delivery
+// target (or puts the target inside the consumer) and asserts three things: the shipped preflight
+// exits non-zero with an explicit refusal, the obstacle is byte-identical afterwards (nothing was
+// written AND nothing was destroyed), and the consumer tree is untouched. The last case pins the
+// other side of the rule: a real previous tool checkout (it has `.git`) is NOT an obstacle.
+const preflightCases = [];
+{
+  const wf = '.github/workflows/devbaseline-callable.yml';
+  let pf = null;
+  try {
+    const jobs = yamlJobs(path.join(CODE, wf));
+    const jobName = Object.keys(jobs).find((jn) => (jobs[jn].steps || []).some(isPreflight));
+    pf = jobName ? (jobs[jobName].steps || []).find(isPreflight) : null;
+  } catch (e) { pf = null; }
+  if (!pf) {
+    preflightCases.push({ name: 'shipped preflight exists', checks: [{ name: 'a collision preflight is shipped', ok: false, detail: `none found in ${wf}` }] });
+    say('FAIL a collision preflight is shipped — none found');
+  } else {
+    const script = render(pf.run, ctx);
+    const ABSENT = '(absent)';
+    // The obstacle ITSELF, not its parent directory: the runner's own marker files
+    // (GITHUB_ENV/GITHUB_OUTPUT/…) are created inside the temp dir when the step env is built,
+    // and fingerprinting the directory would report that as "the target changed".
+    const targetFp = (p) => {
+      let st;
+      try { st = lstatSync(p); } catch { return ABSENT; }
+      if (st.isSymbolicLink()) return `L -> ${readlinkSync(p)}`;
+      if (st.isDirectory()) return fingerprint(p);
+      return `F ${createHash('sha256').update(readFileSync(p)).digest('hex')}`;
+    };
+    const cases = [
+      { name: 'symlink at the target', obstacle: 'symlink' },
+      { name: 'foreign directory at the target', obstacle: 'dir' },
+      { name: 'target inside the consumer tree', obstacle: 'inside' },
+      { name: 'a previous tool checkout is not an obstacle', obstacle: 'tool-checkout', allow: true },
+    ];
+    for (const c of cases) {
+      const caseDir = path.join(root, `preflight-${c.obstacle}`);
+      const workspace = path.join(caseDir, 'ws');
+      const consumerDir = workspace;
+      const runnerTemp = path.join(caseDir, 'rt');
+      mkdirSync(runnerTemp, { recursive: true });
+      ctx.globals['runner.temp'] = runnerTemp;
+      buildFixture(consumerDir, 'tracked');
+      const head = git(['rev-parse', 'HEAD'], consumerDir);
+      const target = path.join(runnerTemp, 'pr-autofix');
+      const extra = {};
+      if (c.obstacle === 'symlink') {
+        mkdirSync(path.join(runnerTemp, 'obstacle'), { recursive: true });
+        writeFileSync(path.join(runnerTemp, 'obstacle', 'keep.md'), OWNED);
+        execFileSync('ln', ['-s', 'obstacle', target], { cwd: runnerTemp });
+      } else if (c.obstacle === 'dir') {
+        mkdirSync(target, { recursive: true });
+        writeFileSync(path.join(target, 'keep.md'), OWNED);
+      } else if (c.obstacle === 'tool-checkout') {
+        mkdirSync(path.join(target, '.git'), { recursive: true });
+        writeFileSync(path.join(target, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/trained-assist/pr-autofix\n');
+        writeFileSync(path.join(target, 'marker'), OWNED);
+      } else if (c.obstacle === 'inside') {
+        extra.RUNNER_TEMP = path.join(workspace, 'scratch'); // a misconfigured runner: target lands in the consumer
+        mkdirSync(extra.RUNNER_TEMP, { recursive: true });
+      }
+      const consumerBefore = fingerprint(consumerDir);
+      const targetPath = c.obstacle === 'inside' ? path.join(extra.RUNNER_TEMP, 'pr-autofix') : target;
+      const targetBefore = targetFp(targetPath);
+      const env = { ...baseEnv({ workspace, consumerDir, runnerTemp, head }), ...extra };
+      const r = await spawnBash(script, { env, cwd: workspace });
+      const out = `${r.stdout}${r.stderr}`.trim();
+      const consumerAfter = fingerprint(consumerDir);
+      const targetAfter = targetFp(targetPath);
+      const verdictWord = c.allow ? 'allows' : 'refuses';
+      const checks = [
+        { name: `${c.name}: the preflight ${verdictWord} (exit ${r.code})`, ok: c.allow ? r.code === 0 : r.code !== 0, detail: out.split('\n').slice(-1)[0] || '(no output)' },
+        { name: `${c.name}: the refusal is explicit, not a silent skip`, ok: c.allow || /refusing/.test(out), detail: c.allow ? '' : (/refusing/.test(out) ? '' : out.split('\n').slice(-2).join(' | ').slice(0, 200)) },
+        { name: `${c.name}: nothing in the target was written or destroyed`, ok: targetAfter === targetBefore, detail: targetAfter === targetBefore ? '' : `before=${targetBefore.slice(0, 120)} after=${targetAfter.slice(0, 120)}` },
+        { name: `${c.name}: the consumer tree is byte-identical`, ok: consumerAfter === consumerBefore, detail: consumerAfter === consumerBefore ? '' : 'the consumer changed' },
+      ];
+      preflightCases.push({ name: c.name, exit: r.code, output: out, checks });
+      for (const k of checks) say(`${k.ok ? 'ok  ' : 'FAIL'} ${k.name}${k.ok ? '' : ` — ${k.detail}`}`);
+    }
+  }
+}
+
 const failedScenarios = results.filter((s) => !s.passed);
+const failedPreflight = preflightCases.flatMap((c) => c.checks).filter((k) => !k.ok).length;
 const report = {
   probe: 'r1-consumer-collision-probe',
   code: CODE,
@@ -447,9 +533,12 @@ const report = {
   actions_checkout: { dir: CHECKOUT, dist_sha256: CHECKOUT_DIST_SHA, pinned_review_sha: CHECKOUT_PIN },
   transport: 'local bare mirror via url.insteadOf; GIT_ALLOW_PROTOCOL=file (no network)',
   scenarios: results,
+  preflight_cases: preflightCases,
   verdict: failedScenarios.length
     ? `DEFECT — consumer content lost at ${failedScenarios.length}/${results.length} scenarios`
-    : 'clean — delivery leaves the consumer byte-identical',
+    : failedPreflight
+      ? `DEFECT — the collision preflight fails ${failedPreflight} check(s)`
+      : 'clean — delivery leaves the consumer byte-identical',
 };
 writeFileSync(path.join(sandboxBase, 'results.json'), `${JSON.stringify(report, null, 2)}\n`);
 
@@ -458,4 +547,4 @@ else console.log(`\nverdict: ${report.verdict}\nresults: ${path.join(sandboxBase
 
 if (!KEEP && !process.env.DEVBASELINE_SANDBOX_TMP) rmSync(root, { recursive: true, force: true });
 else say(`sandbox kept at ${root}`);
-process.exit(failedScenarios.length ? 1 : 0);
+process.exit(failedScenarios.length || failedPreflight ? 1 : 0);
