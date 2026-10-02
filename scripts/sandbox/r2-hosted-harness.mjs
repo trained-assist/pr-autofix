@@ -245,7 +245,9 @@ function selfTest() {
 }
 
 // ── live phases ───────────────────────────────────────────────────────────────────
-// `gh` is used for every remote call, so the harness never handles a token itself.
+// `gh` is used for every remote call, so the harness never handles a token itself — the one
+// exception is provisioning the disposable consumer's own secrets (see setup below), where a
+// value reaches `gh secret set` as STDIN only and is never argv, log or bundle.
 const gh = (args, { check = true } = {}) => {
   const r = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   if (check && r.status !== 0) die(`gh ${args.slice(0, 3).join(' ')} failed: ${(r.stderr || '').trim().slice(0, 300)}`);
@@ -303,7 +305,7 @@ const CAPTURE_STEP = (when, toolSha) => `      - uses: actions/checkout@v4
               untracked: sh(["-C", ".", "ls-files", "--others", "--exclude-standard"]).split("\\n").filter(Boolean),
               gitlinks: sh(["-C", ".", "ls-files", "-s"]).split("\\n").filter((l) => l.startsWith("160000")),
               head_sha: process.env.GITHUB_SHA,
-              pr_head_sha: "${'$'}{github.event.pull_request.head.sha}",
+              pr_head_sha: "${'$'}{{github.event.pull_request.head.sha}}",
               tool_sha: "${toolSha}",
               run_id: process.env.GITHUB_RUN_ID,
               run_url: process.env.GITHUB_SERVER_URL + "/" + process.env.GITHUB_REPOSITORY + "/actions/runs/" + process.env.GITHUB_RUN_ID,
@@ -386,7 +388,24 @@ function liveRun() {
   let teardownDone = false;
   try {
     phase('setup — disposable consumer');
+    // A real consumer of this product carries the two repository secrets the shipped workflow
+    // reads (autofix-callable.yml — "Required secrets in your repo"): the llm-ladder bearer
+    // token without which autofix.mjs exits at `LLM_LADDER_TOKEN not set`, and the PAT under
+    // which the fix branch is pushed and the fix PR is opened. Nine hosted runs died at that
+    // exit and the bundle never held a patch — the harness must provision what every real
+    // consumer has, or it proves nothing about failed→fix. Values go to `gh secret set` on
+    // STDIN: never argv, never a log line, never the bundle.
+    const ladderToken = process.env.LLM_LADDER_TOKEN || process.env.OPENCODE_LADDER_TOKEN;
+    if (!ladderToken) die('LLM_LADDER_TOKEN (or OPENCODE_LADDER_TOKEN) is not set in the environment — the shipped fixer cannot run without it');
     gh(['repo', 'create', full, '--private', '--description', `disposable evidence consumer (auto-deleted) — ${TOOL_SHA.slice(0, 8)}`]);
+    const setSecret = (name, value) => {
+      const r = spawnSync('gh', ['secret', 'set', name, '--repo', full], { encoding: 'utf8', input: value });
+      if (r.status !== 0) die(`gh secret set ${name} failed: ${(r.stderr || '').trim().slice(0, 200)}`);
+    };
+    setSecret('LLM_LADDER_TOKEN', ladderToken);
+    const pat = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8' });
+    if (pat.status === 0 && (pat.stdout || '').trim()) setSecret('AUTOFIX_PAT', pat.stdout.trim());
+    else say('::warning::no gh auth token — the fixer falls back to GITHUB_TOKEN, which the org may refuse for PR creation');
     mkdirSync(work, { recursive: true });
     writeFileSync(path.join(work, 'README.md'), '# disposable consumer\n');
     mkdirSync(path.join(work, '.github', 'workflows'), { recursive: true });
@@ -396,10 +415,17 @@ function liveRun() {
     // The SHIPPED fixer is a Node consumer's fixer: `actions/setup-node` runs with `cache: npm`
     // and the next step is `npm ci --ignore-scripts`. A disposable consumer without a lockfile is
     // not a consumer of this product — it fails in setup-node, before the tool is ever executed.
-    writeFileSync(path.join(work, 'package.json'), `${JSON.stringify({ name: 'disposable-consumer', version: '1.0.0', private: true }, null, 2)}\n`);
+    // `scripts.test` is the consumer's own verify contract: the non-agent pipeline runs
+    // `npm test` after applying a patch (autofix.mjs — "Verify: run tests") and reverts the
+    // patch if it fails, so a consumer with no `test` script can never produce a fix PR —
+    // the harness would be proving the cycle against a fixture the product cannot pass.
+    writeFileSync(path.join(work, 'package.json'), `${JSON.stringify({
+      name: 'disposable-consumer', version: '1.0.0', private: true,
+      scripts: { test: 'node check.js' },
+    }, null, 2)}\n`);
     writeFileSync(path.join(work, 'package-lock.json'), `${JSON.stringify({
       name: 'disposable-consumer', version: '1.0.0', lockfileVersion: 3, requires: true,
-      packages: { '': { name: 'disposable-consumer', version: '1.0.0' } },
+      packages: { '': { name: 'disposable-consumer', version: '1.0.0', scripts: { test: 'node check.js' } } },
     }, null, 2)}\n`);
     writeFileSync(path.join(work, '.github', 'workflows', 'ci.yml'), CONSUMER_CI(TOOL_SHA));
     writeFileSync(path.join(work, '.github', 'workflows', 'pr-autofix.yml'), CONSUMER_AUTOFIX(TOOL_SHA));
