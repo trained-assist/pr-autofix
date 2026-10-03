@@ -6,7 +6,7 @@
 //     B. Missing permissions → patch workflow YAML
 //     C. Cloudflare DO conflict → bail with precise diagnosis
 //
-//   AI stages (llm-ladder worker, model free-ladder; only if pre-stage didn't apply):
+//   AI stages (llm-ladder worker, model free; only if pre-stage didn't apply):
 //     Stage 1 (deepseek-v4-flash:free)    — diagnose: root cause + files to examine
 //     Stage 2 (nemotron-3-super-120b:free) — contextualize: read real files, describe changes
 //     Stage 3 (nemotron-3-ultra-550b:free) — patch: write the unified diff
@@ -88,12 +88,12 @@ const estTokens = s => Math.ceil(String(s).length / 4);
 
 // Models: every stage calls ONE place — the trained-assist-llm-ladder worker
 // (https://llm-ladder.trainedassist.store, repo trained-assist/trained-assist-llm-ladder), model
-// `free-ladder`: OpenCode Go cheap rungs → OpenRouter :free, with per-model health, Go key
+// `free`: OpenCode Go cheap rungs → OpenRouter :free, with per-model health, Go key
 // rotation, JSON guard and response_format-400 retry done server-side. The bench-validated rung
 // order that used to live here (FREE_MODEL_LADDER / GO_MODEL_LADDER / paid fallback) moved into
 // the worker's config — one ladder for every trained-assist consumer (owner 2026-09-27).
 const LADDER_URL = (process.env.LLM_LADDER_URL || 'https://llm-ladder.trainedassist.store').replace(/\/+$/, '');
-const LADDER_MODEL = process.env.AUTOFIX_LADDER || 'free-ladder';
+const LADDER_MODEL = process.env.AUTOFIX_LADDER || 'free';
 const STAGE0_MODEL = LADDER_MODEL;
 const STAGE1_MODEL = LADDER_MODEL;
 const STAGE2_MODEL = LADDER_MODEL;
